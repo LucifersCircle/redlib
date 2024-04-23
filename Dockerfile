@@ -1,13 +1,10 @@
-FROM alpine:3.19
-
-# Install wget
-RUN apk add --no-cache wget
+FROM ubuntu:22.04
 
 # Download redlib binary from the provided URL
-RUN wget -O /tmp/redlib https://github.com/LucifersCircle/redlib/raw/main/target/release/redlib \
-    && chmod +x /tmp/redlib \
-    && mv /tmp/redlib /usr/bin/redlib \
-    && chown root:root /usr/bin/redlib
+RUN apt-get update && apt-get install -y wget && \
+    wget -O /usr/bin/redlib https://github.com/LucifersCircle/redlib/raw/main/target/release/redlib && \
+    chmod +x /usr/bin/redlib && \
+    apt-get purge -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Expose port 8080 (if your application listens on a different port, change it accordingly)
 EXPOSE 8080
