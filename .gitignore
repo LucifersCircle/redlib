@@ -6,6 +6,8 @@
 /target/release/incremental
 /target/release/.cargo-lock
 /target/release/redlib.d
+/target/.rustc_info.json
+/target/CACHEDIR.TAG
 .env
 # Idea Files
 .idea/
