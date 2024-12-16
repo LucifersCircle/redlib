@@ -1,6 +1,8 @@
 # This Fork
 I'm not sure the maintainer of redlib wants random themes added, so until my PR gets approved I just wanted to add my theme "Midnight Purple" to my public redlib instances. <br>
 
+It also currently merges 2 pull requests not merged in the main project https://github.com/redlib-org/redlib/pull/291 and https://github.com/redlib-org/redlib/pull/321
+
 Dockerhub: luciferscircle/redlib <br>
 
 Instances that will use this image: <br>
