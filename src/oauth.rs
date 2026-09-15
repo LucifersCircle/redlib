@@ -320,10 +320,7 @@ struct RolloverGuard;
 
 impl RolloverGuard {
 	fn acquire() -> Option<Self> {
-		OAUTH_IS_ROLLING_OVER
-			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-			.ok()
-			.map(|_| Self)
+		OAUTH_IS_ROLLING_OVER.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).ok().map(|_| Self)
 	}
 }
 

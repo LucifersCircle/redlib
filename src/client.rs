@@ -570,10 +570,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 									error!("Forcing a token refresh");
 									let outcome = force_refresh_token().await;
 									if let Some(delay) = outcome.retry_after() {
-										return Err(format!(
-											"OAuth token refresh is temporarily unavailable. Retry in {} seconds",
-											delay.as_secs().max(1)
-										));
+										return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
 									}
 									return Err("OAuth token has expired. Please refresh the page!".to_string());
 								}
