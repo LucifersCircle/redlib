@@ -1,5 +1,5 @@
 use crate::{
-	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
+	client::{current_rate_limit_remaining, install_oauth_generation, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -19,9 +19,30 @@ const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
 const TOKEN_REFRESH_EARLY_BY: u64 = 120;
+const DEFAULT_LOW_BUDGET_ROTATION_DELAY: Duration = Duration::from_secs(60);
+const LOW_BUDGET_ROTATION_MARGIN: Duration = Duration::from_secs(2);
+const MAX_LOW_BUDGET_ROTATION_DELAY: Duration = Duration::from_secs(600);
 
 static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
 static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static LOW_BUDGET_ROTATION_NOT_BEFORE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RefreshReason {
+	Scheduled,
+	Unauthorized,
+	LowRateLimit,
+}
+
+impl RefreshReason {
+	fn label(self) -> &'static str {
+		match self {
+			Self::Scheduled => "scheduled",
+			Self::Unauthorized => "unauthorized",
+			Self::LowRateLimit => "low_rate_limit",
+		}
+	}
+}
 
 // Response from OAuth backend authentication
 #[derive(Debug, Clone)]
@@ -90,6 +111,12 @@ pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
 	expires_in: u64,
 	pub(crate) backend: OauthBackendImpl,
+	pub(crate) generation: u64,
+}
+
+struct RefreshedOauth {
+	oauth: Oauth,
+	fresh_identity: bool,
 }
 
 impl Oauth {
@@ -135,20 +162,36 @@ impl Oauth {
 			headers_map,
 			expires_in: response.expires_in,
 			backend: backend.clone(),
+			generation: 0,
 		})
 	}
 
-	async fn refreshed(&self) -> Result<Self, RefreshError> {
-		let mut primary = self.backend.clone();
+	fn refresh_backend(&self, reason: RefreshReason, fallback: bool) -> (OauthBackendImpl, bool) {
+		match (reason, fallback) {
+			(RefreshReason::LowRateLimit, false) => (OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new()), true),
+			(RefreshReason::LowRateLimit, true) => (OauthBackendImpl::GenericWeb(GenericWebAuth::new()), true),
+			(RefreshReason::Scheduled | RefreshReason::Unauthorized, false) => (self.backend.clone(), false),
+			(RefreshReason::Scheduled | RefreshReason::Unauthorized, true) => (self.backend.alternate(), true),
+		}
+	}
+
+	async fn refreshed(&self, reason: RefreshReason) -> Result<RefreshedOauth, RefreshError> {
+		let (mut primary, primary_is_fresh) = self.refresh_backend(reason, false);
 		let primary_name = primary.name();
 		match Self::authenticate_with_backend(&mut primary).await {
-			Ok(oauth) => Ok(oauth),
+			Ok(oauth) => Ok(RefreshedOauth {
+				oauth,
+				fresh_identity: primary_is_fresh,
+			}),
 			Err(primary_error) => {
-				warn!("OAuth refresh with existing {primary_name} identity failed: {primary_error}");
-				let mut fallback = self.backend.alternate();
+				warn!("OAuth {} refresh with {primary_name} failed: {primary_error}", reason.label());
+				let (mut fallback, fallback_is_fresh) = self.refresh_backend(reason, true);
 				let fallback_name = fallback.name();
 				match Self::authenticate_with_backend(&mut fallback).await {
-					Ok(oauth) => Ok(oauth),
+					Ok(oauth) => Ok(RefreshedOauth {
+						oauth,
+						fresh_identity: fallback_is_fresh,
+					}),
 					Err(fallback_error) => Err(RefreshError {
 						primary_name,
 						primary_error,
@@ -295,6 +338,24 @@ fn refresh_backoff_remaining() -> Option<Duration> {
 	refresh_backoff().retry_remaining(Instant::now())
 }
 
+fn low_budget_rotation_delay(reset_after: Option<Duration>) -> Duration {
+	reset_after
+		.unwrap_or(DEFAULT_LOW_BUDGET_ROTATION_DELAY)
+		.saturating_add(LOW_BUDGET_ROTATION_MARGIN)
+		.min(MAX_LOW_BUDGET_ROTATION_DELAY)
+}
+
+fn low_budget_rotation_remaining() -> Option<Duration> {
+	LOW_BUDGET_ROTATION_NOT_BEFORE
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+}
+
+fn suppress_low_budget_rotation_for(duration: Duration) {
+	*LOW_BUDGET_ROTATION_NOT_BEFORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + duration);
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RefreshOutcome {
 	Refreshed,
@@ -339,7 +400,7 @@ pub async fn token_daemon() {
 		info!("[⏳] Waiting {duration:?} for {reason}");
 		tokio::select! {
 			_ = tokio::time::sleep(duration) => {
-				let _ = force_refresh_token().await;
+				let _ = force_refresh_token(RefreshReason::Scheduled).await;
 			}
 			_ = TOKEN_REFRESH_NOTIFY.notified() => {
 				trace!("OAuth refresh schedule changed; recalculating");
@@ -348,17 +409,37 @@ pub async fn token_daemon() {
 	}
 }
 
-pub fn should_attempt_refresh() -> bool {
-	!OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst) && refresh_backoff_remaining().is_none()
+pub(crate) fn spawn_rate_limit_refresh(reset_after: Option<Duration>) -> bool {
+	if refresh_backoff_remaining().is_some() || low_budget_rotation_remaining().is_some() {
+		return false;
+	}
+
+	let Some(rollover_guard) = RolloverGuard::acquire() else {
+		return false;
+	};
+
+	// Claim both the refresh guard and the rate-window suppression before the
+	// task is spawned. Concurrent low-budget responses therefore queue exactly
+	// one identity rotation and emit exactly one warning.
+	if refresh_backoff_remaining().is_some() || low_budget_rotation_remaining().is_some() {
+		drop(rollover_guard);
+		return false;
+	}
+	suppress_low_budget_rotation_for(low_budget_rotation_delay(reset_after));
+
+	tokio::spawn(async move {
+		let _ = refresh_token_with_guard(RefreshReason::LowRateLimit, rollover_guard).await;
+	});
+	true
 }
 
-pub async fn force_refresh_token() -> RefreshOutcome {
+pub(crate) async fn force_refresh_token(reason: RefreshReason) -> RefreshOutcome {
 	if let Some(delay) = refresh_backoff_remaining() {
-		trace!("Skipping OAuth refresh during backoff ({delay:?} remaining)");
+		trace!("Skipping {} OAuth refresh during backoff ({delay:?} remaining)", reason.label());
 		return RefreshOutcome::BackingOff(delay);
 	}
 
-	let Some(_rollover_guard) = RolloverGuard::acquire() else {
+	let Some(rollover_guard) = RolloverGuard::acquire() else {
 		trace!("Skipping refresh token roll over, already in progress");
 		return RefreshOutcome::InProgress;
 	};
@@ -369,21 +450,36 @@ pub async fn force_refresh_token() -> RefreshOutcome {
 		return RefreshOutcome::BackingOff(delay);
 	}
 
-	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
+	refresh_token_with_guard(reason, rollover_guard).await
+}
+
+async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: RolloverGuard) -> RefreshOutcome {
+	trace!("Refreshing OAuth token: reason={} current_rate_limit={}", reason.label(), current_rate_limit_remaining());
 	let current_client = OAUTH_CLIENT.load_full();
-	match current_client.refreshed().await {
-		Ok(new_client) => {
-			OAUTH_CLIENT.swap(new_client.into());
-			OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+	match current_client.refreshed(reason).await {
+		Ok(mut refreshed) => {
+			refreshed.oauth.generation = current_client.generation.wrapping_add(1);
+			let generation = refreshed.oauth.generation;
+			OAUTH_CLIENT.swap(refreshed.oauth.into());
+			install_oauth_generation(generation, refreshed.fresh_identity);
 			refresh_backoff().record_success();
 			TOKEN_REFRESH_NOTIFY.notify_waiters();
-			info!("[✅] OAuth token refreshed successfully");
+			info!(
+				"[✅] OAuth token refreshed successfully: reason={} fresh_identity={}",
+				reason.label(),
+				refreshed.fresh_identity
+			);
 			RefreshOutcome::Refreshed
 		}
 		Err(error) => {
 			let delay = refresh_backoff().record_failure(Instant::now(), error.retry_after());
-			TOKEN_REFRESH_NOTIFY.notify_waiters();
-			error!("OAuth token refresh failed; retaining the current client and retrying in {delay:?}: {error}");
+			if reason != RefreshReason::LowRateLimit {
+				TOKEN_REFRESH_NOTIFY.notify_waiters();
+			}
+			error!(
+				"OAuth token refresh failed: reason={}; retaining the current client and retrying in {delay:?}: {error}",
+				reason.label()
+			);
 			RefreshOutcome::Failed(delay)
 		}
 	}
@@ -732,7 +828,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_oauth_client_refresh() {
-		force_refresh_token().await;
+		force_refresh_token(RefreshReason::Scheduled).await;
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -790,6 +886,48 @@ mod tests {
 		assert_eq!(token_refresh_delay(3600), Duration::from_secs(3480));
 		assert_eq!(token_refresh_delay(120), Duration::from_secs(1));
 		assert_eq!(token_refresh_delay(30), Duration::from_secs(1));
+	}
+
+	#[test]
+	fn test_low_budget_rotation_delay_uses_reset_and_bounds() {
+		assert_eq!(low_budget_rotation_delay(Some(Duration::from_secs(30))), Duration::from_secs(32));
+		assert_eq!(low_budget_rotation_delay(None), Duration::from_secs(62));
+		assert_eq!(low_budget_rotation_delay(Some(Duration::from_secs(9999))), MAX_LOW_BUDGET_ROTATION_DELAY);
+	}
+
+	#[test]
+	fn test_refresh_reason_selects_stable_or_fresh_identity() {
+		let original_backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		let original_device_id = match &original_backend {
+			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
+			OauthBackendImpl::GenericWeb(_) => unreachable!(),
+		};
+		let oauth = Oauth {
+			headers_map: HashMap::new(),
+			expires_in: 3600,
+			backend: original_backend,
+			generation: 4,
+		};
+
+		let (stable, stable_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled, false);
+		let (_, stable_fallback_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled, true);
+		let stable_device_id = match stable {
+			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
+			OauthBackendImpl::GenericWeb(_) => unreachable!(),
+		};
+		assert!(!stable_is_fresh);
+		assert!(stable_fallback_is_fresh);
+		assert_eq!(stable_device_id, original_device_id);
+
+		let (rotated, rotated_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit, false);
+		let (_, rotated_fallback_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit, true);
+		let rotated_device_id = match rotated {
+			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
+			OauthBackendImpl::GenericWeb(_) => unreachable!(),
+		};
+		assert!(rotated_is_fresh);
+		assert!(rotated_fallback_is_fresh);
+		assert_ne!(rotated_device_id, original_device_id);
 	}
 
 	#[test]

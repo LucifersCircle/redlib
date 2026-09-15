@@ -1,15 +1,7 @@
 name: Rust Build & Publish
 
 on:
-  push:
-    paths-ignore:
-      - "**.md"
-  
-    branches:
-      - 'main'
-  
-  release:
-    types: [published]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
