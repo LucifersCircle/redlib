@@ -55,6 +55,8 @@ const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
 const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
 const RATE_LIMIT_REMAINING_MASK: u64 = u16::MAX as u64;
+const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
+const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
 
 static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
 	let configured = max_concurrent_api_requests();
@@ -66,6 +68,7 @@ static UPSTREAM_GUARD: LazyLock<Mutex<UpstreamGuard>> = LazyLock::new(|| Mutex::
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CooldownReason {
 	RateLimit,
+	EdgeThrottle,
 	UpstreamFailures,
 }
 
@@ -73,15 +76,24 @@ impl CooldownReason {
 	fn message(self) -> &'static str {
 		match self {
 			Self::RateLimit => "Reddit requests are temporarily paused until the current rate-limit window resets",
+			Self::EdgeThrottle => "Reddit is temporarily rejecting this instance; upstream retries are being slowed",
 			Self::UpstreamFailures => "Reddit requests are temporarily paused after repeated upstream failures",
 		}
 	}
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct EdgeThrottleDecision {
+	delay: Duration,
+	consecutive_failures: u8,
+	started_cooldown: bool,
 }
 
 #[derive(Debug, Default)]
 struct UpstreamGuard {
 	failure_window_started: Option<Instant>,
 	failures_in_window: u8,
+	edge_throttle_failures: u8,
 	blocked_until: Option<Instant>,
 	blocked_reason: Option<CooldownReason>,
 }
@@ -119,6 +131,28 @@ impl UpstreamGuard {
 	fn record_success(&mut self) {
 		self.failure_window_started = None;
 		self.failures_in_window = 0;
+		self.edge_throttle_failures = 0;
+	}
+
+	fn record_edge_throttle(&mut self, now: Instant, retry_after: Option<Duration>) -> EdgeThrottleDecision {
+		if self.blocked_reason == Some(CooldownReason::EdgeThrottle) {
+			if let Some(delay) = self.cooldown_remaining(now) {
+				return EdgeThrottleDecision {
+					delay,
+					consecutive_failures: self.edge_throttle_failures,
+					started_cooldown: false,
+				};
+			}
+		}
+
+		self.edge_throttle_failures = self.edge_throttle_failures.saturating_add(1);
+		let delay = edge_throttle_delay(self.edge_throttle_failures, retry_after);
+		self.block_for(now, delay, CooldownReason::EdgeThrottle);
+		EdgeThrottleDecision {
+			delay,
+			consecutive_failures: self.edge_throttle_failures,
+			started_cooldown: true,
+		}
 	}
 
 	fn clear_rate_limit_block(&mut self) {
@@ -162,6 +196,29 @@ fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration 
 		.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
 		.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
 		.min(MAX_RATE_LIMIT_COOLDOWN)
+}
+
+fn edge_throttle_delay(consecutive_failures: u8, retry_after: Option<Duration>) -> Duration {
+	let exponent = u32::from(consecutive_failures.saturating_sub(1).min(7));
+	let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+	let exponential = Duration::from_secs(EDGE_THROTTLE_INITIAL_COOLDOWN.as_secs().saturating_mul(multiplier)).min(EDGE_THROTTLE_MAX_COOLDOWN);
+	let server_delay = retry_after.unwrap_or_default().saturating_add(RATE_LIMIT_COOLDOWN_MARGIN).min(MAX_RATE_LIMIT_COOLDOWN);
+	exponential.max(server_delay)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ThrottleKind {
+	Quota,
+	Edge,
+}
+
+fn classify_throttle_response(status: u16, retry_after_present: bool, quota_headers_present: bool) -> Option<ThrottleKind> {
+	match status {
+		429 => Some(ThrottleKind::Quota),
+		403 if retry_after_present && quota_headers_present => Some(ThrottleKind::Quota),
+		403 if retry_after_present => Some(ThrottleKind::Edge),
+		_ => None,
+	}
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -265,6 +322,14 @@ fn block_for_rate_limit(generation: u64, duration: Duration) -> bool {
 	true
 }
 
+fn block_for_edge_throttle(generation: u64, retry_after: Option<Duration>) -> Option<EdgeThrottleDecision> {
+	let mut guard = upstream_guard();
+	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) != generation {
+		return None;
+	}
+	Some(guard.record_edge_throttle(Instant::now(), retry_after))
+}
+
 fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str, generation: u64) {
 	let mut guard = upstream_guard();
 	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) != generation {
@@ -295,17 +360,19 @@ pub fn build_client() -> WreqClient {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
-	let emulation = [Emulation::Chrome145, Emulation::Firefox147];
-	let emulation_os = [EmulationOS::Android, EmulationOS::Windows];
+	let emulations = [Emulation::Chrome145, Emulation::Firefox147];
+	let emulation_operating_systems = [EmulationOS::Android, EmulationOS::Windows];
 
 	let rand = fastrand::usize(..);
+	let selected_emulation = emulations[rand % emulations.len()];
+	let selected_operating_system = emulation_operating_systems[rand % emulation_operating_systems.len()];
 	let emulation = EmulationOption::builder()
-		.emulation(emulation[rand % emulation.len()])
-		.emulation_os(emulation_os[rand % emulation_os.len()])
+		.emulation(selected_emulation)
+		.emulation_os(selected_operating_system)
 		.build()
 		.emulation();
 
-	info!("Building Wreq client with random emulation {:?}", emulation);
+	info!("Building Wreq client: browser={selected_emulation:?} os={selected_operating_system:?}");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
@@ -610,6 +677,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 	match reddit_get(path.clone(), quarantine, oauth_client).await {
 		Ok(response) => {
 			let status = response.status();
+			let status_code = status.as_u16();
 
 			let remaining = response.headers().get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
 			let reset = response.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
@@ -618,6 +686,8 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 			let parsed_remaining = parse_rate_limit_count(remaining);
 			let parsed_used = parse_rate_limit_count(used);
 			let reset_duration = parse_delay_seconds(reset);
+			let retry_after_duration = parse_delay_seconds(retry_after);
+			let quota_headers_present = remaining.is_some() || reset.is_some() || used.is_some();
 
 			if let Some(remaining) = parsed_remaining {
 				let response_is_current = update_rate_limit_remaining(&OAUTH_RATELIMIT_STATE, reservation.generation, remaining);
@@ -644,20 +714,49 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 				}
 			}
 
-			if status.as_u16() == 429 || (status.as_u16() == 403 && retry_after.is_some()) {
-				let delay = rate_limit_delay(retry_after, reset);
-				let response_is_current = block_for_rate_limit(reservation.generation, delay);
-				warn!(
-					"Reddit rate limit response: status={} endpoint={} retry_after_present={} reset_present={} current_generation={response_is_current}",
-					status,
-					endpoint_class(&path),
-					retry_after.is_some(),
-					reset.is_some(),
-				);
-				return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
+			match classify_throttle_response(status_code, retry_after.is_some(), quota_headers_present) {
+				Some(ThrottleKind::Quota) => {
+					let delay = rate_limit_delay(retry_after, reset);
+					let response_is_current = block_for_rate_limit(reservation.generation, delay);
+					warn!(
+						"Reddit quota response: status={} endpoint={} retry_after_seconds={} remaining_present={} reset_seconds={} used_present={} current_generation={response_is_current}",
+						status,
+						endpoint_class(&path),
+						retry_after_duration.map_or(0, |duration| duration.as_secs()),
+						remaining.is_some(),
+						reset_duration.map_or(0, |duration| duration.as_secs()),
+						used.is_some(),
+					);
+					return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
+				}
+				Some(ThrottleKind::Edge) => {
+					let decision = block_for_edge_throttle(reservation.generation, retry_after_duration);
+					match decision {
+						Some(decision) if decision.started_cooldown => warn!(
+							"Reddit edge throttle: status={} endpoint={} retry_after_seconds={} consecutive_failures={} cooldown_seconds={} current_generation=true",
+							status,
+							endpoint_class(&path),
+							retry_after_duration.map_or(0, |duration| duration.as_secs()),
+							decision.consecutive_failures,
+							decision.delay.as_secs(),
+						),
+						Some(decision) => trace!(
+							"Reddit edge throttle joined existing cooldown: endpoint={} cooldown_seconds={} current_generation=true",
+							endpoint_class(&path),
+							decision.delay.as_secs(),
+						),
+						None => trace!("Ignoring stale Reddit edge throttle response: endpoint={}", endpoint_class(&path)),
+					}
+					let delay = decision.map_or_else(
+						|| edge_throttle_delay(1, retry_after_duration),
+						|decision| decision.delay,
+					);
+					return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", delay.as_secs().max(1)));
+				}
+				None => {}
 			}
 
-			if status.as_u16() == 401 {
+			if status_code == 401 {
 				if !is_current_oauth_generation(reservation.generation) {
 					return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
 				}
@@ -868,6 +967,25 @@ mod tests {
 	}
 
 	#[test]
+	fn test_classify_throttle_response_separates_edge_denials() {
+		assert_eq!(classify_throttle_response(403, true, false), Some(ThrottleKind::Edge));
+		assert_eq!(classify_throttle_response(403, true, true), Some(ThrottleKind::Quota));
+		assert_eq!(classify_throttle_response(429, false, false), Some(ThrottleKind::Quota));
+		assert_eq!(classify_throttle_response(403, false, false), None);
+	}
+
+	#[test]
+	fn test_edge_throttle_delay_escalates_and_caps() {
+		assert_eq!(edge_throttle_delay(1, None), Duration::from_secs(5));
+		assert_eq!(edge_throttle_delay(2, None), Duration::from_secs(10));
+		assert_eq!(edge_throttle_delay(3, None), Duration::from_secs(20));
+		assert_eq!(edge_throttle_delay(4, None), Duration::from_secs(40));
+		assert_eq!(edge_throttle_delay(5, None), EDGE_THROTTLE_MAX_COOLDOWN);
+		assert_eq!(edge_throttle_delay(8, None), EDGE_THROTTLE_MAX_COOLDOWN);
+		assert_eq!(edge_throttle_delay(1, Some(Duration::from_secs(90))), Duration::from_secs(92));
+	}
+
+	#[test]
 	fn test_rate_limit_counter_does_not_underflow() {
 		let counter = AtomicU64::new(rate_limit_state(7, 1));
 		assert_eq!(
@@ -910,6 +1028,34 @@ mod tests {
 		assert!(guard.cooldown_remaining(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
 		guard.record_success();
 		assert_eq!(guard.failures_in_window, 0);
+	}
+
+	#[test]
+	fn test_edge_throttle_ignores_concurrent_responses_and_recovers() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let first = guard.record_edge_throttle(now, Some(Duration::from_secs(2)));
+		assert_eq!(
+			first,
+			EdgeThrottleDecision {
+				delay: Duration::from_secs(5),
+				consecutive_failures: 1,
+				started_cooldown: true,
+			}
+		);
+		let concurrent = guard.record_edge_throttle(now + Duration::from_secs(1), Some(Duration::from_secs(2)));
+		assert_eq!(concurrent.consecutive_failures, 1);
+		assert!(!concurrent.started_cooldown);
+
+		let second = guard.record_edge_throttle(now + Duration::from_secs(6), Some(Duration::from_secs(2)));
+		assert_eq!(second.delay, Duration::from_secs(10));
+		assert_eq!(second.consecutive_failures, 2);
+		assert!(second.started_cooldown);
+
+		guard.record_success();
+		let recovered = guard.record_edge_throttle(now + Duration::from_secs(17), Some(Duration::from_secs(2)));
+		assert_eq!(recovered.delay, Duration::from_secs(5));
+		assert_eq!(recovered.consecutive_failures, 1);
 	}
 
 	#[test]

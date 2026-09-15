@@ -25,7 +25,8 @@ const MAX_LOW_BUDGET_ROTATION_DELAY: Duration = Duration::from_secs(600);
 
 static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
 static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
-static LOW_BUDGET_ROTATION_NOT_BEFORE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+static LOW_BUDGET_ROTATION_SUPPRESSION: LazyLock<Mutex<LowBudgetRotationSuppression>> =
+	LazyLock::new(|| Mutex::new(LowBudgetRotationSuppression::default()));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RefreshReason {
@@ -283,6 +284,25 @@ struct RefreshBackoff {
 	retry_not_before: Option<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct LowBudgetRotationSuppression {
+	not_before: Option<Instant>,
+}
+
+impl LowBudgetRotationSuppression {
+	fn remaining(&self, now: Instant) -> Option<Duration> {
+		self.not_before.and_then(|deadline| deadline.checked_duration_since(now))
+	}
+
+	fn suppress_for(&mut self, now: Instant, duration: Duration) {
+		self.not_before = Some(now + duration);
+	}
+
+	fn clear(&mut self) {
+		self.not_before = None;
+	}
+}
+
 impl RefreshBackoff {
 	fn retry_remaining(&self, now: Instant) -> Option<Duration> {
 		self.retry_not_before.and_then(|deadline| deadline.checked_duration_since(now))
@@ -346,14 +366,24 @@ fn low_budget_rotation_delay(reset_after: Option<Duration>) -> Duration {
 }
 
 fn low_budget_rotation_remaining() -> Option<Duration> {
-	LOW_BUDGET_ROTATION_NOT_BEFORE
+	LOW_BUDGET_ROTATION_SUPPRESSION
 		.lock()
 		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+		.remaining(Instant::now())
 }
 
 fn suppress_low_budget_rotation_for(duration: Duration) {
-	*LOW_BUDGET_ROTATION_NOT_BEFORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + duration);
+	LOW_BUDGET_ROTATION_SUPPRESSION
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.suppress_for(Instant::now(), duration);
+}
+
+fn clear_low_budget_rotation_suppression() {
+	LOW_BUDGET_ROTATION_SUPPRESSION
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.clear();
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -462,6 +492,12 @@ async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: Rollov
 			let generation = refreshed.oauth.generation;
 			OAUTH_CLIENT.swap(refreshed.oauth.into());
 			install_oauth_generation(generation, refreshed.fresh_identity);
+			if refreshed.fresh_identity {
+				// The suppression deadline belongs to the previous identity's
+				// rate-limit window. A successfully installed fresh identity has
+				// its own budget and must not inherit that stale deadline.
+				clear_low_budget_rotation_suppression();
+			}
 			refresh_backoff().record_success();
 			TOKEN_REFRESH_NOTIFY.notify_waiters();
 			info!(
@@ -893,6 +929,16 @@ mod tests {
 		assert_eq!(low_budget_rotation_delay(Some(Duration::from_secs(30))), Duration::from_secs(32));
 		assert_eq!(low_budget_rotation_delay(None), Duration::from_secs(62));
 		assert_eq!(low_budget_rotation_delay(Some(Duration::from_secs(9999))), MAX_LOW_BUDGET_ROTATION_DELAY);
+	}
+
+	#[test]
+	fn test_low_budget_rotation_suppression_clears_after_fresh_identity() {
+		let now = Instant::now();
+		let mut suppression = LowBudgetRotationSuppression::default();
+		suppression.suppress_for(now, Duration::from_secs(30));
+		assert_eq!(suppression.remaining(now + Duration::from_secs(5)), Some(Duration::from_secs(25)));
+		suppression.clear();
+		assert_eq!(suppression.remaining(now), None);
 	}
 
 	#[test]
