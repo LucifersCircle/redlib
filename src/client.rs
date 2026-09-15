@@ -747,10 +747,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 						),
 						None => trace!("Ignoring stale Reddit edge throttle response: endpoint={}", endpoint_class(&path)),
 					}
-					let delay = decision.map_or_else(
-						|| edge_throttle_delay(1, retry_after_duration),
-						|decision| decision.delay,
-					);
+					let delay = decision.map_or_else(|| edge_throttle_delay(1, retry_after_duration), |decision| decision.delay);
 					return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", delay.as_secs().max(1)));
 				}
 				None => {}

@@ -25,8 +25,7 @@ const MAX_LOW_BUDGET_ROTATION_DELAY: Duration = Duration::from_secs(600);
 
 static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
 static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
-static LOW_BUDGET_ROTATION_SUPPRESSION: LazyLock<Mutex<LowBudgetRotationSuppression>> =
-	LazyLock::new(|| Mutex::new(LowBudgetRotationSuppression::default()));
+static LOW_BUDGET_ROTATION_SUPPRESSION: LazyLock<Mutex<LowBudgetRotationSuppression>> = LazyLock::new(|| Mutex::new(LowBudgetRotationSuppression::default()));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RefreshReason {
@@ -380,10 +379,7 @@ fn suppress_low_budget_rotation_for(duration: Duration) {
 }
 
 fn clear_low_budget_rotation_suppression() {
-	LOW_BUDGET_ROTATION_SUPPRESSION
-		.lock()
-		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.clear();
+	LOW_BUDGET_ROTATION_SUPPRESSION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
