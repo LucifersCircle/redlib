@@ -1,109 +1,78 @@
-name: Container build
+name: Docker Hub
 
 on:
-  workflow_run:
-    workflows: ["Release Build"]
-    types:
-      - completed
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-hub-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
-  REGISTRY_IMAGE: quay.io/redlib/redlib
+  REGISTRY_IMAGE: luciferscircle/redlib
 
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { platform: linux/amd64, target: x86_64-unknown-linux-musl }
-          - { platform: linux/arm64, target: aarch64-unknown-linux-musl }
-          - { platform: linux/arm/v7, target: armv7-unknown-linux-musleabihf }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          images: ${{ env.REGISTRY_IMAGE }}
-          tags: |
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+          components: rustfmt, clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev
+      - name: Check formatting
+        run: rustfmt --edition 2021 --check src/client.rs
+      - name: Check code
+        run: cargo check --locked --all-targets
+      - name: Run deterministic resilience tests
+        run: |
+          cargo test --locked --lib test_parse_max_concurrency
+          cargo test --locked --lib test_parse_delay_seconds
+          cargo test --locked --lib test_rate_limit_counter_does_not_underflow
+          cargo test --locked --lib test_upstream_guard_opens_after_burst_and_recovers
+          cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
+          cargo test --locked --lib test_identical_cache_misses_are_coalesced
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to Quay.io Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          file: Dockerfile
-          build-args: TARGET=${{ matrix.target }}
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.target }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-  merge:
-    runs-on: ubuntu-latest
-    needs:
-      - build
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4.1.7
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Docker meta
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Generate image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-      - name: Login to Quay.io Container Registry
-        uses: docker/login-action@v3
+            type=raw,value=latest
+            type=sha,prefix=sha-
+      - name: Build and push fork source
+        uses: docker/build-push-action@v6
         with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
-      - name: Create manifest list and push
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
-
-      # - name: Push README to Quay.io
-      #   uses: christian-korneck/update-container-description-action@v1
-      #   env:
-      #     DOCKER_APIKEY: ${{ secrets.APIKEY__QUAY_IO }}
-      #   with:
-      #     destination_container_repo: quay.io/redlib/redlib
-      #     provider: quay
-      #     readme_file: 'README.md'
-
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+          context: .
+          file: Dockerfile.ubuntu
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
