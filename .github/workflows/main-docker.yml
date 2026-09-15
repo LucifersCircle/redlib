@@ -31,17 +31,23 @@ jobs:
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev
       - name: Check formatting
-        run: rustfmt --edition 2021 --check src/client.rs
+        run: rustfmt --edition 2021 --check src/client.rs src/oauth.rs
       - name: Check code
         run: cargo check --locked --all-targets
       - name: Run deterministic resilience tests
         run: |
           cargo test --locked --lib test_parse_max_concurrency
           cargo test --locked --lib test_parse_delay_seconds
+          cargo test --locked --lib test_rate_limit_delay_adds_margin_and_respects_cap
           cargo test --locked --lib test_rate_limit_counter_does_not_underflow
           cargo test --locked --lib test_upstream_guard_opens_after_burst_and_recovers
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
+          cargo test --locked --lib test_refresh_retry_delay_is_exponential_and_capped
+          cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
+          cargo test --locked --lib test_refresh_backoff_recovers_after_success
+          cargo test --locked --lib test_token_refresh_delay_cannot_underflow
+          cargo test --locked --lib test_alternate_backend_changes_kind
 
   publish:
     if: github.event_name != 'pull_request'
