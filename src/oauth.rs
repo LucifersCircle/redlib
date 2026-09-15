@@ -712,6 +712,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "requires live Reddit GenericWeb OAuth access"]
 	async fn test_generic_web_backend() {
 		// Test GenericWebAuth backend specifically
 		let mut backend = GenericWebAuth::new();
