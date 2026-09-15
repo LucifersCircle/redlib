@@ -1027,7 +1027,7 @@ pub fn format_url(url: &str) -> String {
 				regex.captures(url).map_or(String::new(), |caps| match segments {
 					1 => [format, &caps[1]].join(""),
 					2 => [format, &caps[1], "/", &caps[2]].join(""),
-					3 => [format, &caps[1], "/", &caps[2].to_lowercase().as_str(), "/", &caps[3]].join(""),
+					3 => [format, &caps[1], "/", caps[2].to_lowercase().as_str(), "/", &caps[3]].join(""),
 					_ => String::new(),
 				})
 			};
