@@ -1,5 +1,8 @@
 # Redlib
 
+> [!NOTE]
+> Docker images for this fork are published at [Docker Hub](https://hub.docker.com/r/luciferscircle/redlib): `docker.io/luciferscircle/redlib:latest`.
+
 > An alternative private front-end to Reddit, with its origins in [Libreddit](https://github.com/libreddit/libreddit).
 
 ![screenshot](https://i.ibb.co/18vrdxk/redlib-rust.png)
