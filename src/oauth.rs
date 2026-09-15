@@ -142,7 +142,7 @@ impl Oauth {
 		let mut primary = self.backend.clone();
 		let primary_name = primary.name();
 		match Self::authenticate_with_backend(&mut primary).await {
-			Ok(oauth) => return Ok(oauth),
+			Ok(oauth) => Ok(oauth),
 			Err(primary_error) => {
 				warn!("OAuth refresh with existing {primary_name} identity failed: {primary_error}");
 				let mut fallback = self.backend.alternate();
@@ -304,10 +304,6 @@ pub enum RefreshOutcome {
 }
 
 impl RefreshOutcome {
-	pub fn was_refreshed(self) -> bool {
-		matches!(self, Self::Refreshed)
-	}
-
 	pub fn retry_after(self) -> Option<Duration> {
 		match self {
 			Self::BackingOff(delay) | Self::Failed(delay) => Some(delay),

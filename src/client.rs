@@ -631,34 +631,18 @@ async fn self_check(sub: &str) -> Result<(), String> {
 }
 
 pub async fn rate_limit_check() -> Result<(), String> {
-	// First, test the Oauth client: we can perform a rate limit check if the OAuth backend is MobileSpoof; if GenericWeb, we skip the check.
+	// We can perform a startup reachability check if the OAuth backend is
+	// MobileSpoof; GenericWeb does not expose the same rate-limit behavior.
 	if matches!(OAUTH_CLIENT.load().backend, OauthBackendImpl::GenericWeb(_)) {
 		warn!("[⚠️] Cannot perform rate limit check, running as GenericWeb. Skipping check.");
 		return Ok(());
 	}
 
-	// First, check a subreddit.
+	// Make one uncached request. Older versions refreshed OAuth here and made a
+	// second request to test whether Reddit associated the budget with an IP or
+	// token. That creates unnecessary authentication traffic at every startup
+	// and conflicts with preserving a stable device identity across refreshes.
 	self_check("reddit").await?;
-	// This will reduce the rate limit to 99. Assert this check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 1 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
-	}
-	// Now, we switch out the OAuth client.
-	// This checks for the IP rate limit association.
-	let outcome = force_refresh_token().await;
-	if !outcome.was_refreshed() {
-		return Err(match outcome.retry_after() {
-			Some(delay) => format!("OAuth rollover check could not refresh the token; retry available in {} seconds", delay.as_secs().max(1)),
-			None => "OAuth rollover check found another refresh already in progress".to_string(),
-		});
-	}
-	// Now, check a new sub to break cache.
-	self_check("rust").await?;
-	// Again, assert the rate limit check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 2 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
-	}
-
 	Ok(())
 }
 
