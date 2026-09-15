@@ -3,6 +3,7 @@ name: Docker Hub
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -43,6 +44,7 @@ jobs:
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
 
   publish:
+    if: github.event_name != 'pull_request'
     needs: verify
     runs-on: ubuntu-latest
     steps:
