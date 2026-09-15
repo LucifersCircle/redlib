@@ -1,5 +1,5 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
+use crate::oauth::{force_refresh_token, should_attempt_refresh, token_daemon, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
@@ -49,8 +49,13 @@ const FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 const FAILURE_THRESHOLD: u8 = 3;
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
+const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
 
-static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(max_concurrent_api_requests()));
+static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
+	let configured = max_concurrent_api_requests();
+	info!("Reddit API concurrency limit: {configured}");
+	Semaphore::new(configured)
+});
 static UPSTREAM_GUARD: LazyLock<Mutex<UpstreamGuard>> = LazyLock::new(|| Mutex::new(UpstreamGuard::default()));
 
 #[derive(Debug, Default)]
@@ -112,6 +117,14 @@ fn parse_delay_seconds(value: Option<&str>) -> Option<Duration> {
 		.ok()
 		.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
 		.map(|seconds| Duration::from_secs_f64(seconds).min(MAX_RATE_LIMIT_COOLDOWN))
+}
+
+fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration {
+	parse_delay_seconds(retry_after)
+		.or_else(|| parse_delay_seconds(reset))
+		.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
+		.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
+		.min(MAX_RATE_LIMIT_COOLDOWN)
 }
 
 fn reserve_rate_limit_slot(counter: &AtomicU16) -> u16 {
@@ -472,7 +485,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 	// Reserve estimated OAuth budget only when an upstream call will be made.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
-	if current_rate_limit < 10 && !is_rolling_over {
+	if current_rate_limit < 10 && should_attempt_refresh() {
 		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
 		tokio::spawn(force_refresh_token());
 	}
@@ -498,15 +511,13 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 				if let Ok(val) = remaining.parse::<f32>() {
 					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
 					if val <= 0.0 {
-						block_for_rate_limit(parse_delay_seconds(Some(reset)).unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN));
+						block_for_rate_limit(rate_limit_delay(None, Some(reset)));
 					}
 				}
 			}
 
 			if status.as_u16() == 429 || (status.as_u16() == 403 && retry_after.is_some()) {
-				let delay = parse_delay_seconds(retry_after)
-					.or_else(|| parse_delay_seconds(reset))
-					.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN);
+				let delay = rate_limit_delay(retry_after, reset);
 				block_for_rate_limit(delay);
 				warn!(
 					"Reddit rate limit response: status={} endpoint={} retry_after_present={} reset_present={}",
@@ -520,7 +531,10 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 
 			if status.as_u16() == 401 {
 				error!("Reddit rejected the OAuth token; forcing a refresh");
-				force_refresh_token().await;
+				let outcome = force_refresh_token().await;
+				if let Some(delay) = outcome.retry_after() {
+					return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
+				}
 				return Err("OAuth token has expired. Please refresh the page!".to_string());
 			}
 
@@ -554,7 +568,10 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 								// OAuth token has expired; http status 401
 								if json["message"] == "Unauthorized" {
 									error!("Forcing a token refresh");
-									let () = force_refresh_token().await;
+									let outcome = force_refresh_token().await;
+									if let Some(delay) = outcome.retry_after() {
+										return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
+									}
 									return Err("OAuth token has expired. Please refresh the page!".to_string());
 								}
 
@@ -614,28 +631,18 @@ async fn self_check(sub: &str) -> Result<(), String> {
 }
 
 pub async fn rate_limit_check() -> Result<(), String> {
-	// First, test the Oauth client: we can perform a rate limit check if the OAuth backend is MobileSpoof; if GenericWeb, we skip the check.
+	// We can perform a startup reachability check if the OAuth backend is
+	// MobileSpoof; GenericWeb does not expose the same rate-limit behavior.
 	if matches!(OAUTH_CLIENT.load().backend, OauthBackendImpl::GenericWeb(_)) {
 		warn!("[⚠️] Cannot perform rate limit check, running as GenericWeb. Skipping check.");
 		return Ok(());
 	}
 
-	// First, check a subreddit.
+	// Make one uncached request. Older versions refreshed OAuth here and made a
+	// second request to test whether Reddit associated the budget with an IP or
+	// token. That creates unnecessary authentication traffic at every startup
+	// and conflicts with preserving a stable device identity across refreshes.
 	self_check("reddit").await?;
-	// This will reduce the rate limit to 99. Assert this check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 1 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
-	}
-	// Now, we switch out the OAuth client.
-	// This checks for the IP rate limit association.
-	force_refresh_token().await;
-	// Now, check a new sub to break cache.
-	self_check("rust").await?;
-	// Again, assert the rate limit check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 2 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
-	}
-
 	Ok(())
 }
 
@@ -708,6 +715,14 @@ mod tests {
 		assert_eq!(parse_delay_seconds(Some("-1")), None);
 		assert_eq!(parse_delay_seconds(Some("not-a-number")), None);
 		assert_eq!(parse_delay_seconds(None), None);
+	}
+
+	#[test]
+	fn test_rate_limit_delay_adds_margin_and_respects_cap() {
+		assert_eq!(rate_limit_delay(Some("1"), None), Duration::from_secs(3));
+		assert_eq!(rate_limit_delay(None, Some("20")), Duration::from_secs(22));
+		assert_eq!(rate_limit_delay(Some("9999"), None), MAX_RATE_LIMIT_COOLDOWN);
+		assert_eq!(rate_limit_delay(None, None), Duration::from_secs(12));
 	}
 
 	#[test]
