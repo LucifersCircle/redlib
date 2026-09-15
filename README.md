@@ -417,6 +417,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
+| `REDDIT_MAX_CONCURRENCY`  | Integer 1-64    | `8`                    | Caps simultaneous Reddit JSON API requests to flatten bursts and reduce upstream rate-limit pressure.    |
 
 ## Default user settings
 

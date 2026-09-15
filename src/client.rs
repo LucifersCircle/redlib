@@ -10,10 +10,13 @@ use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperR
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
+use std::env;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Response as WreqResponse};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
@@ -38,6 +41,125 @@ pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
+
+const DEFAULT_MAX_CONCURRENT_API_REQUESTS: usize = 8;
+const MAX_CONFIGURED_API_REQUESTS: usize = 64;
+const FAILURE_WINDOW: Duration = Duration::from_secs(10);
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
+const FAILURE_THRESHOLD: u8 = 3;
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
+
+static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(max_concurrent_api_requests()));
+static UPSTREAM_GUARD: LazyLock<Mutex<UpstreamGuard>> = LazyLock::new(|| Mutex::new(UpstreamGuard::default()));
+
+#[derive(Debug, Default)]
+struct UpstreamGuard {
+	failure_window_started: Option<Instant>,
+	failures_in_window: u8,
+	blocked_until: Option<Instant>,
+}
+
+impl UpstreamGuard {
+	fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
+		self.blocked_until.and_then(|deadline| deadline.checked_duration_since(now))
+	}
+
+	fn block_for(&mut self, now: Instant, duration: Duration) {
+		let deadline = now + duration.min(MAX_RATE_LIMIT_COOLDOWN);
+		if self.blocked_until.map_or(true, |current| deadline > current) {
+			self.blocked_until = Some(deadline);
+		}
+	}
+
+	fn record_failure(&mut self, now: Instant) -> bool {
+		if self.failure_window_started.map_or(true, |started| now.duration_since(started) > FAILURE_WINDOW) {
+			self.failure_window_started = Some(now);
+			self.failures_in_window = 0;
+		}
+
+		self.failures_in_window = self.failures_in_window.saturating_add(1);
+		if self.failures_in_window >= FAILURE_THRESHOLD {
+			self.block_for(now, FAILURE_COOLDOWN);
+			self.failure_window_started = None;
+			self.failures_in_window = 0;
+			true
+		} else {
+			false
+		}
+	}
+
+	fn record_success(&mut self) {
+		self.failure_window_started = None;
+		self.failures_in_window = 0;
+	}
+}
+
+fn max_concurrent_api_requests() -> usize {
+	parse_max_concurrency(env::var("REDLIB_REDDIT_MAX_CONCURRENCY").ok().as_deref())
+}
+
+fn parse_max_concurrency(value: Option<&str>) -> usize {
+	value
+		.and_then(|value| value.parse::<usize>().ok())
+		.unwrap_or(DEFAULT_MAX_CONCURRENT_API_REQUESTS)
+		.clamp(1, MAX_CONFIGURED_API_REQUESTS)
+}
+
+fn parse_delay_seconds(value: Option<&str>) -> Option<Duration> {
+	value?
+		.parse::<f64>()
+		.ok()
+		.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+		.map(|seconds| Duration::from_secs_f64(seconds).min(MAX_RATE_LIMIT_COOLDOWN))
+}
+
+fn reserve_rate_limit_slot(counter: &AtomicU16) -> u16 {
+	counter
+		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| Some(value.saturating_sub(1)))
+		.unwrap_or_else(|value| value)
+}
+
+fn endpoint_class(path: &str) -> &'static str {
+	match path.split('?').next().unwrap_or_default().split('/').nth(1) {
+		Some("r") => "subreddit",
+		Some("user") => "user",
+		Some("api") => "api",
+		Some("search.json") => "search",
+		Some("comments") => "comments",
+		_ => "other",
+	}
+}
+
+fn upstream_guard() -> std::sync::MutexGuard<'static, UpstreamGuard> {
+	UPSTREAM_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn cooldown_error() -> Option<String> {
+	upstream_guard().cooldown_remaining(Instant::now()).map(|remaining| {
+		format!(
+			"Reddit requests are temporarily paused after upstream failures. Retry in {} seconds",
+			remaining.as_secs().max(1)
+		)
+	})
+}
+
+fn block_for_rate_limit(duration: Duration) {
+	upstream_guard().block_for(Instant::now(), duration);
+}
+
+fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str) {
+	let opened = upstream_guard().record_failure(Instant::now());
+	warn!(
+		"Reddit upstream failure: kind={kind} status={} endpoint={} circuit_opened={opened}",
+		status.map_or_else(|| "transport".to_string(), |status| status.to_string()),
+		endpoint_class(path),
+	);
+}
+
+fn record_upstream_success() {
+	upstream_guard().record_success();
+}
 
 const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
@@ -318,34 +440,55 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	.boxed()
 }
 
-/// Make a request to a Reddit API and parse the JSON response
-#[cached(size = 100, time = 30, result = true)]
+/// Make a request to a Reddit API and parse the JSON response.
+///
+/// The short outer cache coalesces identical concurrent misses and briefly
+/// caches errors. The inner cache keeps successful responses longer and can
+/// serve its most recent success if a refresh fails.
+#[cached(size = 1024, time = 2, sync_writes = "by_key")]
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
+	json_cached(path, quarantine).await
+}
+
+#[cached(size = 1024, time = 60, result = true, result_fallback = true)]
+async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	// First, handle rolling over the OAUTH_CLIENT if need be.
+	if let Some(error) = cooldown_error() {
+		return Err(error);
+	}
+
+	let _permit = REDDIT_API_CONCURRENCY.acquire().await.map_err(|_| "Reddit request limiter is unavailable".to_string())?;
+
+	// A cooldown may have started while this request was waiting for a permit.
+	if let Some(error) = cooldown_error() {
+		return Err(error);
+	}
+
+	// Reserve estimated OAuth budget only when an upstream call will be made.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
 	if current_rate_limit < 10 && !is_rolling_over {
 		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
 		tokio::spawn(force_refresh_token());
 	}
-	OAUTH_RATELIMIT_REMAINING.fetch_sub(1, Ordering::SeqCst);
+	reserve_rate_limit_slot(&OAUTH_RATELIMIT_REMAINING);
 
 	// Fetch the url...
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
 
-			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
-				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-				response.headers().get("x-ratelimit-reset").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-				response.headers().get("x-ratelimit-used").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
-			) {
+			let remaining = response.headers().get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
+			let reset = response.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
+			let used = response.headers().get("x-ratelimit-used").and_then(|value| value.to_str().ok());
+			let retry_after = response.headers().get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
+
+			if let (Some(remaining), Some(reset), Some(used)) = (remaining, reset, used) {
 				trace!(
 					"Ratelimit remaining: Header says {remaining}, we have {current_rate_limit}. Resets in {reset}. Rollover: {}. Ratelimit used: {used}",
 					if is_rolling_over { "yes" } else { "no" },
@@ -354,12 +497,32 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 				// If can parse remaining as a float, round to a u16 and save
 				if let Ok(val) = remaining.parse::<f32>() {
 					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
+					if val <= 0.0 {
+						block_for_rate_limit(parse_delay_seconds(Some(reset)).unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN));
+					}
 				}
+			}
 
-				Some(reset)
-			} else {
-				None
-			};
+			if status.as_u16() == 429 || (status.as_u16() == 403 && retry_after.is_some()) {
+				let delay = parse_delay_seconds(retry_after)
+					.or_else(|| parse_delay_seconds(reset))
+					.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN);
+				block_for_rate_limit(delay);
+				warn!(
+					"Reddit rate limit response: status={} endpoint={} retry_after_present={} reset_present={}",
+					status,
+					endpoint_class(&path),
+					retry_after.is_some(),
+					reset.is_some(),
+				);
+				return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
+			}
+
+			if status.as_u16() == 401 {
+				error!("Reddit rejected the OAuth token; forcing a refresh");
+				force_refresh_token().await;
+				return Err("OAuth token has expired. Please refresh the page!".to_string());
+			}
 
 			// asynchronously aggregate the chunks of the body
 			match hyper::body::aggregate(response.into_hyper_response()).await {
@@ -367,21 +530,15 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					let has_remaining = body.has_remaining();
 
 					if !has_remaining {
-						// Rate limited, so spawn a force_refresh_token()
-						tokio::spawn(force_refresh_token());
-						return match reset {
-							Some(val) => Err(format!(
-								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
-								 Rate limit will reset in: {val}"
-							)),
-							None => Err("Reddit rate limit exceeded".to_string()),
-						};
+						record_upstream_failure("empty_body", Some(status.as_u16()), &path);
+						return Err(format!("Reddit returned an empty response (status {status})"));
 					}
 
 					// Parse the response from Reddit as JSON
 					match serde_json::from_reader(body.reader()) {
 						Ok(value) => {
 							let json: Value = value;
+							record_upstream_success();
 
 							// If user is suspended
 							if let Some(data) = json.get("data") {
@@ -425,6 +582,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
+							record_upstream_failure("invalid_json", Some(status.as_u16()), &path);
 							if status.is_server_error() {
 								Err("Reddit is having issues, check if there's an outage".to_string())
 							} else {
@@ -433,10 +591,16 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 					}
 				}
-				Err(e) => err("Failed receiving body from Reddit", e.to_string(), path),
+				Err(e) => {
+					record_upstream_failure("body_transport", Some(status.as_u16()), &path);
+					err("Failed receiving body from Reddit", e.to_string(), path)
+				}
 			}
 		}
-		Err(e) => err("Couldn't send request to Reddit", e, path),
+		Err(e) => {
+			record_upstream_failure("request_transport", None, &path);
+			err("Couldn't send request to Reddit", e, path)
+		}
 	}
 }
 
@@ -507,9 +671,73 @@ impl IntoHyperResponse for WreqResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::sync::atomic::AtomicUsize;
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+	static COALESCED_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+	#[cached(size = 8, time = 30, sync_writes = "by_key")]
+	async fn coalesced_test_fetch(key: u8) -> u8 {
+		COALESCED_TEST_CALLS.fetch_add(1, Ordering::SeqCst);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		key
+	}
+
+	#[tokio::test]
+	async fn test_identical_cache_misses_are_coalesced() {
+		COALESCED_TEST_CALLS.store(0, Ordering::SeqCst);
+		let (first, second, third) = tokio::join!(coalesced_test_fetch(42), coalesced_test_fetch(42), coalesced_test_fetch(42));
+		assert_eq!((first, second, third), (42, 42, 42));
+		assert_eq!(COALESCED_TEST_CALLS.load(Ordering::SeqCst), 1);
+	}
+
+	#[test]
+	fn test_parse_max_concurrency() {
+		assert_eq!(parse_max_concurrency(None), DEFAULT_MAX_CONCURRENT_API_REQUESTS);
+		assert_eq!(parse_max_concurrency(Some("invalid")), DEFAULT_MAX_CONCURRENT_API_REQUESTS);
+		assert_eq!(parse_max_concurrency(Some("0")), 1);
+		assert_eq!(parse_max_concurrency(Some("12")), 12);
+		assert_eq!(parse_max_concurrency(Some("1000")), MAX_CONFIGURED_API_REQUESTS);
+	}
+
+	#[test]
+	fn test_parse_delay_seconds() {
+		assert_eq!(parse_delay_seconds(Some("1.5")), Some(Duration::from_millis(1500)));
+		assert_eq!(parse_delay_seconds(Some("9999")), Some(MAX_RATE_LIMIT_COOLDOWN));
+		assert_eq!(parse_delay_seconds(Some("-1")), None);
+		assert_eq!(parse_delay_seconds(Some("not-a-number")), None);
+		assert_eq!(parse_delay_seconds(None), None);
+	}
+
+	#[test]
+	fn test_rate_limit_counter_does_not_underflow() {
+		let counter = AtomicU16::new(1);
+		assert_eq!(reserve_rate_limit_slot(&counter), 1);
+		assert_eq!(counter.load(Ordering::SeqCst), 0);
+		assert_eq!(reserve_rate_limit_slot(&counter), 0);
+		assert_eq!(counter.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
+	fn test_upstream_guard_opens_after_burst_and_recovers() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		assert!(!guard.record_failure(now));
+		assert!(!guard.record_failure(now + Duration::from_secs(1)));
+		assert!(guard.record_failure(now + Duration::from_secs(2)));
+		assert!(guard.cooldown_remaining(now + Duration::from_secs(3)).is_some());
+		assert!(guard.cooldown_remaining(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
+		guard.record_success();
+		assert_eq!(guard.failures_in_window, 0);
+	}
+
+	#[test]
+	fn test_endpoint_class_does_not_log_resource_names() {
+		assert_eq!(endpoint_class("/r/example/hot.json?raw_json=1"), "subreddit");
+		assert_eq!(endpoint_class("/user/example/about.json"), "user");
+		assert_eq!(endpoint_class("/search.json?q=private"), "search");
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_rate_limit_check() {
