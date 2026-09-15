@@ -1,14 +1,7 @@
 name: Release Build
 
 on:
-  push:
-    paths-ignore:
-      - "*.md"
-      - "compose.*"
-    branches:
-      - "main"
-  release:
-    types: [published]
+  workflow_dispatch:
 
 env: 
   CARGO_TERM_COLOR: always
@@ -71,6 +64,5 @@ jobs:
           body: |
             - ${{ github.event.head_commit.message }} ${{ github.sha }}
           generate_release_notes: true
-
 
 

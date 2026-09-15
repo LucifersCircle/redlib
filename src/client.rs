@@ -1,5 +1,5 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, should_attempt_refresh, token_daemon, Oauth, OauthBackendImpl};
+use crate::oauth::{force_refresh_token, spawn_rate_limit_refresh, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
 use crate::server::RequestExt;
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
@@ -13,8 +13,8 @@ use serde_json::Value;
 use std::env;
 use std::result::Result;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use wreq::redirect::Policy;
@@ -38,7 +38,10 @@ pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	ArcSwap::new(client.into())
 });
 
-pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
+// The high bits identify the OAuth client generation and the low 16 bits hold
+// its estimated remaining request budget. Keeping them in one atomic prevents
+// late responses from an old token from overwriting a newly rotated budget.
+static OAUTH_RATELIMIT_STATE: AtomicU64 = AtomicU64::new(99);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 
@@ -50,6 +53,8 @@ const FAILURE_THRESHOLD: u8 = 3;
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
+const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
+const RATE_LIMIT_REMAINING_MASK: u64 = u16::MAX as u64;
 
 static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
 	let configured = max_concurrent_api_requests();
@@ -58,11 +63,27 @@ static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
 });
 static UPSTREAM_GUARD: LazyLock<Mutex<UpstreamGuard>> = LazyLock::new(|| Mutex::new(UpstreamGuard::default()));
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CooldownReason {
+	RateLimit,
+	UpstreamFailures,
+}
+
+impl CooldownReason {
+	fn message(self) -> &'static str {
+		match self {
+			Self::RateLimit => "Reddit requests are temporarily paused until the current rate-limit window resets",
+			Self::UpstreamFailures => "Reddit requests are temporarily paused after repeated upstream failures",
+		}
+	}
+}
+
 #[derive(Debug, Default)]
 struct UpstreamGuard {
 	failure_window_started: Option<Instant>,
 	failures_in_window: u8,
 	blocked_until: Option<Instant>,
+	blocked_reason: Option<CooldownReason>,
 }
 
 impl UpstreamGuard {
@@ -70,10 +91,11 @@ impl UpstreamGuard {
 		self.blocked_until.and_then(|deadline| deadline.checked_duration_since(now))
 	}
 
-	fn block_for(&mut self, now: Instant, duration: Duration) {
+	fn block_for(&mut self, now: Instant, duration: Duration, reason: CooldownReason) {
 		let deadline = now + duration.min(MAX_RATE_LIMIT_COOLDOWN);
 		if self.blocked_until.map_or(true, |current| deadline > current) {
 			self.blocked_until = Some(deadline);
+			self.blocked_reason = Some(reason);
 		}
 	}
 
@@ -85,7 +107,7 @@ impl UpstreamGuard {
 
 		self.failures_in_window = self.failures_in_window.saturating_add(1);
 		if self.failures_in_window >= FAILURE_THRESHOLD {
-			self.block_for(now, FAILURE_COOLDOWN);
+			self.block_for(now, FAILURE_COOLDOWN, CooldownReason::UpstreamFailures);
 			self.failure_window_started = None;
 			self.failures_in_window = 0;
 			true
@@ -97,6 +119,13 @@ impl UpstreamGuard {
 	fn record_success(&mut self) {
 		self.failure_window_started = None;
 		self.failures_in_window = 0;
+	}
+
+	fn clear_rate_limit_block(&mut self) {
+		if self.blocked_reason == Some(CooldownReason::RateLimit) {
+			self.blocked_until = None;
+			self.blocked_reason = None;
+		}
 	}
 }
 
@@ -119,6 +148,14 @@ fn parse_delay_seconds(value: Option<&str>) -> Option<Duration> {
 		.map(|seconds| Duration::from_secs_f64(seconds).min(MAX_RATE_LIMIT_COOLDOWN))
 }
 
+fn parse_rate_limit_count(value: Option<&str>) -> Option<u16> {
+	value?
+		.parse::<f64>()
+		.ok()
+		.filter(|count| count.is_finite() && *count >= 0.0)
+		.map(|count| count.round().min(f64::from(u16::MAX)) as u16)
+}
+
 fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration {
 	parse_delay_seconds(retry_after)
 		.or_else(|| parse_delay_seconds(reset))
@@ -127,10 +164,73 @@ fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration 
 		.min(MAX_RATE_LIMIT_COOLDOWN)
 }
 
-fn reserve_rate_limit_slot(counter: &AtomicU16) -> u16 {
-	counter
-		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| Some(value.saturating_sub(1)))
-		.unwrap_or_else(|value| value)
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RateLimitReservation {
+	generation: u64,
+	previous_remaining: u16,
+}
+
+fn rate_limit_state(generation: u64, remaining: u16) -> u64 {
+	(generation << 16) | u64::from(remaining)
+}
+
+fn rate_limit_generation(state: u64) -> u64 {
+	state >> 16
+}
+
+fn rate_limit_remaining(state: u64) -> u16 {
+	(state & RATE_LIMIT_REMAINING_MASK) as u16
+}
+
+fn is_current_oauth_generation(generation: u64) -> bool {
+	rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) == generation
+}
+
+fn reserve_rate_limit_slot(counter: &AtomicU64, generation: u64) -> RateLimitReservation {
+	let previous = counter
+		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+			(rate_limit_generation(state) == generation).then(|| rate_limit_state(generation, rate_limit_remaining(state).saturating_sub(1)))
+		})
+		.unwrap_or_else(|state| state);
+	RateLimitReservation {
+		generation,
+		previous_remaining: rate_limit_remaining(previous),
+	}
+}
+
+fn update_rate_limit_remaining(counter: &AtomicU64, generation: u64, remaining: u16) -> bool {
+	let mut current = counter.load(Ordering::SeqCst);
+	loop {
+		if rate_limit_generation(current) != generation {
+			return false;
+		}
+		let updated = rate_limit_state(generation, remaining);
+		match counter.compare_exchange_weak(current, updated, Ordering::SeqCst, Ordering::SeqCst) {
+			Ok(_) => return true,
+			Err(actual) => current = actual,
+		}
+	}
+}
+
+pub(crate) fn current_rate_limit_remaining() -> u16 {
+	rate_limit_remaining(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst))
+}
+
+fn state_for_oauth_install(state: u64, generation: u64, fresh_identity: bool) -> u64 {
+	let remaining = if fresh_identity { 99 } else { rate_limit_remaining(state) };
+	rate_limit_state(generation, remaining)
+}
+
+pub(crate) fn install_oauth_generation(generation: u64, fresh_identity: bool) {
+	OAUTH_RATELIMIT_STATE
+		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| Some(state_for_oauth_install(state, generation, fresh_identity)))
+		.unwrap_or_else(|state| state);
+
+	let mut guard = upstream_guard();
+	guard.record_success();
+	if fresh_identity {
+		guard.clear_rate_limit_block();
+	}
 }
 
 fn endpoint_class(path: &str) -> &'static str {
@@ -149,20 +249,29 @@ fn upstream_guard() -> std::sync::MutexGuard<'static, UpstreamGuard> {
 }
 
 fn cooldown_error() -> Option<String> {
-	upstream_guard().cooldown_remaining(Instant::now()).map(|remaining| {
-		format!(
-			"Reddit requests are temporarily paused after upstream failures. Retry in {} seconds",
-			remaining.as_secs().max(1)
-		)
+	let guard = upstream_guard();
+	guard.cooldown_remaining(Instant::now()).map(|remaining| {
+		let message = guard.blocked_reason.unwrap_or(CooldownReason::UpstreamFailures).message();
+		format!("{message}. Retry in {} seconds", remaining.as_secs().max(1))
 	})
 }
 
-fn block_for_rate_limit(duration: Duration) {
-	upstream_guard().block_for(Instant::now(), duration);
+fn block_for_rate_limit(generation: u64, duration: Duration) -> bool {
+	let mut guard = upstream_guard();
+	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) != generation {
+		return false;
+	}
+	guard.block_for(Instant::now(), duration, CooldownReason::RateLimit);
+	true
 }
 
-fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str) {
-	let opened = upstream_guard().record_failure(Instant::now());
+fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str, generation: u64) {
+	let mut guard = upstream_guard();
+	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) != generation {
+		trace!("Ignoring stale Reddit upstream failure: kind={kind} endpoint={}", endpoint_class(path));
+		return;
+	}
+	let opened = guard.record_failure(Instant::now());
 	warn!(
 		"Reddit upstream failure: kind={kind} status={} endpoint={} circuit_opened={opened}",
 		status.map_or_else(|| "transport".to_string(), |status| status.to_string()),
@@ -170,8 +279,11 @@ fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str) {
 	);
 }
 
-fn record_upstream_success() {
-	upstream_guard().record_success();
+fn record_upstream_success(generation: u64) {
+	let mut guard = upstream_guard();
+	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) == generation {
+		guard.record_success();
+	}
 }
 
 const URL_PAIRS: [(&str, &str); 2] = [
@@ -346,13 +458,13 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
-fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>) -> Boxed<Result<WreqResponse, String>> {
+	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST, oauth_client)
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
 fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::HEAD, path, false, quarantine, base_path, host)
+	request(&Method::HEAD, path, false, quarantine, base_path, host, OAUTH_CLIENT.load_full())
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -364,7 +476,15 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// Makes a request to Reddit. If `redirect` is `true`, `request_with_redirect`
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
-fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+fn request(
+	method: &'static Method,
+	path: String,
+	redirect: bool,
+	quarantine: bool,
+	base_path: &'static str,
+	host: &'static str,
+	oauth_client: Arc<Oauth>,
+) -> Boxed<Result<WreqResponse, String>> {
 	// Build Reddit URL from path.
 	let url = format!("{base_path}{path}");
 
@@ -380,11 +500,8 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 		),
 	];
 
-	{
-		let client = OAUTH_CLIENT.load_full();
-		for (key, value) in client.headers_map.clone() {
-			headers.push((key, value));
-		}
+	for (key, value) in oauth_client.headers_map.clone() {
+		headers.push((key, value));
 	}
 
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
@@ -437,6 +554,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 						quarantine,
 						base_path,
 						host,
+						oauth_client,
 					)
 					.await;
 				};
@@ -482,17 +600,14 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 		return Err(error);
 	}
 
-	// Reserve estimated OAuth budget only when an upstream call will be made.
-	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
-	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
-	if current_rate_limit < 10 && should_attempt_refresh() {
-		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
-		tokio::spawn(force_refresh_token());
-	}
-	reserve_rate_limit_slot(&OAUTH_RATELIMIT_REMAINING);
+	// Keep this exact OAuth client throughout redirects and attach its generation
+	// to the response. A late response from an old identity must not overwrite a
+	// newly rotated identity's request budget.
+	let oauth_client = OAUTH_CLIENT.load_full();
+	let reservation = reserve_rate_limit_slot(&OAUTH_RATELIMIT_STATE, oauth_client.generation);
 
 	// Fetch the url...
-	match reddit_get(path.clone(), quarantine).await {
+	match reddit_get(path.clone(), quarantine, oauth_client).await {
 		Ok(response) => {
 			let status = response.status();
 
@@ -500,27 +615,40 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 			let reset = response.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
 			let used = response.headers().get("x-ratelimit-used").and_then(|value| value.to_str().ok());
 			let retry_after = response.headers().get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
+			let parsed_remaining = parse_rate_limit_count(remaining);
+			let parsed_used = parse_rate_limit_count(used);
+			let reset_duration = parse_delay_seconds(reset);
 
-			if let (Some(remaining), Some(reset), Some(used)) = (remaining, reset, used) {
+			if let Some(remaining) = parsed_remaining {
+				let response_is_current = update_rate_limit_remaining(&OAUTH_RATELIMIT_STATE, reservation.generation, remaining);
 				trace!(
-					"Ratelimit remaining: Header says {remaining}, we have {current_rate_limit}. Resets in {reset}. Rollover: {}. Ratelimit used: {used}",
-					if is_rolling_over { "yes" } else { "no" },
+					"Reddit rate-limit state: remaining={remaining} estimated_before={} reset_seconds={} used={} endpoint={} current_generation={response_is_current} rollover={}",
+					reservation.previous_remaining,
+					reset_duration.map_or(0, |duration| duration.as_secs()),
+					parsed_used.map_or(0, u16::from),
+					endpoint_class(&path),
+					OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst),
 				);
 
-				// If can parse remaining as a float, round to a u16 and save
-				if let Ok(val) = remaining.parse::<f32>() {
-					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
-					if val <= 0.0 {
-						block_for_rate_limit(rate_limit_delay(None, Some(reset)));
-					}
+				if response_is_current && remaining < LOW_RATE_LIMIT_THRESHOLD && spawn_rate_limit_refresh(reset_duration) {
+					warn!(
+						"Reddit request budget is low: remaining={remaining} used={} reset_seconds={} endpoint={}; rotating anonymous OAuth identity once",
+						parsed_used.map_or(0, u16::from),
+						reset_duration.map_or(0, |duration| duration.as_secs()),
+						endpoint_class(&path),
+					);
+				}
+
+				if response_is_current && remaining == 0 {
+					let _ = block_for_rate_limit(reservation.generation, rate_limit_delay(None, reset));
 				}
 			}
 
 			if status.as_u16() == 429 || (status.as_u16() == 403 && retry_after.is_some()) {
 				let delay = rate_limit_delay(retry_after, reset);
-				block_for_rate_limit(delay);
+				let response_is_current = block_for_rate_limit(reservation.generation, delay);
 				warn!(
-					"Reddit rate limit response: status={} endpoint={} retry_after_present={} reset_present={}",
+					"Reddit rate limit response: status={} endpoint={} retry_after_present={} reset_present={} current_generation={response_is_current}",
 					status,
 					endpoint_class(&path),
 					retry_after.is_some(),
@@ -530,8 +658,11 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 			}
 
 			if status.as_u16() == 401 {
+				if !is_current_oauth_generation(reservation.generation) {
+					return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
+				}
 				error!("Reddit rejected the OAuth token; forcing a refresh");
-				let outcome = force_refresh_token().await;
+				let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
 				if let Some(delay) = outcome.retry_after() {
 					return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
 				}
@@ -544,7 +675,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 					let has_remaining = body.has_remaining();
 
 					if !has_remaining {
-						record_upstream_failure("empty_body", Some(status.as_u16()), &path);
+						record_upstream_failure("empty_body", Some(status.as_u16()), &path, reservation.generation);
 						return Err(format!("Reddit returned an empty response (status {status})"));
 					}
 
@@ -552,7 +683,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 					match serde_json::from_reader(body.reader()) {
 						Ok(value) => {
 							let json: Value = value;
-							record_upstream_success();
+							record_upstream_success(reservation.generation);
 
 							// If user is suspended
 							if let Some(data) = json.get("data") {
@@ -567,8 +698,11 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 							if json["error"].is_i64() {
 								// OAuth token has expired; http status 401
 								if json["message"] == "Unauthorized" {
+									if !is_current_oauth_generation(reservation.generation) {
+										return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
+									}
 									error!("Forcing a token refresh");
-									let outcome = force_refresh_token().await;
+									let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
 									if let Some(delay) = outcome.retry_after() {
 										return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
 									}
@@ -599,7 +733,7 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
-							record_upstream_failure("invalid_json", Some(status.as_u16()), &path);
+							record_upstream_failure("invalid_json", Some(status.as_u16()), &path, reservation.generation);
 							if status.is_server_error() {
 								Err("Reddit is having issues, check if there's an outage".to_string())
 							} else {
@@ -609,13 +743,13 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 					}
 				}
 				Err(e) => {
-					record_upstream_failure("body_transport", Some(status.as_u16()), &path);
+					record_upstream_failure("body_transport", Some(status.as_u16()), &path, reservation.generation);
 					err("Failed receiving body from Reddit", e.to_string(), path)
 				}
 			}
 		}
 		Err(e) => {
-			record_upstream_failure("request_transport", None, &path);
+			record_upstream_failure("request_transport", None, &path, reservation.generation);
 			err("Couldn't send request to Reddit", e, path)
 		}
 	}
@@ -638,10 +772,9 @@ pub async fn rate_limit_check() -> Result<(), String> {
 		return Ok(());
 	}
 
-	// Make one uncached request. Older versions refreshed OAuth here and made a
-	// second request to test whether Reddit associated the budget with an IP or
-	// token. That creates unnecessary authentication traffic at every startup
-	// and conflicts with preserving a stable device identity across refreshes.
+	// Make one uncached request. Quota-driven identity rotation is handled only
+	// after Reddit reports a low budget, rather than creating extra authentication
+	// traffic during every startup.
 	self_check("reddit").await?;
 	Ok(())
 }
@@ -718,6 +851,15 @@ mod tests {
 	}
 
 	#[test]
+	fn test_parse_rate_limit_count_rejects_invalid_values() {
+		assert_eq!(parse_rate_limit_count(Some("9.4")), Some(9));
+		assert_eq!(parse_rate_limit_count(Some("9.6")), Some(10));
+		assert_eq!(parse_rate_limit_count(Some("-1")), None);
+		assert_eq!(parse_rate_limit_count(Some("NaN")), None);
+		assert_eq!(parse_rate_limit_count(Some("not-a-number")), None);
+	}
+
+	#[test]
 	fn test_rate_limit_delay_adds_margin_and_respects_cap() {
 		assert_eq!(rate_limit_delay(Some("1"), None), Duration::from_secs(3));
 		assert_eq!(rate_limit_delay(None, Some("20")), Duration::from_secs(22));
@@ -727,11 +869,33 @@ mod tests {
 
 	#[test]
 	fn test_rate_limit_counter_does_not_underflow() {
-		let counter = AtomicU16::new(1);
-		assert_eq!(reserve_rate_limit_slot(&counter), 1);
-		assert_eq!(counter.load(Ordering::SeqCst), 0);
-		assert_eq!(reserve_rate_limit_slot(&counter), 0);
-		assert_eq!(counter.load(Ordering::SeqCst), 0);
+		let counter = AtomicU64::new(rate_limit_state(7, 1));
+		assert_eq!(
+			reserve_rate_limit_slot(&counter, 7),
+			RateLimitReservation {
+				generation: 7,
+				previous_remaining: 1,
+			}
+		);
+		assert_eq!(counter.load(Ordering::SeqCst), rate_limit_state(7, 0));
+		assert_eq!(reserve_rate_limit_slot(&counter, 7).previous_remaining, 0);
+		assert_eq!(counter.load(Ordering::SeqCst), rate_limit_state(7, 0));
+	}
+
+	#[test]
+	fn test_stale_rate_limit_responses_cannot_replace_new_budget() {
+		let counter = AtomicU64::new(rate_limit_state(3, 99));
+		assert!(!update_rate_limit_remaining(&counter, 2, 0));
+		assert_eq!(counter.load(Ordering::SeqCst), rate_limit_state(3, 99));
+		assert!(update_rate_limit_remaining(&counter, 3, 88));
+		assert_eq!(counter.load(Ordering::SeqCst), rate_limit_state(3, 88));
+	}
+
+	#[test]
+	fn test_oauth_install_only_resets_budget_for_fresh_identity() {
+		let current = rate_limit_state(4, 7);
+		assert_eq!(state_for_oauth_install(current, 5, false), rate_limit_state(5, 7));
+		assert_eq!(state_for_oauth_install(current, 5, true), rate_limit_state(5, 99));
 	}
 
 	#[test]
@@ -742,9 +906,22 @@ mod tests {
 		assert!(!guard.record_failure(now + Duration::from_secs(1)));
 		assert!(guard.record_failure(now + Duration::from_secs(2)));
 		assert!(guard.cooldown_remaining(now + Duration::from_secs(3)).is_some());
+		assert_eq!(guard.blocked_reason, Some(CooldownReason::UpstreamFailures));
 		assert!(guard.cooldown_remaining(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
 		guard.record_success();
 		assert_eq!(guard.failures_in_window, 0);
+	}
+
+	#[test]
+	fn test_fresh_identity_only_clears_rate_limit_cooldown() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		guard.block_for(now, Duration::from_secs(10), CooldownReason::UpstreamFailures);
+		guard.clear_rate_limit_block();
+		assert!(guard.cooldown_remaining(now).is_some());
+		guard.block_for(now, Duration::from_secs(20), CooldownReason::RateLimit);
+		guard.clear_rate_limit_block();
+		assert!(guard.cooldown_remaining(now).is_none());
 	}
 
 	#[test]
