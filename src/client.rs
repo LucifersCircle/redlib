@@ -189,8 +189,7 @@ fn is_current_oauth_generation(generation: u64) -> bool {
 fn reserve_rate_limit_slot(counter: &AtomicU64, generation: u64) -> RateLimitReservation {
 	let previous = counter
 		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
-			(rate_limit_generation(state) == generation)
-				.then(|| rate_limit_state(generation, rate_limit_remaining(state).saturating_sub(1)))
+			(rate_limit_generation(state) == generation).then(|| rate_limit_state(generation, rate_limit_remaining(state).saturating_sub(1)))
 		})
 		.unwrap_or_else(|state| state);
 	RateLimitReservation {
