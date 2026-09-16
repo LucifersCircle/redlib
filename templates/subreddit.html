@@ -109,7 +109,7 @@
 					</div>
 					<div id="sub_actions">
 						<div id="sub_subscription">
-							{% if prefs.subscriptions.contains(sub.name) %}
+							{% if prefs.is_subscribed(sub.name.as_str()) %}
 								<form action="/r/{{ sub.name }}/unsubscribe?redirect={{ redirect_url }}" method="POST">
 									<button class="unsubscribe">Unsubscribe</button>
 								</form>
@@ -120,7 +120,7 @@
 							{% endif %}
 						</div>
 						<div id="sub_filter">
-							{% if prefs.filters.contains(sub.name) %}
+							{% if prefs.is_filtered(sub.name.as_str()) %}
 								<form action="/r/{{ sub.name }}/unfilter?redirect={{ redirect_url }}" method="POST">
 									<button class="unfilter">Unfilter</button>
 								</form>

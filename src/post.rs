@@ -8,9 +8,7 @@ use crate::utils::{
 };
 use askama::Template;
 use hyper::{Body, Request, Response};
-use regex::Regex;
-use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::collections::HashSet;
 
 // STRUCTS
 #[derive(Template)]
@@ -26,14 +24,38 @@ struct PostTemplate {
 	comment_query: String,
 }
 
-static COMMENT_SEARCH_CAPTURE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
+fn split_comment_search_query(query: &str) -> (String, String) {
+	let pairs = url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
+	let is_comment_search = pairs.iter().any(|(key, value)| key == "type" && value == "comment");
+	let local_query = if is_comment_search {
+		pairs.iter().find(|(key, _)| key == "q").map_or_else(String::new, |(_, value)| value.to_string())
+	} else {
+		String::new()
+	};
+
+	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	for (key, value) in pairs {
+		if !is_comment_search || (key != "q" && key != "type") {
+			serializer.append_pair(&key, &value);
+		}
+	}
+	(serializer.finish(), local_query)
+}
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
-	let mut path: String = format!("{}.json?{}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default());
+	let (upstream_query, query) = split_comment_search_query(req.uri().query().unwrap_or_default());
+	let mut path: String = format!("{}.json?{upstream_query}", req.uri().path());
 	let sub = req.param("sub").unwrap_or_default();
 	let quarantined = can_access_quarantine(&req, &sub);
 	let url = req.uri().to_string();
+	let url_without_query = if query.is_empty() {
+		url.clone()
+	} else if upstream_query.is_empty() {
+		req.uri().path().to_string()
+	} else {
+		format!("{}?{upstream_query}", req.uri().path())
+	};
 
 	// Set sort to sort query parameter
 	let sort = param(&path, "sort").unwrap_or_else(|| {
@@ -44,7 +66,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		if default_sort.is_empty() {
 			String::new()
 		} else {
-			path = format!("{}.json?{}&sort={}&raw_json=1", req.uri().path(), req.uri().query().unwrap_or_default(), default_sort);
+			path.push_str(&format!("&sort={default_sort}"));
 			default_sort
 		}
 	});
@@ -71,15 +93,6 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 			}
 
-			let query_body = match COMMENT_SEARCH_CAPTURE.captures(&url) {
-				Some(captures) => captures.get(1).unwrap().as_str().replace("%20", " ").replace('+', " "),
-				None => String::new(),
-			};
-
-			let query_string = format!("q={query_body}&type=comment");
-			let form = url::form_urlencoded::parse(query_string.as_bytes()).collect::<HashMap<_, _>>();
-			let query = form.get("q").unwrap().clone().to_string();
-
 			let comments = match query.as_str() {
 				"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &req),
 				_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &req),
@@ -89,7 +102,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 			Ok(template(&PostTemplate {
 				comments,
 				post,
-				url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
+				url_without_query,
 				sort,
 				prefs: Preferences::new(&req),
 				single_thread,
@@ -106,6 +119,25 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				error(req, &msg).await
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::split_comment_search_query;
+
+	#[test]
+	fn test_comment_search_parameters_stay_local() {
+		let (upstream, local) = split_comment_search_query("sort=top&q=rust%20cache&type=comment&context=3");
+		assert_eq!(upstream, "sort=top&context=3");
+		assert_eq!(local, "rust cache");
+	}
+
+	#[test]
+	fn test_non_comment_query_is_preserved() {
+		let (upstream, local) = split_comment_search_query("sort=new&q=keep&type=link");
+		assert_eq!(upstream, "sort=new&q=keep&type=link");
+		assert!(local.is_empty());
 	}
 }
 
@@ -216,7 +248,7 @@ fn build_comment(
 		},
 		distinguished: val(comment, "distinguished"),
 	};
-	let is_filtered = filters.contains(&["u_", author.name.as_str()].concat());
+	let is_filtered = filters.contains(&format!("u_{}", author.name.to_ascii_lowercase()));
 
 	// Many subreddits have a default comment posted about the sub's rules etc.
 	// Many Redlib users do not wish to see this kind of comment by default.

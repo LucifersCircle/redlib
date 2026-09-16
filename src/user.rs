@@ -61,7 +61,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 
 	let filters = get_filters(&req);
-	if filters.contains(&["u_", &username].concat()) {
+	if filters.contains(&format!("u_{}", username.to_ascii_lowercase())) {
 		Ok(template(&UserTemplate {
 			user,
 			posts: Vec::new(),
