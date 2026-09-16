@@ -1,6 +1,7 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
 use crate::server::RequestExt;
+use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
 use cached::proc_macro::cached;
@@ -249,7 +250,7 @@ impl QuotaGovernor {
 		if attempt.generation != self.generation {
 			if attempt.discovery_probe && matches!(self.window, QuotaWindow::Unknown { .. }) {
 				self.window = QuotaWindow::Unknown {
-					not_before: now + QUOTA_UNKNOWN_RETRY,
+					not_before: now + proportional_positive_jitter(QUOTA_UNKNOWN_RETRY),
 					probe_in_flight: false,
 				};
 			}
@@ -289,7 +290,7 @@ impl QuotaGovernor {
 			}
 			(QuotaWindow::Unknown { .. }, None) => {
 				self.window = QuotaWindow::Unknown {
-					not_before: now + QUOTA_UNKNOWN_RETRY,
+					not_before: now + proportional_positive_jitter(QUOTA_UNKNOWN_RETRY),
 					probe_in_flight: false,
 				};
 			}
@@ -343,7 +344,7 @@ impl QuotaGovernor {
 			}
 			QuotaWindow::Unknown { .. } => {
 				self.window = QuotaWindow::Unknown {
-					not_before: now + QUOTA_UNKNOWN_RETRY,
+					not_before: now + proportional_positive_jitter(QUOTA_UNKNOWN_RETRY),
 					probe_in_flight: false,
 				};
 			}
@@ -466,7 +467,7 @@ impl UpstreamGuard {
 	}
 
 	fn extend_deadline(slot: &mut Option<Instant>, now: Instant, duration: Duration) {
-		let deadline = now + duration.min(MAX_RATE_LIMIT_COOLDOWN);
+		let deadline = now + duration;
 		if deadline > slot.as_ref().copied().unwrap_or(now) {
 			*slot = Some(deadline);
 		}
@@ -515,7 +516,11 @@ impl UpstreamGuard {
 
 		self.failures_in_window = self.failures_in_window.saturating_add(1);
 		if self.failures_in_window >= FAILURE_THRESHOLD {
-			Self::extend_deadline(&mut self.upstream_failure_blocked_until, now, FAILURE_COOLDOWN);
+			Self::extend_deadline(
+				&mut self.upstream_failure_blocked_until,
+				now,
+				proportional_positive_jitter(FAILURE_COOLDOWN),
+			);
 			self.failure_window_started = None;
 			self.failures_in_window = 0;
 			true
@@ -547,7 +552,7 @@ impl UpstreamGuard {
 			let delay = match self.edge_state {
 				EdgeCircuitState::Open { until } => until.checked_duration_since(now).unwrap_or_default(),
 				EdgeCircuitState::HalfOpen { .. } => Duration::from_secs(1),
-				EdgeCircuitState::Closed => edge_throttle_delay(self.edge_throttle_failures.max(1), retry_after),
+				EdgeCircuitState::Closed => edge_throttle_base_delay(self.edge_throttle_failures.max(1), retry_after).0,
 			};
 			return EdgeThrottleDecision {
 				delay,
@@ -617,22 +622,44 @@ fn parse_rate_limit_count(value: Option<&str>) -> Option<u16> {
 }
 
 fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration {
-	match (parse_retry_after(retry_after, SystemTime::now()), parse_delay_seconds(reset)) {
+	let (base, server_is_floor) = rate_limit_base_delay(retry_after, reset);
+	if server_is_floor {
+		positive_jitter(base, Duration::from_secs(2))
+	} else {
+		proportional_positive_jitter(base)
+	}
+}
+
+fn rate_limit_base_delay(retry_after: Option<&str>, reset: Option<&str>) -> (Duration, bool) {
+	let server_delay = match (parse_retry_after(retry_after, SystemTime::now()), parse_delay_seconds(reset)) {
 		(Some(retry), Some(reset)) => Some(retry.max(reset)),
 		(Some(delay), None) | (None, Some(delay)) => Some(delay),
 		(None, None) => None,
-	}
-	.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
-	.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
-	.min(MAX_RATE_LIMIT_COOLDOWN)
+	};
+	(
+		server_delay
+			.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
+			.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
+			.min(MAX_RATE_LIMIT_COOLDOWN),
+		server_delay.is_some(),
+	)
 }
 
 fn edge_throttle_delay(consecutive_failures: u8, retry_after: Option<Duration>) -> Duration {
+	let (base, server_is_floor) = edge_throttle_base_delay(consecutive_failures, retry_after);
+	if server_is_floor {
+		positive_jitter(base, Duration::from_secs(2))
+	} else {
+		proportional_positive_jitter(base)
+	}
+}
+
+fn edge_throttle_base_delay(consecutive_failures: u8, retry_after: Option<Duration>) -> (Duration, bool) {
 	let exponent = u32::from(consecutive_failures.saturating_sub(1).min(7));
 	let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
 	let exponential = Duration::from_secs(EDGE_THROTTLE_INITIAL_COOLDOWN.as_secs().saturating_mul(multiplier)).min(EDGE_THROTTLE_MAX_COOLDOWN);
 	let server_delay = retry_after.unwrap_or_default().saturating_add(RATE_LIMIT_COOLDOWN_MARGIN).min(MAX_RATE_LIMIT_COOLDOWN);
-	exponential.max(server_delay)
+	(exponential.max(server_delay), retry_after.is_some() && server_delay >= exponential)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -821,6 +848,10 @@ fn upstream_guard() -> std::sync::MutexGuard<'static, UpstreamGuard> {
 	UPSTREAM_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn retry_after_seconds(duration: Duration) -> u64 {
+	duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() > 0)).max(1)
+}
+
 fn cooldown_error() -> Option<String> {
 	let guard = upstream_guard();
 	let active = guard.active_cooldown(Instant::now());
@@ -828,24 +859,25 @@ fn cooldown_error() -> Option<String> {
 	active.map(|(remaining, reason)| {
 		record_local_denial(reason);
 		let message = reason.message();
-		format!("{message}. Retry in {} seconds", remaining.as_secs().max(1))
+		format!("{message}. Retry in {} seconds", retry_after_seconds(remaining))
 	})
 }
 
 fn begin_upstream_attempt(generation: u64) -> Result<UpstreamAttempt, String> {
 	upstream_guard().try_admit(Instant::now(), generation).map_err(|(remaining, reason)| {
 		record_local_denial(reason);
-		format!("{}. Retry in {} seconds", reason.message(), remaining.as_secs().max(1))
+		format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(remaining))
 	})
 }
 
-fn block_for_rate_limit(generation: u64, duration: Duration) -> bool {
+fn block_for_rate_limit(generation: u64, retry_after: Option<&str>, reset: Option<&str>) -> (Duration, bool) {
 	let mut guard = upstream_guard();
 	if guard.quota.generation != generation {
-		return false;
+		return (rate_limit_base_delay(retry_after, reset).0, false);
 	}
+	let duration = rate_limit_delay(retry_after, reset);
 	guard.block_for_rate_limit(Instant::now(), duration);
-	true
+	(duration, true)
 }
 
 fn reconcile_rate_limit(attempt: &mut UpstreamAttempt, remaining: Option<u16>, reset: Option<Duration>, quota_exhausted: bool) {
@@ -862,7 +894,7 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, continue
 	if let Some((delay, reason)) = guard.redirect_cooldown(now, attempt.edge) {
 		drop(guard);
 		record_local_denial(reason);
-		return Err(ApiRequestError::Deferred(format!("{}. Retry in {} seconds", reason.message(), delay.as_secs().max(1))));
+		return Err(ApiRequestError::Deferred(format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(delay))));
 	}
 	if continue_discovery && guard.quota.owns_discovery(attempt) {
 		return Ok(());
@@ -879,7 +911,7 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, continue
 			return Err(ApiRequestError::Deferred(format!(
 				"{}. Retry in {} seconds",
 				CooldownReason::RateLimit.message(),
-				delay.as_secs().max(1)
+				retry_after_seconds(delay)
 			)));
 		}
 	};
@@ -1367,8 +1399,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 
 				match throttle_kind {
 					Some(ThrottleKind::Quota) => {
-						let delay = rate_limit_delay(retry_after, reset);
-						let response_is_current = block_for_rate_limit(request_generation, delay);
+						let (delay, response_is_current) = block_for_rate_limit(request_generation, retry_after, reset);
 						warn!(
 							"Reddit quota response: status={} endpoint={} retry_after_seconds={} remaining_present={} reset_seconds={} used_present={} current_generation={response_is_current}",
 							status,
@@ -1378,7 +1409,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 							reset_duration.map_or(0, |duration| duration.as_secs()),
 							used.is_some(),
 						);
-						return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
+						return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", retry_after_seconds(delay)));
 					}
 					Some(ThrottleKind::Edge) => {
 						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
@@ -1399,7 +1430,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 							),
 						}
 						let delay = decision.delay;
-						return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", delay.as_secs().max(1)));
+						return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", retry_after_seconds(delay)));
 					}
 					None => {}
 				}
@@ -1411,7 +1442,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 					error!("Reddit rejected the OAuth token; forcing a refresh");
 					let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
 					if let Some(delay) = outcome.retry_after() {
-						return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
+						return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", retry_after_seconds(delay)));
 					}
 					return Err("OAuth token has expired. Please refresh the page!".to_string());
 				}
@@ -1455,7 +1486,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 										error!("Forcing a token refresh");
 										let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
 										if let Some(delay) = outcome.retry_after() {
-											return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
+											return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", retry_after_seconds(delay)));
 										}
 										return Err("OAuth token has expired. Please refresh the page!".to_string());
 									}
@@ -1625,12 +1656,14 @@ mod tests {
 
 	#[test]
 	fn test_rate_limit_delay_adds_margin_and_respects_cap() {
-		assert_eq!(rate_limit_delay(Some("1"), None), Duration::from_secs(3));
-		assert_eq!(rate_limit_delay(None, Some("20")), Duration::from_secs(22));
-		assert_eq!(rate_limit_delay(Some("0"), Some("120")), Duration::from_secs(122));
-		assert_eq!(rate_limit_delay(Some("9999"), None), MAX_RATE_LIMIT_COOLDOWN);
+		assert_eq!(rate_limit_base_delay(Some("1"), None), (Duration::from_secs(3), true));
+		assert_eq!(rate_limit_base_delay(None, Some("20")), (Duration::from_secs(22), true));
+		assert_eq!(rate_limit_base_delay(Some("0"), Some("120")), (Duration::from_secs(122), true));
+		assert_eq!(rate_limit_base_delay(Some("9999"), None), (MAX_RATE_LIMIT_COOLDOWN, true));
 		assert_eq!(parse_delay_seconds(Some("1e300")), Some(MAX_RATE_LIMIT_COOLDOWN));
-		assert_eq!(rate_limit_delay(None, None), Duration::from_secs(12));
+		assert_eq!(rate_limit_base_delay(None, None), (Duration::from_secs(12), false));
+		let delay = rate_limit_delay(Some("1"), None);
+		assert!((Duration::from_secs(3)..=Duration::from_secs(5)).contains(&delay));
 	}
 
 	#[test]
@@ -1643,13 +1676,24 @@ mod tests {
 
 	#[test]
 	fn test_edge_throttle_delay_escalates_and_caps() {
-		assert_eq!(edge_throttle_delay(1, None), Duration::from_secs(5));
-		assert_eq!(edge_throttle_delay(2, None), Duration::from_secs(10));
-		assert_eq!(edge_throttle_delay(3, None), Duration::from_secs(20));
-		assert_eq!(edge_throttle_delay(4, None), Duration::from_secs(40));
-		assert_eq!(edge_throttle_delay(5, None), EDGE_THROTTLE_MAX_COOLDOWN);
-		assert_eq!(edge_throttle_delay(8, None), EDGE_THROTTLE_MAX_COOLDOWN);
-		assert_eq!(edge_throttle_delay(1, Some(Duration::from_secs(90))), Duration::from_secs(92));
+		assert_eq!(edge_throttle_base_delay(1, None), (Duration::from_secs(5), false));
+		assert_eq!(edge_throttle_base_delay(2, None), (Duration::from_secs(10), false));
+		assert_eq!(edge_throttle_base_delay(3, None), (Duration::from_secs(20), false));
+		assert_eq!(edge_throttle_base_delay(4, None), (Duration::from_secs(40), false));
+		assert_eq!(edge_throttle_base_delay(5, None), (EDGE_THROTTLE_MAX_COOLDOWN, false));
+		assert_eq!(edge_throttle_base_delay(8, None), (EDGE_THROTTLE_MAX_COOLDOWN, false));
+		assert_eq!(edge_throttle_base_delay(1, Some(Duration::from_secs(90))), (Duration::from_secs(92), true));
+		let delay = edge_throttle_delay(1, None);
+		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&delay));
+		let saturated = edge_throttle_delay(8, None);
+		assert!((EDGE_THROTTLE_MAX_COOLDOWN..=Duration::from_secs(75)).contains(&saturated));
+	}
+
+	#[test]
+	fn test_retry_after_seconds_rounds_up() {
+		assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+		assert_eq!(retry_after_seconds(Duration::from_secs(2)), 2);
+		assert_eq!(retry_after_seconds(Duration::from_millis(2001)), 3);
 	}
 
 	#[test]
@@ -1816,7 +1860,7 @@ mod tests {
 		quota.reconcile(now, &stale_attempt, Some(99), Some(Duration::from_secs(300)), false);
 		assert_eq!(quota.outstanding, 0);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
-		assert_eq!(quota.reserve(now + QUOTA_UNKNOWN_RETRY, 2).unwrap().2, true);
+		assert_eq!(quota.reserve(now + QUOTA_UNKNOWN_RETRY + Duration::from_secs(2), 2).unwrap().2, true);
 	}
 
 	#[test]
@@ -1928,7 +1972,7 @@ mod tests {
 			guard.active_cooldown(now + Duration::from_secs(3)).map(|(_, reason)| reason),
 			Some(CooldownReason::UpstreamFailures)
 		);
-		assert!(guard.active_cooldown(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
+		assert!(guard.active_cooldown(now + FAILURE_COOLDOWN + Duration::from_secs(6)).is_none());
 		guard.reset_failure_window();
 		assert_eq!(guard.failures_in_window, 0);
 	}
@@ -1940,20 +1984,21 @@ mod tests {
 		let redirecting = guard.begin_attempt(now).unwrap();
 		let second_redirecting = guard.begin_attempt(now).unwrap();
 		let denied = guard.begin_attempt(now).unwrap();
-		guard.record_edge_throttle(now, denied, None);
+		let denial = guard.record_edge_throttle(now, denied, None);
+		let probe_at = now + denial.delay + Duration::from_millis(1);
 		assert_eq!(guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
 		assert_eq!(
-			guard.redirect_cooldown(now + Duration::from_secs(6), redirecting).map(|(_, reason)| reason),
+			guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason),
 			Some(CooldownReason::EdgeThrottle)
 		);
 		assert_eq!(
-			guard.redirect_cooldown(now + Duration::from_secs(6), second_redirecting).map(|(_, reason)| reason),
+			guard.redirect_cooldown(probe_at, second_redirecting).map(|(_, reason)| reason),
 			Some(CooldownReason::EdgeThrottle)
 		);
-		let recovery_probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
+		let recovery_probe = guard.begin_attempt(probe_at).unwrap();
 		assert!(recovery_probe.half_open);
 		assert_eq!(
-			guard.redirect_cooldown(now + Duration::from_secs(6), redirecting).map(|(_, reason)| reason),
+			guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason),
 			Some(CooldownReason::EdgeThrottle)
 		);
 
@@ -1969,31 +2014,29 @@ mod tests {
 		let mut guard = UpstreamGuard::default();
 		let original = guard.begin_attempt(now).unwrap();
 		let first = guard.record_edge_throttle(now, original, Some(Duration::from_secs(2)));
-		assert_eq!(
-			first,
-			EdgeThrottleDecision {
-				delay: Duration::from_secs(5),
-				consecutive_failures: 1,
-				started_cooldown: true,
-			}
-		);
+		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&first.delay));
+		assert_eq!(first.consecutive_failures, 1);
+		assert!(first.started_cooldown);
 		let concurrent = guard.record_edge_throttle(now + Duration::from_secs(1), original, Some(Duration::from_secs(2)));
 		assert_eq!(concurrent.consecutive_failures, 1);
 		assert!(!concurrent.started_cooldown);
+		assert_eq!(concurrent.delay, first.delay - Duration::from_secs(1));
 
-		let probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
+		let first_probe_at = now + first.delay + Duration::from_millis(1);
+		let probe = guard.begin_attempt(first_probe_at).unwrap();
 		assert!(probe.half_open);
-		assert!(guard.begin_attempt(now + Duration::from_secs(6)).is_err());
-		let second = guard.record_edge_throttle(now + Duration::from_secs(6), probe, Some(Duration::from_secs(2)));
-		assert_eq!(second.delay, Duration::from_secs(10));
+		assert!(guard.begin_attempt(first_probe_at).is_err());
+		let second = guard.record_edge_throttle(first_probe_at, probe, Some(Duration::from_secs(2)));
+		assert!((Duration::from_secs(10)..=Duration::from_millis(12_500)).contains(&second.delay));
 		assert_eq!(second.consecutive_failures, 2);
 		assert!(second.started_cooldown);
 
-		let recovery_probe = guard.begin_attempt(now + Duration::from_secs(17)).unwrap();
+		let recovery_at = first_probe_at + second.delay + Duration::from_millis(1);
+		let recovery_probe = guard.begin_attempt(recovery_at).unwrap();
 		guard.record_api_success(recovery_probe);
-		let recovered_attempt = guard.begin_attempt(now + Duration::from_secs(17)).unwrap();
-		let recovered = guard.record_edge_throttle(now + Duration::from_secs(17), recovered_attempt, Some(Duration::from_secs(2)));
-		assert_eq!(recovered.delay, Duration::from_secs(5));
+		let recovered_attempt = guard.begin_attempt(recovery_at).unwrap();
+		let recovered = guard.record_edge_throttle(recovery_at, recovered_attempt, Some(Duration::from_secs(2)));
+		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&recovered.delay));
 		assert_eq!(recovered.consecutive_failures, 1);
 	}
 
@@ -2027,11 +2070,12 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
 		let attempt = guard.begin_attempt(now).unwrap();
-		guard.record_edge_throttle(now, attempt, None);
-		let probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
-		guard.abandon_edge_probe(now + Duration::from_secs(6), probe);
+		let denial = guard.record_edge_throttle(now, attempt, None);
+		let probe_at = now + denial.delay + Duration::from_millis(1);
+		let probe = guard.begin_attempt(probe_at).unwrap();
+		guard.abandon_edge_probe(probe_at, probe);
 		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
-		assert!(guard.begin_attempt(now + Duration::from_secs(7)).is_err());
+		assert!(guard.begin_attempt(probe_at + Duration::from_secs(1)).is_err());
 	}
 
 	#[test]
@@ -2039,9 +2083,10 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
 		let attempt = guard.begin_attempt(now).unwrap();
-		guard.record_edge_throttle(now, attempt, None);
-		let stale_probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
-		let replacement_probe = guard.begin_attempt(now + Duration::from_secs(37)).unwrap();
+		let denial = guard.record_edge_throttle(now, attempt, None);
+		let stale_probe_at = now + denial.delay + Duration::from_millis(1);
+		let stale_probe = guard.begin_attempt(stale_probe_at).unwrap();
+		let replacement_probe = guard.begin_attempt(stale_probe_at + REDDIT_API_REQUEST_TIMEOUT + Duration::from_secs(1)).unwrap();
 		assert!(replacement_probe.half_open);
 		guard.record_api_success(stale_probe);
 		assert!(matches!(guard.edge_state, EdgeCircuitState::HalfOpen { .. }));

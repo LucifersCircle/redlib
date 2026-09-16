@@ -1,6 +1,7 @@
 use crate::{
 	client::{install_oauth_generation, record_oauth_send, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
+	timing::{positive_jitter, proportional_positive_jitter},
 };
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, trace, warn};
@@ -18,7 +19,8 @@ const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
-const TOKEN_REFRESH_EARLY_BY: u64 = 120;
+const TOKEN_REFRESH_MIN_EARLY_BY: u64 = 120;
+const TOKEN_REFRESH_MAX_EARLY_BY: u64 = 240;
 static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
 static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
@@ -102,7 +104,7 @@ impl OauthBackendImpl {
 #[derive(Debug, Clone)]
 pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
-	expires_in: u64,
+	refresh_at: Instant,
 	pub(crate) backend: OauthBackendImpl,
 	pub(crate) generation: u64,
 }
@@ -151,9 +153,10 @@ impl Oauth {
 		headers_map.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
 		headers_map.extend(response.additional_headers);
 
+		let refresh_at = Instant::now() + sampled_token_refresh_delay(response.expires_in);
 		Ok(Self {
 			headers_map,
-			expires_in: response.expires_in,
+			refresh_at,
 			backend: backend.clone(),
 			generation: 0,
 		})
@@ -297,11 +300,20 @@ fn refresh_backoff() -> std::sync::MutexGuard<'static, RefreshBackoff> {
 }
 
 fn refresh_retry_delay(failure_count: u32, retry_after: Option<Duration>) -> Duration {
+	let (base, server_is_floor) = refresh_retry_base_delay(failure_count, retry_after);
+	if server_is_floor {
+		positive_jitter(base, Duration::from_secs(2))
+	} else {
+		proportional_positive_jitter(base)
+	}
+}
+
+fn refresh_retry_base_delay(failure_count: u32, retry_after: Option<Duration>) -> (Duration, bool) {
 	let exponent = failure_count.saturating_sub(1).min(31);
 	let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
 	let exponential = Duration::from_secs(INITIAL_REFRESH_RETRY_DELAY.as_secs().saturating_mul(multiplier)).min(MAX_REFRESH_RETRY_DELAY);
 	let retry_after = retry_after.unwrap_or_default().min(MAX_SERVER_RETRY_DELAY);
-	exponential.max(retry_after)
+	(exponential.max(retry_after), retry_after >= exponential && !retry_after.is_zero())
 }
 
 fn max_duration(first: Option<Duration>, second: Option<Duration>) -> Option<Duration> {
@@ -325,8 +337,19 @@ fn response_retry_after(headers: &wreq::header::HeaderMap) -> Option<Duration> {
 		.map(|delay| delay.min(MAX_SERVER_RETRY_DELAY))
 }
 
-fn token_refresh_delay(expires_in: u64) -> Duration {
-	Duration::from_secs(expires_in.saturating_sub(TOKEN_REFRESH_EARLY_BY).max(1))
+fn sampled_token_refresh_delay(expires_in: u64) -> Duration {
+	let max_early_by = TOKEN_REFRESH_MAX_EARLY_BY.min(expires_in / 2);
+	let min_early_by = TOKEN_REFRESH_MIN_EARLY_BY.min(max_early_by);
+	let early_by = if min_early_by == max_early_by {
+		min_early_by
+	} else {
+		fastrand::u64(min_early_by..=max_early_by)
+	};
+	token_refresh_delay(expires_in, early_by)
+}
+
+fn token_refresh_delay(expires_in: u64, early_by: u64) -> Duration {
+	Duration::from_secs(expires_in.saturating_sub(early_by.min(expires_in / 2)).max(1))
 }
 
 fn refresh_backoff_remaining() -> Option<Duration> {
@@ -369,15 +392,19 @@ pub async fn token_daemon() {
 		let (duration, reason) = match refresh_backoff_remaining() {
 			Some(duration) => (duration, "OAuth refresh retry"),
 			None => {
-				let expires_in = OAUTH_CLIENT.load_full().expires_in;
-				(token_refresh_delay(expires_in), "scheduled OAuth refresh")
+				let refresh_at = OAUTH_CLIENT.load_full().refresh_at;
+				(refresh_at.checked_duration_since(Instant::now()).unwrap_or_default(), "scheduled OAuth refresh")
 			}
 		};
 
 		info!("[⏳] Waiting {duration:?} for {reason}");
 		tokio::select! {
 			_ = tokio::time::sleep(duration) => {
-				let _ = force_refresh_token(RefreshReason::Scheduled).await;
+				if force_refresh_token(RefreshReason::Scheduled).await == RefreshOutcome::InProgress {
+					// Another request owns the refresh. Avoid a zero-delay loop while
+					// its replacement token is still being fetched.
+					tokio::time::sleep(OAUTH_TIMEOUT).await;
+				}
 			}
 			_ = TOKEN_REFRESH_NOTIFY.notified() => {
 				trace!("OAuth refresh schedule changed; recalculating");
@@ -808,25 +835,31 @@ mod tests {
 
 	#[test]
 	fn test_refresh_retry_delay_is_exponential_and_capped() {
-		assert_eq!(refresh_retry_delay(1, None), Duration::from_secs(5));
-		assert_eq!(refresh_retry_delay(2, None), Duration::from_secs(10));
-		assert_eq!(refresh_retry_delay(3, None), Duration::from_secs(20));
-		assert_eq!(refresh_retry_delay(20, None), MAX_REFRESH_RETRY_DELAY);
+		assert_eq!(refresh_retry_base_delay(1, None), (Duration::from_secs(5), false));
+		assert_eq!(refresh_retry_base_delay(2, None), (Duration::from_secs(10), false));
+		assert_eq!(refresh_retry_base_delay(3, None), (Duration::from_secs(20), false));
+		assert_eq!(refresh_retry_base_delay(20, None), (MAX_REFRESH_RETRY_DELAY, false));
+		let saturated = refresh_retry_delay(20, None);
+		assert!((MAX_REFRESH_RETRY_DELAY..=Duration::from_secs(375)).contains(&saturated));
 	}
 
 	#[test]
 	fn test_refresh_retry_delay_honors_server_delay() {
-		assert_eq!(refresh_retry_delay(1, Some(Duration::from_secs(90))), Duration::from_secs(90));
-		assert_eq!(refresh_retry_delay(1, Some(Duration::from_secs(900))), MAX_SERVER_RETRY_DELAY);
+		assert_eq!(refresh_retry_base_delay(1, Some(Duration::from_secs(90))), (Duration::from_secs(90), true));
+		assert_eq!(refresh_retry_base_delay(1, Some(Duration::from_secs(900))), (MAX_SERVER_RETRY_DELAY, true));
+		let delay = refresh_retry_delay(1, Some(Duration::from_secs(90)));
+		assert!((Duration::from_secs(90)..=Duration::from_secs(92)).contains(&delay));
 	}
 
 	#[test]
 	fn test_refresh_backoff_recovers_after_success() {
 		let now = Instant::now();
 		let mut backoff = RefreshBackoff::default();
-		assert_eq!(backoff.record_failure(now, None), Duration::from_secs(5));
-		assert_eq!(backoff.retry_remaining(now + Duration::from_secs(1)), Some(Duration::from_secs(4)));
-		assert_eq!(backoff.record_failure(now + Duration::from_secs(5), None), Duration::from_secs(10));
+		let first = backoff.record_failure(now, None);
+		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&first));
+		assert_eq!(backoff.retry_remaining(now + Duration::from_secs(1)), Some(first - Duration::from_secs(1)));
+		let second = backoff.record_failure(now + first, None);
+		assert!((Duration::from_secs(10)..=Duration::from_millis(12_500)).contains(&second));
 		backoff.record_success();
 		assert_eq!(backoff.retry_remaining(now), None);
 		assert_eq!(backoff.consecutive_failures, 0);
@@ -834,9 +867,12 @@ mod tests {
 
 	#[test]
 	fn test_token_refresh_delay_cannot_underflow() {
-		assert_eq!(token_refresh_delay(3600), Duration::from_secs(3480));
-		assert_eq!(token_refresh_delay(120), Duration::from_secs(1));
-		assert_eq!(token_refresh_delay(30), Duration::from_secs(1));
+		assert_eq!(token_refresh_delay(3600, 120), Duration::from_secs(3480));
+		assert_eq!(token_refresh_delay(3600, 240), Duration::from_secs(3360));
+		assert_eq!(token_refresh_delay(180, 240), Duration::from_secs(90));
+		assert_eq!(token_refresh_delay(30, 240), Duration::from_secs(15));
+		let sampled = sampled_token_refresh_delay(3600);
+		assert!((Duration::from_secs(3360)..=Duration::from_secs(3480)).contains(&sampled));
 	}
 
 	#[test]
@@ -848,10 +884,11 @@ mod tests {
 		};
 		let oauth = Oauth {
 			headers_map: HashMap::new(),
-			expires_in: 3600,
+			refresh_at: Instant::now() + Duration::from_secs(3480),
 			backend: original_backend,
 			generation: 4,
 		};
+		assert_eq!(oauth.clone().refresh_at, oauth.refresh_at);
 
 		let (stable, stable_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled, false);
 		let (_, stable_fallback_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled, true);
