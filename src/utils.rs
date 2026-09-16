@@ -1412,7 +1412,7 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 }
 
 fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
-	const TEMPORARY_ERRORS: [&str; 7] = [
+	const TEMPORARY_ERRORS: [&str; 11] = [
 		"Reddit requests are temporarily paused",
 		"Reddit is temporarily rejecting this instance",
 		"Reddit rate limit exceeded",
@@ -1420,6 +1420,10 @@ fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
 		"Reddit is having issues",
 		"Reddit returned an empty response",
 		"Reddit API request timed out",
+		"Reddit request limiter is unavailable",
+		"Couldn't send request to Reddit",
+		"Failed receiving body from Reddit",
+		"Failed to parse page JSON data",
 	];
 	if !TEMPORARY_ERRORS.iter().any(|prefix| msg.starts_with(prefix)) {
 		return None;
