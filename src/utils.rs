@@ -1186,11 +1186,11 @@ pub fn rewrite_urls(input_text: &str) -> String {
 			let _image_replacement = if REDDIT_PREVIEW_REGEX.find(image_caption).is_none() {
 				// Without this " would show as \" instead. "\&quot;" is how the quotes are formatted within image_text beforehand
 				format!(
-					"<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a><figcaption>{}</figcaption></figure>",
+					"<figure><a draggable=\"false\" href=\"{image_url}<img loading=\"lazy\" draggable=\"false\" src=\"{image_url}</a><figcaption>{}</figcaption></figure>",
 					image_caption.replace("\\&quot;", "\"")
 				)
 			} else {
-				format!("<figure><a href=\"{image_url}<img loading=\"lazy\" src=\"{image_url}</a></figure>")
+				format!("<figure><a draggable=\"false\" href=\"{image_url}<img loading=\"lazy\" draggable=\"false\" src=\"{image_url}</a></figure>")
 			};
 
 			/* In order to know if we're dealing with a normal or external preview we need to take a look at the first capture group of REDDIT_PREVIEW_REGEX
@@ -1820,7 +1820,7 @@ mod tests {
 	fn test_rewriting_image_links() {
 		let input =
 			r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
-		let output = r#"<figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure>"#;
+		let output = r#"<figure><a draggable="false" href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" draggable="false" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure>"#;
 		assert_eq!(rewrite_urls(input), output);
 	}
 

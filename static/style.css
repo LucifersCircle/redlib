@@ -1125,9 +1125,42 @@ a.search_subreddit:hover {
 }
 
 .post_media_image,
+.post_media_image img,
 .post_thumbnail,
-.gallery > figure > a {
+.post_thumbnail img,
+.gallery > figure > a,
+.gallery > figure > a img,
+.post_body figure > a,
+.post_body figure > a img,
+.comment_body figure > a,
+.comment_body figure > a img {
     -webkit-tap-highlight-color: transparent;
+}
+
+.post_media_image,
+.post_thumbnail,
+.gallery > figure > a,
+.post_body figure > a,
+.comment_body figure > a {
+    -webkit-user-drag: none;
+}
+
+.post_media_image img,
+.post_thumbnail img,
+.gallery > figure > a img,
+.post_body figure > a img,
+.comment_body figure > a img {
+    -webkit-user-drag: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.post_media_image img::selection,
+.post_thumbnail img::selection,
+.gallery > figure > a img::selection,
+.post_body figure > a img::selection,
+.comment_body figure > a img::selection {
+    background: transparent;
 }
 
 .post_media_video {
