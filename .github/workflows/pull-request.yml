@@ -5,13 +5,9 @@ env:
   NEXTEST_RETRIES: 10
 
 on:
-  push:
-    branches:
-      - 'main'
-
-  pull_request:
-    branches:
-      - 'main'
+  # Kept for occasional manual upstream compatibility checks. The Docker Hub
+  # workflow is the fork's required PR gate and runs deterministic checks.
+  workflow_dispatch:
     
 jobs:
   test:

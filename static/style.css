@@ -1124,6 +1124,12 @@ a.search_subreddit:hover {
     overflow: hidden;
 }
 
+.post_media_image,
+.post_thumbnail,
+.gallery > figure > a {
+    -webkit-tap-highlight-color: transparent;
+}
+
 .post_media_video {
     min-width: 100px;
     max-width: 100px;
