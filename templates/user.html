@@ -128,7 +128,7 @@ body %}
             <div id="user_actions">
                 {% let name = ["u_", user.name.as_str()].join("") %}
                 <div id="user_subscription">
-                    {% if prefs.subscriptions.contains(name) %}
+                    {% if prefs.is_subscribed(name.as_str()) %}
                     <form
                         action="/r/{{ name }}/unsubscribe?redirect={{ redirect_url }}"
                         method="POST"
@@ -145,7 +145,7 @@ body %}
                     {% endif %}
                 </div>
                 <div id="user_filter">
-                    {% if prefs.filters.contains(name) %}
+                    {% if prefs.is_filtered(name.as_str()) %}
                     <form
                         action="/r/{{ name }}/unfilter?redirect={{ redirect_url }}"
                         method="POST"

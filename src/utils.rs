@@ -769,6 +769,14 @@ impl Preferences {
 		}
 	}
 
+	pub fn is_subscribed(&self, name: &str) -> bool {
+		self.subscriptions.iter().any(|subscription| subscription.eq_ignore_ascii_case(name))
+	}
+
+	pub fn is_filtered(&self, name: &str) -> bool {
+		self.filters.iter().any(|filter| filter.eq_ignore_ascii_case(name))
+	}
+
 	pub fn to_urlencoded(&self) -> Result<String, String> {
 		serde_urlencoded::to_string(self).map_err(|e| e.to_string())
 	}
@@ -799,7 +807,11 @@ pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 
 /// Gets a `HashSet` of filters from the cookie in the given `Request`.
 pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
-	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+	setting(req, "filters")
+		.split('+')
+		.map(str::to_ascii_lowercase)
+		.filter(|s| !s.is_empty())
+		.collect::<HashSet<String>>()
 }
 
 /// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being
@@ -815,7 +827,11 @@ pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> (u64, b
 	if posts.is_empty() {
 		(0, false)
 	} else {
-		posts.retain(|p| !(filters.contains(&p.community) || filters.contains(&["u_", &p.author.name].concat())));
+		posts.retain(|p| {
+			let community = p.community.to_ascii_lowercase();
+			let author = format!("u_{}", p.author.name.to_ascii_lowercase());
+			!(filters.contains(&community) || filters.contains(&author))
+		});
 
 		// Get the length of the Vec<Post> after applying the filter.
 		// If lb > la, then at least one post was removed.
@@ -1821,6 +1837,15 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		let serialized = serde_json::to_string(&prefs).unwrap();
 		let deserialized: Preferences = serde_json::from_str(&serialized).unwrap();
 		assert_eq!(prefs, deserialized);
+	}
+
+	#[test]
+	fn test_preference_membership_is_case_insensitive() {
+		let mut prefs = Preferences::default();
+		prefs.subscriptions.push("Rust".to_string());
+		prefs.filters.push("u_Example".to_string());
+		assert!(prefs.is_subscribed("rust"));
+		assert!(prefs.is_filtered("u_example"));
 	}
 
 	#[test]

@@ -147,7 +147,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let filters = get_filters(&req);
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub_name.split('+').all(|s| filters.contains(s)) {
+	if sub_name.split('+').all(|s| filters.contains(&s.to_ascii_lowercase())) {
 		Ok(template(&SubredditTemplate {
 			sub,
 			posts: Vec::new(),
@@ -284,66 +284,29 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	let mut sub_list = preferences.subscriptions;
 	let mut filters = preferences.filters;
 
-	// Retrieve list of posts for these subreddits to extract display names
-
-	let posts = json(format!("/r/{sub}/hot.json?raw_json=1"), true).await;
-	let display_lookup: Vec<(String, &str)> = match &posts {
-		Ok(posts) => posts["data"]["children"]
-			.as_array()
-			.map(|list| {
-				list
-					.iter()
-					.map(|post| {
-						let display_name = post["data"]["subreddit"].as_str().unwrap_or_default();
-						(display_name.to_lowercase(), display_name)
-					})
-					.collect::<Vec<_>>()
-			})
-			.unwrap_or_default(),
-		Err(_) => vec![],
-	};
-
 	// Find each subreddit name (separated by '+') in sub parameter
 	for part in sub.split('+').filter(|x| x != &"") {
-		// Retrieve display name for the subreddit
-		let display;
-		let part = if part.starts_with("u_") {
-			part
-		} else if let Some(&(_, display)) = display_lookup.iter().find(|x| x.0 == part.to_lowercase()) {
-			// This is already known, doesn't require separate request
-			display
-		} else {
-			// This subreddit display name isn't known, retrieve it
-			let path: String = format!("/r/{part}/about.json?raw_json=1");
-			display = json(path, true).await;
-			match &display {
-				Ok(display) => display["data"]["display_name"].as_str(),
-				Err(_) => None,
-			}
-			.unwrap_or(part)
-		};
-
 		// Modify sub list based on action
-		if action.contains(&"subscribe".to_string()) && !sub_list.contains(&part.to_owned()) {
+		if action.contains(&"subscribe".to_string()) && !contains_ignore_ascii_case(&sub_list, part) {
 			// Add each sub name to the subscribed list
 			sub_list.push(part.to_owned());
-			filters.retain(|s| s.to_lowercase() != part.to_lowercase());
+			filters.retain(|s| !s.eq_ignore_ascii_case(part));
 			// Reorder sub names alphabetically
 			sub_list.sort_by_key(|a| a.to_lowercase());
 			filters.sort_by_key(|a| a.to_lowercase());
 		} else if action.contains(&"unsubscribe".to_string()) {
 			// Remove sub name from subscribed list
-			sub_list.retain(|s| s.to_lowercase() != part.to_lowercase());
-		} else if action.contains(&"filter".to_string()) && !filters.contains(&part.to_owned()) {
+			sub_list.retain(|s| !s.eq_ignore_ascii_case(part));
+		} else if action.contains(&"filter".to_string()) && !contains_ignore_ascii_case(&filters, part) {
 			// Add each sub name to the filtered list
 			filters.push(part.to_owned());
-			sub_list.retain(|s| s.to_lowercase() != part.to_lowercase());
+			sub_list.retain(|s| !s.eq_ignore_ascii_case(part));
 			// Reorder sub names alphabetically
 			filters.sort_by_key(|a| a.to_lowercase());
 			sub_list.sort_by_key(|a| a.to_lowercase());
 		} else if action.contains(&"unfilter".to_string()) {
 			// Remove sub name from filtered list
-			filters.retain(|s| s.to_lowercase() != part.to_lowercase());
+			filters.retain(|s| !s.eq_ignore_ascii_case(part));
 		}
 	}
 
@@ -455,6 +418,10 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 	}
 
 	Ok(response)
+}
+
+fn contains_ignore_ascii_case(values: &[String], candidate: &str) -> bool {
+	values.iter().any(|value| value.eq_ignore_ascii_case(candidate))
 }
 
 pub async fn wiki(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -705,6 +672,14 @@ fn get_mime_type(url: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_subscription_names_are_compared_case_insensitively() {
+		let values = vec!["Rust".to_string(), "u_Example".to_string()];
+		assert!(contains_ignore_ascii_case(&values, "rust"));
+		assert!(contains_ignore_ascii_case(&values, "U_example"));
+		assert!(!contains_ignore_ascii_case(&values, "privacy"));
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_fetching_subreddit() {

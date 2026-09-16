@@ -52,6 +52,10 @@ struct SearchTemplate {
 /// Regex matched against search queries to determine if they are reddit urls.
 static REDDIT_URL_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^https?://([^\./]+\.)*reddit.com/").unwrap());
 
+fn should_fetch_search_posts(typed: &str) -> bool {
+	typed != "sr_user"
+}
+
 // SERVICES
 pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	// This ensures that during a search, no NSFW posts are fetched at all
@@ -96,16 +100,18 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	// If search is not restricted to this subreddit, show other subreddits in search results
 	let subreddits = if param(&path, "restrict_sr").is_none() {
 		let mut subreddits = search_subreddits(&query, &typed).await;
-		subreddits.retain(|s| !filters.contains(s.name.as_str()));
+		subreddits.retain(|s| !filters.contains(&s.name.to_ascii_lowercase()));
 		subreddits
 	} else {
 		Vec::new()
 	};
 
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let fetch_posts = should_fetch_search_posts(&typed);
+	let all_subs_filtered = sub.split('+').all(|s| filters.contains(&s.to_ascii_lowercase()));
 
-	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub.split('+').all(|s| filters.contains(s)) {
+	// Community-only search and fully filtered communities do not need a post listing.
+	if !fetch_posts || all_subs_filtered {
 		Ok(template(&SearchTemplate {
 			posts: Vec::new(),
 			subreddits,
@@ -121,7 +127,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 			},
 			prefs: Preferences::new(&req),
 			url,
-			is_filtered: true,
+			is_filtered: all_subs_filtered,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
@@ -162,6 +168,18 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::should_fetch_search_posts;
+
+	#[test]
+	fn test_community_only_search_skips_post_listing() {
+		assert!(!should_fetch_search_posts("sr_user"));
+		assert!(should_fetch_search_posts("link"));
+		assert!(should_fetch_search_posts(""));
 	}
 }
 

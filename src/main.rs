@@ -73,6 +73,17 @@ async fn opensearch() -> Result<Response<Body>, String> {
 	)
 }
 
+async fn health_live() -> Result<Response<Body>, String> {
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "text/plain; charset=utf-8")
+			.header("cache-control", "no-store")
+			.body("ok\n".into())
+			.unwrap_or_default(),
+	)
+}
+
 async fn resource(body: &str, content_type: &str, cache: bool) -> Result<Response<Body>, String> {
 	let mut res = Response::builder()
 		.status(200)
@@ -219,6 +230,7 @@ async fn main() {
 	}
 
 	// Read static files
+	app.at("/health/live").get(|_| health_live().boxed());
 	app.at("/style.css").get(|_| style().boxed());
 	app
 		.at("/manifest.json")
@@ -413,13 +425,7 @@ async fn main() {
 				Some("best" | "hot" | "new" | "top" | "rising" | "controversial") => subreddit::community(req).await,
 
 				// Short link for post
-				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
-					Ok(path_opt) => match path_opt {
-						Some(path) => Ok(redirect(&path)),
-						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
-					},
-					Err(e) => error(req, &e).await,
-				},
+				Some(id) if (5..8).contains(&id.len()) => Ok(redirect(&format!("/comments/{id}"))),
 
 				// Error message for unknown pages
 				_ => error(req, "Nothing here").await,

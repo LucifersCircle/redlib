@@ -57,6 +57,7 @@ const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
 const RATE_LIMIT_REMAINING_MASK: u64 = u16::MAX as u64;
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
+const REDDIT_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
 	let configured = max_concurrent_api_requests();
@@ -64,6 +65,7 @@ static REDDIT_API_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
 	Semaphore::new(configured)
 });
 static UPSTREAM_GUARD: LazyLock<Mutex<UpstreamGuard>> = LazyLock::new(|| Mutex::new(UpstreamGuard::default()));
+static UPSTREAM_REQUEST_COUNTS: LazyLock<[AtomicU64; 6]> = LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CooldownReason {
@@ -89,25 +91,110 @@ struct EdgeThrottleDecision {
 	started_cooldown: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum EdgeCircuitState {
+	Closed,
+	Open { until: Instant },
+	HalfOpen { epoch: u64, expires_at: Instant },
+}
+
+impl Default for EdgeCircuitState {
+	fn default() -> Self {
+		Self::Closed
+	}
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct EdgeAttempt {
+	epoch: u64,
+	half_open: bool,
+}
+
+#[derive(Debug)]
+struct UpstreamAttempt {
+	edge: EdgeAttempt,
+	completed: bool,
+}
+
+impl UpstreamAttempt {
+	fn complete(&mut self) {
+		self.completed = true;
+	}
+}
+
+impl Drop for UpstreamAttempt {
+	fn drop(&mut self) {
+		if self.edge.half_open && !self.completed {
+			upstream_guard().abandon_edge_probe(Instant::now(), self.edge);
+		}
+	}
+}
+
 #[derive(Debug, Default)]
 struct UpstreamGuard {
 	failure_window_started: Option<Instant>,
 	failures_in_window: u8,
+	upstream_failure_blocked_until: Option<Instant>,
+	rate_limit_blocked_until: Option<Instant>,
 	edge_throttle_failures: u8,
-	blocked_until: Option<Instant>,
-	blocked_reason: Option<CooldownReason>,
+	edge_epoch: u64,
+	edge_state: EdgeCircuitState,
 }
 
 impl UpstreamGuard {
-	fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
-		self.blocked_until.and_then(|deadline| deadline.checked_duration_since(now))
+	fn active_cooldown(&self, now: Instant) -> Option<(Duration, CooldownReason)> {
+		let mut active = None;
+		let mut consider = |deadline: Option<Instant>, reason| {
+			if let Some(remaining) = deadline.and_then(|deadline| deadline.checked_duration_since(now)) {
+				if active.map_or(true, |(current, _)| remaining > current) {
+					active = Some((remaining, reason));
+				}
+			}
+		};
+
+		consider(self.rate_limit_blocked_until, CooldownReason::RateLimit);
+		consider(self.upstream_failure_blocked_until, CooldownReason::UpstreamFailures);
+		match self.edge_state {
+			EdgeCircuitState::Open { until } => consider(Some(until), CooldownReason::EdgeThrottle),
+			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at), CooldownReason::EdgeThrottle),
+			EdgeCircuitState::Closed => {}
+		}
+		active
 	}
 
-	fn block_for(&mut self, now: Instant, duration: Duration, reason: CooldownReason) {
+	fn extend_deadline(slot: &mut Option<Instant>, now: Instant, duration: Duration) {
 		let deadline = now + duration.min(MAX_RATE_LIMIT_COOLDOWN);
-		if self.blocked_until.map_or(true, |current| deadline > current) {
-			self.blocked_until = Some(deadline);
-			self.blocked_reason = Some(reason);
+		if deadline > slot.as_ref().copied().unwrap_or(now) {
+			*slot = Some(deadline);
+		}
+	}
+
+	fn begin_attempt(&mut self, now: Instant) -> Result<EdgeAttempt, (Duration, CooldownReason)> {
+		if let Some(active) = self.active_cooldown(now) {
+			return Err(active);
+		}
+
+		match self.edge_state {
+			EdgeCircuitState::Open { .. } => {
+				self.edge_state = EdgeCircuitState::HalfOpen {
+					epoch: self.edge_epoch,
+					expires_at: now + REDDIT_API_REQUEST_TIMEOUT,
+				};
+				Ok(EdgeAttempt {
+					epoch: self.edge_epoch,
+					half_open: true,
+				})
+			}
+			EdgeCircuitState::HalfOpen { .. } => {
+				self.edge_epoch = self.edge_epoch.wrapping_add(1);
+				let delay = edge_throttle_delay(self.edge_throttle_failures.max(1), None);
+				self.edge_state = EdgeCircuitState::Open { until: now + delay };
+				Err((delay, CooldownReason::EdgeThrottle))
+			}
+			EdgeCircuitState::Closed => Ok(EdgeAttempt {
+				epoch: self.edge_epoch,
+				half_open: false,
+			}),
 		}
 	}
 
@@ -119,7 +206,7 @@ impl UpstreamGuard {
 
 		self.failures_in_window = self.failures_in_window.saturating_add(1);
 		if self.failures_in_window >= FAILURE_THRESHOLD {
-			self.block_for(now, FAILURE_COOLDOWN, CooldownReason::UpstreamFailures);
+			Self::extend_deadline(&mut self.upstream_failure_blocked_until, now, FAILURE_COOLDOWN);
 			self.failure_window_started = None;
 			self.failures_in_window = 0;
 			true
@@ -128,26 +215,42 @@ impl UpstreamGuard {
 		}
 	}
 
-	fn record_success(&mut self) {
+	fn reset_failure_window(&mut self) {
 		self.failure_window_started = None;
 		self.failures_in_window = 0;
-		self.edge_throttle_failures = 0;
 	}
 
-	fn record_edge_throttle(&mut self, now: Instant, retry_after: Option<Duration>) -> EdgeThrottleDecision {
-		if self.blocked_reason == Some(CooldownReason::EdgeThrottle) {
-			if let Some(delay) = self.cooldown_remaining(now) {
-				return EdgeThrottleDecision {
-					delay,
-					consecutive_failures: self.edge_throttle_failures,
-					started_cooldown: false,
-				};
-			}
+	fn record_api_success(&mut self, attempt: EdgeAttempt) {
+		self.reset_failure_window();
+		let closes_probe = matches!(self.edge_state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
+		let current_closed_attempt = matches!(self.edge_state, EdgeCircuitState::Closed) && attempt.epoch == self.edge_epoch;
+		if closes_probe {
+			self.edge_throttle_failures = 0;
+			self.edge_epoch = self.edge_epoch.wrapping_add(1);
+			self.edge_state = EdgeCircuitState::Closed;
+		} else if current_closed_attempt {
+			self.edge_throttle_failures = 0;
+		}
+	}
+
+	fn record_edge_throttle(&mut self, now: Instant, attempt: EdgeAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
+		if attempt.epoch != self.edge_epoch {
+			let delay = match self.edge_state {
+				EdgeCircuitState::Open { until } => until.checked_duration_since(now).unwrap_or_default(),
+				EdgeCircuitState::HalfOpen { .. } => Duration::from_secs(1),
+				EdgeCircuitState::Closed => edge_throttle_delay(self.edge_throttle_failures.max(1), retry_after),
+			};
+			return EdgeThrottleDecision {
+				delay,
+				consecutive_failures: self.edge_throttle_failures,
+				started_cooldown: false,
+			};
 		}
 
 		self.edge_throttle_failures = self.edge_throttle_failures.saturating_add(1);
 		let delay = edge_throttle_delay(self.edge_throttle_failures, retry_after);
-		self.block_for(now, delay, CooldownReason::EdgeThrottle);
+		self.edge_epoch = self.edge_epoch.wrapping_add(1);
+		self.edge_state = EdgeCircuitState::Open { until: now + delay };
 		EdgeThrottleDecision {
 			delay,
 			consecutive_failures: self.edge_throttle_failures,
@@ -155,11 +258,19 @@ impl UpstreamGuard {
 		}
 	}
 
-	fn clear_rate_limit_block(&mut self) {
-		if self.blocked_reason == Some(CooldownReason::RateLimit) {
-			self.blocked_until = None;
-			self.blocked_reason = None;
+	fn abandon_edge_probe(&mut self, now: Instant, attempt: EdgeAttempt) {
+		if attempt.half_open && matches!(self.edge_state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch) {
+			let delay = edge_throttle_delay(self.edge_throttle_failures.max(1), None);
+			self.edge_state = EdgeCircuitState::Open { until: now + delay };
 		}
+	}
+
+	fn block_for_rate_limit(&mut self, now: Instant, duration: Duration) {
+		Self::extend_deadline(&mut self.rate_limit_blocked_until, now, duration);
+	}
+
+	fn clear_rate_limit_block(&mut self) {
+		self.rate_limit_blocked_until = None;
 	}
 }
 
@@ -284,21 +395,68 @@ pub(crate) fn install_oauth_generation(generation: u64, fresh_identity: bool) {
 		.unwrap_or_else(|state| state);
 
 	let mut guard = upstream_guard();
-	guard.record_success();
+	guard.reset_failure_window();
 	if fresh_identity {
 		guard.clear_rate_limit_block();
+		reset_upstream_request_counts();
+	}
+}
+
+fn endpoint_class_index(path: &str) -> usize {
+	let path = path.split('?').next().unwrap_or_default();
+	if path.contains("/comments/") || path.starts_with("/comments/") {
+		return 4;
+	}
+	if path == "/search.json" || path.ends_with("/search.json") {
+		return 3;
+	}
+	match path.split('/').nth(1) {
+		Some("r") => 0,
+		Some("user") => 1,
+		Some("api") => 2,
+		_ => 5,
 	}
 }
 
 fn endpoint_class(path: &str) -> &'static str {
-	match path.split('?').next().unwrap_or_default().split('/').nth(1) {
-		Some("r") => "subreddit",
-		Some("user") => "user",
-		Some("api") => "api",
-		Some("search.json") => "search",
-		Some("comments") => "comments",
-		_ => "other",
+	["subreddit", "user", "api", "search", "comments", "other"][endpoint_class_index(path)]
+}
+
+fn record_upstream_request(path: &str) {
+	UPSTREAM_REQUEST_COUNTS[endpoint_class_index(path)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn reset_upstream_request_counts() {
+	for counter in UPSTREAM_REQUEST_COUNTS.iter() {
+		counter.store(0, Ordering::Relaxed);
 	}
+}
+
+fn upstream_request_summary() -> String {
+	["subreddit", "user", "api", "search", "comments", "other"]
+		.into_iter()
+		.zip(UPSTREAM_REQUEST_COUNTS.iter())
+		.map(|(label, counter)| format!("{label}={}", counter.load(Ordering::Relaxed)))
+		.collect::<Vec<_>>()
+		.join(",")
+}
+
+fn maybe_rotate_low_budget(generation: u64, remaining: u16, used: Option<u16>, reset: Option<Duration>, path: &str) {
+	if remaining >= LOW_RATE_LIMIT_THRESHOLD
+		|| !is_current_oauth_generation(generation)
+		|| !edge_circuit_allows_oauth_rollover()
+		|| !spawn_rate_limit_refresh(reset)
+	{
+		return;
+	}
+
+	warn!(
+		"Reddit request budget is low: remaining={remaining} used={} reset_seconds={} endpoint={} api_requests_since_identity_approx={}; rotating anonymous OAuth identity once",
+		used.map_or(0, u16::from),
+		reset.map_or(0, |duration| duration.as_secs()),
+		endpoint_class(path),
+		upstream_request_summary(),
+	);
 }
 
 fn upstream_guard() -> std::sync::MutexGuard<'static, UpstreamGuard> {
@@ -307,10 +465,21 @@ fn upstream_guard() -> std::sync::MutexGuard<'static, UpstreamGuard> {
 
 fn cooldown_error() -> Option<String> {
 	let guard = upstream_guard();
-	guard.cooldown_remaining(Instant::now()).map(|remaining| {
-		let message = guard.blocked_reason.unwrap_or(CooldownReason::UpstreamFailures).message();
+	guard.active_cooldown(Instant::now()).map(|(remaining, reason)| {
+		let message = reason.message();
 		format!("{message}. Retry in {} seconds", remaining.as_secs().max(1))
 	})
+}
+
+fn edge_circuit_allows_oauth_rollover() -> bool {
+	matches!(upstream_guard().edge_state, EdgeCircuitState::Closed)
+}
+
+fn begin_upstream_attempt() -> Result<UpstreamAttempt, String> {
+	let edge = upstream_guard().begin_attempt(Instant::now()).map_err(|(remaining, reason)| {
+		format!("{}. Retry in {} seconds", reason.message(), remaining.as_secs().max(1))
+	})?;
+	Ok(UpstreamAttempt { edge, completed: false })
 }
 
 fn block_for_rate_limit(generation: u64, duration: Duration) -> bool {
@@ -318,16 +487,14 @@ fn block_for_rate_limit(generation: u64, duration: Duration) -> bool {
 	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) != generation {
 		return false;
 	}
-	guard.block_for(Instant::now(), duration, CooldownReason::RateLimit);
+	guard.block_for_rate_limit(Instant::now(), duration);
 	true
 }
 
-fn block_for_edge_throttle(generation: u64, retry_after: Option<Duration>) -> Option<EdgeThrottleDecision> {
-	let mut guard = upstream_guard();
-	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) != generation {
-		return None;
-	}
-	Some(guard.record_edge_throttle(Instant::now(), retry_after))
+fn block_for_edge_throttle(attempt: &mut UpstreamAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
+	let decision = upstream_guard().record_edge_throttle(Instant::now(), attempt.edge, retry_after);
+	attempt.complete();
+	decision
 }
 
 fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str, generation: u64) {
@@ -344,11 +511,9 @@ fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str, generati
 	);
 }
 
-fn record_upstream_success(generation: u64) {
-	let mut guard = upstream_guard();
-	if rate_limit_generation(OAUTH_RATELIMIT_STATE.load(Ordering::SeqCst)) == generation {
-		guard.record_success();
-	}
+fn record_upstream_success(attempt: &mut UpstreamAttempt) {
+	upstream_guard().record_api_success(attempt.edge);
+	attempt.complete();
 }
 
 const URL_PAIRS: [(&str, &str); 2] = [
@@ -641,15 +806,60 @@ fn request(
 /// Make a request to a Reddit API and parse the JSON response.
 ///
 /// The short outer cache coalesces identical concurrent misses and briefly
-/// caches errors. The inner cache keeps successful responses longer and can
-/// serve its most recent success if a refresh fails.
-#[cached(size = 1024, time = 2, sync_writes = "by_key")]
+/// caches errors. Successful metadata responses are kept longer than dynamic
+/// listings, and either cache can serve its most recent success if a refresh
+/// fails.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
-	json_cached(path, quarantine).await
+	json_coalesced(normalize_reddit_api_path(&path), quarantine).await
+}
+
+#[cached(size = 1024, time = 2, sync_writes = "by_key")]
+async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String> {
+	if is_metadata_path(&path) {
+		json_metadata_cached(path, quarantine).await
+	} else {
+		json_dynamic_cached(path, quarantine).await
+	}
 }
 
 #[cached(size = 1024, time = 60, result = true, result_fallback = true)]
-async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
+async fn json_dynamic_cached(path: String, quarantine: bool) -> Result<Value, String> {
+	json_uncached(path, quarantine).await
+}
+
+#[cached(size = 512, time = 300, result = true, result_fallback = true)]
+async fn json_metadata_cached(path: String, quarantine: bool) -> Result<Value, String> {
+	json_uncached(path, quarantine).await
+}
+
+fn normalize_reddit_api_path(path: &str) -> String {
+	let (base, query) = path.split_once('?').unwrap_or((path, ""));
+	let mut pairs = url::form_urlencoded::parse(query.as_bytes())
+		.filter(|(key, _)| {
+			let key = key.as_ref();
+			key != "raw_json" && key != "share_id" && !key.starts_with("utm_")
+		})
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect::<Vec<_>>();
+	pairs.push(("raw_json".to_string(), "1".to_string()));
+	pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	serializer.extend_pairs(pairs);
+	format!("{base}?{}", serializer.finish())
+}
+
+fn is_metadata_path(path: &str) -> bool {
+	let base = path.split('?').next().unwrap_or_default();
+	let segments = base.trim_start_matches('/').split('/').collect::<Vec<_>>();
+	match segments.as_slice() {
+		["r", sub, "about.json"] => !sub.eq_ignore_ascii_case("random") && !sub.eq_ignore_ascii_case("randnsfw"),
+		["user", _, "about.json"] | ["r", _, "wiki.json"] | ["r", _, "wiki", ..] | ["subreddits", "search.json"] => true,
+		_ => false,
+	}
+}
+
+async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
@@ -663,18 +873,19 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 	let _permit = REDDIT_API_CONCURRENCY.acquire().await.map_err(|_| "Reddit request limiter is unavailable".to_string())?;
 
 	// A cooldown may have started while this request was waiting for a permit.
-	if let Some(error) = cooldown_error() {
-		return Err(error);
-	}
+	let mut upstream_attempt = begin_upstream_attempt()?;
 
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
 	let oauth_client = OAUTH_CLIENT.load_full();
 	let reservation = reserve_rate_limit_slot(&OAUTH_RATELIMIT_STATE, oauth_client.generation);
+	record_upstream_request(&path);
+	let timeout_path = path.clone();
 
 	// Fetch the url...
-	match reddit_get(path.clone(), quarantine, oauth_client).await {
+	let result = tokio::time::timeout(REDDIT_API_REQUEST_TIMEOUT, async {
+		match reddit_get(path.clone(), quarantine, oauth_client).await {
 		Ok(response) => {
 			let status = response.status();
 			let status_code = status.as_u16();
@@ -700,15 +911,6 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 					OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst),
 				);
 
-				if response_is_current && remaining < LOW_RATE_LIMIT_THRESHOLD && spawn_rate_limit_refresh(reset_duration) {
-					warn!(
-						"Reddit request budget is low: remaining={remaining} used={} reset_seconds={} endpoint={}; rotating anonymous OAuth identity once",
-						parsed_used.map_or(0, u16::from),
-						reset_duration.map_or(0, |duration| duration.as_secs()),
-						endpoint_class(&path),
-					);
-				}
-
 				if response_is_current && remaining == 0 {
 					let _ = block_for_rate_limit(reservation.generation, rate_limit_delay(None, reset));
 				}
@@ -727,27 +929,30 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 						reset_duration.map_or(0, |duration| duration.as_secs()),
 						used.is_some(),
 					);
+					if let Some(remaining) = parsed_remaining {
+						maybe_rotate_low_budget(reservation.generation, remaining, parsed_used, reset_duration, &path);
+					}
 					return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
 				}
 				Some(ThrottleKind::Edge) => {
-					let decision = block_for_edge_throttle(reservation.generation, retry_after_duration);
+					let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
 					match decision {
-						Some(decision) if decision.started_cooldown => warn!(
-							"Reddit edge throttle: status={} endpoint={} retry_after_seconds={} consecutive_failures={} cooldown_seconds={} current_generation=true",
+						decision if decision.started_cooldown => warn!(
+							"Reddit edge throttle: status={} endpoint={} retry_after_seconds={} consecutive_failures={} cooldown_seconds={} half_open_probe={}",
 							status,
 							endpoint_class(&path),
 							retry_after_duration.map_or(0, |duration| duration.as_secs()),
 							decision.consecutive_failures,
 							decision.delay.as_secs(),
+							upstream_attempt.edge.half_open,
 						),
-						Some(decision) => trace!(
-							"Reddit edge throttle joined existing cooldown: endpoint={} cooldown_seconds={} current_generation=true",
+						decision => trace!(
+							"Reddit edge throttle joined existing cooldown: endpoint={} cooldown_seconds={}",
 							endpoint_class(&path),
 							decision.delay.as_secs(),
 						),
-						None => trace!("Ignoring stale Reddit edge throttle response: endpoint={}", endpoint_class(&path)),
 					}
-					let delay = decision.map_or_else(|| edge_throttle_delay(1, retry_after_duration), |decision| decision.delay);
+					let delay = decision.delay;
 					return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", delay.as_secs().max(1)));
 				}
 				None => {}
@@ -765,6 +970,11 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 				return Err("OAuth token has expired. Please refresh the page!".to_string());
 			}
 
+			if status.is_server_error() {
+				record_upstream_failure("http_status", Some(status_code), &path, reservation.generation);
+				return Err("Reddit is having issues, check if there's an outage".to_string());
+			}
+
 			// asynchronously aggregate the chunks of the body
 			match hyper::body::aggregate(response.into_hyper_response()).await {
 				Ok(body) => {
@@ -779,7 +989,6 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 					match serde_json::from_reader(body.reader()) {
 						Ok(value) => {
 							let json: Value = value;
-							record_upstream_success(reservation.generation);
 
 							// If user is suspended
 							if let Some(data) = json.get("data") {
@@ -823,18 +1032,20 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 								}
 
 								Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
+							} else if !status.is_success() {
+								Err(format!("Reddit returned an unexpected response status: {status}"))
 							} else {
+								record_upstream_success(&mut upstream_attempt);
+								if let Some(remaining) = parsed_remaining {
+									maybe_rotate_low_budget(reservation.generation, remaining, parsed_used, reset_duration, &path);
+								}
 								Ok(json)
 							}
 						}
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
 							record_upstream_failure("invalid_json", Some(status.as_u16()), &path, reservation.generation);
-							if status.is_server_error() {
-								Err("Reddit is having issues, check if there's an outage".to_string())
-							} else {
-								err("Failed to parse page JSON data", e.to_string(), path)
-							}
+							err("Failed to parse page JSON data", e.to_string(), path)
 						}
 					}
 				}
@@ -844,9 +1055,19 @@ async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
 				}
 			}
 		}
-		Err(e) => {
-			record_upstream_failure("request_transport", None, &path, reservation.generation);
-			err("Couldn't send request to Reddit", e, path)
+			Err(e) => {
+				record_upstream_failure("request_transport", None, &path, reservation.generation);
+				err("Couldn't send request to Reddit", e, path)
+			}
+		}
+	})
+	.await;
+
+	match result {
+		Ok(result) => result,
+		Err(_) => {
+			record_upstream_failure("request_timeout", None, &timeout_path, reservation.generation);
+			Err(format!("Reddit API request timed out after {} seconds", REDDIT_API_REQUEST_TIMEOUT.as_secs()))
 		}
 	}
 }
@@ -1020,18 +1241,18 @@ mod tests {
 		assert!(!guard.record_failure(now));
 		assert!(!guard.record_failure(now + Duration::from_secs(1)));
 		assert!(guard.record_failure(now + Duration::from_secs(2)));
-		assert!(guard.cooldown_remaining(now + Duration::from_secs(3)).is_some());
-		assert_eq!(guard.blocked_reason, Some(CooldownReason::UpstreamFailures));
-		assert!(guard.cooldown_remaining(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
-		guard.record_success();
+		assert_eq!(guard.active_cooldown(now + Duration::from_secs(3)).map(|(_, reason)| reason), Some(CooldownReason::UpstreamFailures));
+		assert!(guard.active_cooldown(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
+		guard.reset_failure_window();
 		assert_eq!(guard.failures_in_window, 0);
 	}
 
 	#[test]
-	fn test_edge_throttle_ignores_concurrent_responses_and_recovers() {
+	fn test_edge_throttle_uses_one_probe_and_escalates_until_success() {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
-		let first = guard.record_edge_throttle(now, Some(Duration::from_secs(2)));
+		let original = guard.begin_attempt(now).unwrap();
+		let first = guard.record_edge_throttle(now, original, Some(Duration::from_secs(2)));
 		assert_eq!(
 			first,
 			EdgeThrottleDecision {
@@ -1040,36 +1261,106 @@ mod tests {
 				started_cooldown: true,
 			}
 		);
-		let concurrent = guard.record_edge_throttle(now + Duration::from_secs(1), Some(Duration::from_secs(2)));
+		let concurrent = guard.record_edge_throttle(now + Duration::from_secs(1), original, Some(Duration::from_secs(2)));
 		assert_eq!(concurrent.consecutive_failures, 1);
 		assert!(!concurrent.started_cooldown);
 
-		let second = guard.record_edge_throttle(now + Duration::from_secs(6), Some(Duration::from_secs(2)));
+		let probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
+		assert!(probe.half_open);
+		assert!(guard.begin_attempt(now + Duration::from_secs(6)).is_err());
+		let second = guard.record_edge_throttle(now + Duration::from_secs(6), probe, Some(Duration::from_secs(2)));
 		assert_eq!(second.delay, Duration::from_secs(10));
 		assert_eq!(second.consecutive_failures, 2);
 		assert!(second.started_cooldown);
 
-		guard.record_success();
-		let recovered = guard.record_edge_throttle(now + Duration::from_secs(17), Some(Duration::from_secs(2)));
+		let recovery_probe = guard.begin_attempt(now + Duration::from_secs(17)).unwrap();
+		guard.record_api_success(recovery_probe);
+		let recovered_attempt = guard.begin_attempt(now + Duration::from_secs(17)).unwrap();
+		let recovered = guard.record_edge_throttle(now + Duration::from_secs(17), recovered_attempt, Some(Duration::from_secs(2)));
 		assert_eq!(recovered.delay, Duration::from_secs(5));
 		assert_eq!(recovered.consecutive_failures, 1);
 	}
 
 	#[test]
-	fn test_fresh_identity_only_clears_rate_limit_cooldown() {
+	fn test_oauth_refresh_only_clears_rate_limit_cooldown() {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
-		guard.block_for(now, Duration::from_secs(10), CooldownReason::UpstreamFailures);
+		let attempt = guard.begin_attempt(now).unwrap();
+		guard.record_edge_throttle(now, attempt, None);
+		guard.block_for_rate_limit(now, Duration::from_secs(20));
+		guard.reset_failure_window();
 		guard.clear_rate_limit_block();
-		assert!(guard.cooldown_remaining(now).is_some());
-		guard.block_for(now, Duration::from_secs(20), CooldownReason::RateLimit);
-		guard.clear_rate_limit_block();
-		assert!(guard.cooldown_remaining(now).is_none());
+		assert_eq!(guard.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
+		assert_eq!(guard.edge_throttle_failures, 1);
+	}
+
+	#[test]
+	fn test_response_started_before_edge_denial_cannot_close_circuit() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let denied = guard.begin_attempt(now).unwrap();
+		let late_success = guard.begin_attempt(now).unwrap();
+		guard.record_edge_throttle(now, denied, None);
+		guard.record_api_success(late_success);
+		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
+		assert_eq!(guard.edge_throttle_failures, 1);
+	}
+
+	#[test]
+	fn test_abandoned_half_open_probe_reopens_edge_circuit() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let attempt = guard.begin_attempt(now).unwrap();
+		guard.record_edge_throttle(now, attempt, None);
+		let probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
+		guard.abandon_edge_probe(now + Duration::from_secs(6), probe);
+		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
+		assert!(guard.begin_attempt(now + Duration::from_secs(7)).is_err());
+	}
+
+	#[test]
+	fn test_expired_half_open_probe_cannot_block_or_recover_circuit() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let attempt = guard.begin_attempt(now).unwrap();
+		guard.record_edge_throttle(now, attempt, None);
+		let stale_probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
+		assert!(guard.begin_attempt(now + Duration::from_secs(37)).is_err());
+		guard.record_api_success(stale_probe);
+		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
+	}
+
+	#[test]
+	fn test_api_path_normalization_is_conservative_and_deterministic() {
+		assert_eq!(
+			normalize_reddit_api_path("/r/rust/hot.json?utm_source=test&after=t3_abc&raw_json=0&sort=new&share_id=secret&raw_json=1"),
+			"/r/rust/hot.json?after=t3_abc&raw_json=1&sort=new"
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/r/rust/hot.json?sort=new&after=t3_abc"),
+			normalize_reddit_api_path("/r/rust/hot.json?after=t3_abc&sort=new")
+		);
+		let preserved = normalize_reddit_api_path("/comments/abc.json?context=3&q=a%2Bb");
+		assert!(preserved.contains("context=3"));
+		assert!(preserved.contains("q=a%2Bb"));
+	}
+
+	#[test]
+	fn test_metadata_cache_policy_is_narrow() {
+		assert!(is_metadata_path("/r/rust/about.json?raw_json=1"));
+		assert!(is_metadata_path("/r/rust/wiki/index.json?raw_json=1"));
+		assert!(is_metadata_path("/subreddits/search.json?q=rust&raw_json=1"));
+		assert!(!is_metadata_path("/r/rust/hot.json?raw_json=1"));
+		assert!(!is_metadata_path("/comments/abc.json?raw_json=1"));
+		assert!(!is_metadata_path("/comments/about.json?raw_json=1"));
+		assert!(!is_metadata_path("/r/rust/comments/abc/wiki/def.json?raw_json=1"));
+		assert!(!is_metadata_path("/r/random/about.json?raw_json=1"));
 	}
 
 	#[test]
 	fn test_endpoint_class_does_not_log_resource_names() {
 		assert_eq!(endpoint_class("/r/example/hot.json?raw_json=1"), "subreddit");
+		assert_eq!(endpoint_class("/r/example/comments/abc/title.json"), "comments");
 		assert_eq!(endpoint_class("/user/example/about.json"), "user");
 		assert_eq!(endpoint_class("/search.json?q=private"), "search");
 	}

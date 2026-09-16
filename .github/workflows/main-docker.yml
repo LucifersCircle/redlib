@@ -31,7 +31,7 @@ jobs:
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev
       - name: Check formatting
-        run: rustfmt --edition 2021 --check src/client.rs src/oauth.rs
+        run: cargo fmt --all -- --check
       - name: Check code
         run: cargo check --locked --all-targets
       - name: Run deterministic resilience tests
@@ -46,10 +46,20 @@ jobs:
           cargo test --locked --lib test_stale_rate_limit_responses_cannot_replace_new_budget
           cargo test --locked --lib test_oauth_install_only_resets_budget_for_fresh_identity
           cargo test --locked --lib test_upstream_guard_opens_after_burst_and_recovers
-          cargo test --locked --lib test_edge_throttle_ignores_concurrent_responses_and_recovers
-          cargo test --locked --lib test_fresh_identity_only_clears_rate_limit_cooldown
+          cargo test --locked --lib test_edge_throttle_uses_one_probe_and_escalates_until_success
+          cargo test --locked --lib test_oauth_refresh_only_clears_rate_limit_cooldown
+          cargo test --locked --lib test_response_started_before_edge_denial_cannot_close_circuit
+          cargo test --locked --lib test_abandoned_half_open_probe_reopens_edge_circuit
+          cargo test --locked --lib test_expired_half_open_probe_cannot_block_or_recover_circuit
+          cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
+          cargo test --locked --lib test_metadata_cache_policy_is_narrow
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
+          cargo test --locked --lib test_comment_search_parameters_stay_local
+          cargo test --locked --lib test_non_comment_query_is_preserved
+          cargo test --locked --lib test_community_only_search_skips_post_listing
+          cargo test --locked --lib test_subscription_names_are_compared_case_insensitively
+          cargo test --locked --lib test_preference_membership_is_case_insensitive
           cargo test --locked --lib test_refresh_retry_delay_is_exponential_and_capped
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
