@@ -40,10 +40,13 @@ jobs:
           cargo test --locked --lib test_parse_delay_seconds
           cargo test --locked --lib test_parse_rate_limit_count_rejects_invalid_values
           cargo test --locked --lib test_rate_limit_delay_adds_margin_and_respects_cap
+          cargo test --locked --lib test_classify_throttle_response_separates_edge_denials
+          cargo test --locked --lib test_edge_throttle_delay_escalates_and_caps
           cargo test --locked --lib test_rate_limit_counter_does_not_underflow
           cargo test --locked --lib test_stale_rate_limit_responses_cannot_replace_new_budget
           cargo test --locked --lib test_oauth_install_only_resets_budget_for_fresh_identity
           cargo test --locked --lib test_upstream_guard_opens_after_burst_and_recovers
+          cargo test --locked --lib test_edge_throttle_ignores_concurrent_responses_and_recovers
           cargo test --locked --lib test_fresh_identity_only_clears_rate_limit_cooldown
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
@@ -52,6 +55,7 @@ jobs:
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
           cargo test --locked --lib test_token_refresh_delay_cannot_underflow
           cargo test --locked --lib test_low_budget_rotation_delay_uses_reset_and_bounds
+          cargo test --locked --lib test_low_budget_rotation_suppression_clears_after_fresh_identity
           cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
           cargo test --locked --lib test_alternate_backend_changes_kind
 
