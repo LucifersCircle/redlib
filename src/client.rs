@@ -516,11 +516,7 @@ impl UpstreamGuard {
 
 		self.failures_in_window = self.failures_in_window.saturating_add(1);
 		if self.failures_in_window >= FAILURE_THRESHOLD {
-			Self::extend_deadline(
-				&mut self.upstream_failure_blocked_until,
-				now,
-				proportional_positive_jitter(FAILURE_COOLDOWN),
-			);
+			Self::extend_deadline(&mut self.upstream_failure_blocked_until, now, proportional_positive_jitter(FAILURE_COOLDOWN));
 			self.failure_window_started = None;
 			self.failures_in_window = 0;
 			true
@@ -1987,20 +1983,14 @@ mod tests {
 		let denial = guard.record_edge_throttle(now, denied, None);
 		let probe_at = now + denial.delay + Duration::from_millis(1);
 		assert_eq!(guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
-		assert_eq!(
-			guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason),
-			Some(CooldownReason::EdgeThrottle)
-		);
+		assert_eq!(guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
 		assert_eq!(
 			guard.redirect_cooldown(probe_at, second_redirecting).map(|(_, reason)| reason),
 			Some(CooldownReason::EdgeThrottle)
 		);
 		let recovery_probe = guard.begin_attempt(probe_at).unwrap();
 		assert!(recovery_probe.half_open);
-		assert_eq!(
-			guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason),
-			Some(CooldownReason::EdgeThrottle)
-		);
+		assert_eq!(guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
 
 		guard.edge_state = EdgeCircuitState::Closed;
 		guard.edge_epoch = redirecting.epoch;
