@@ -168,6 +168,7 @@ struct QuotaGovernor {
 	epoch: u64,
 	next_request_id: u64,
 	outstanding: u16,
+	rollover_reserve: u16,
 	window: QuotaWindow,
 }
 
@@ -178,6 +179,7 @@ impl Default for QuotaGovernor {
 			epoch: 0,
 			next_request_id: 0,
 			outstanding: 0,
+			rollover_reserve: 0,
 			window: QuotaWindow::Unknown {
 				not_before: Instant::now(),
 				probe_in_flight: false,
@@ -199,6 +201,7 @@ impl QuotaGovernor {
 		}
 		if matches!(self.window, QuotaWindow::Known { reset_at, .. } if now >= reset_at + RATE_LIMIT_COOLDOWN_MARGIN) {
 			self.epoch = self.epoch.wrapping_add(1);
+			self.rollover_reserve = self.rollover_reserve.saturating_add(self.outstanding);
 			self.outstanding = 0;
 			self.window = QuotaWindow::Unknown {
 				not_before: now,
@@ -211,7 +214,8 @@ impl QuotaGovernor {
 				if *probe_in_flight {
 					return Err(QuotaReserveError::Deferred(QUOTA_UNKNOWN_RETRY));
 				}
-				if let Some(delay) = not_before.checked_duration_since(now) {
+				if now < *not_before {
+					let delay = (*not_before).duration_since(now);
 					return Err(QuotaReserveError::Deferred(delay.max(Duration::from_secs(1))));
 				}
 				*probe_in_flight = true;
@@ -243,6 +247,12 @@ impl QuotaGovernor {
 		}
 		self.outstanding = self.outstanding.saturating_sub(1);
 		if attempt.generation != self.generation {
+			if attempt.discovery_probe && matches!(self.window, QuotaWindow::Unknown { .. }) {
+				self.window = QuotaWindow::Unknown {
+					not_before: now + QUOTA_UNKNOWN_RETRY,
+					probe_in_flight: false,
+				};
+			}
 			return;
 		}
 
@@ -256,11 +266,13 @@ impl QuotaGovernor {
 		}
 
 		if let (QuotaWindow::Known { reset_at: known_reset, .. }, Some(remaining), Some(observed_reset)) = (&self.window, remaining, reset_at) {
-			if now >= *known_reset + RATE_LIMIT_COOLDOWN_MARGIN && observed_reset > *known_reset + RATE_LIMIT_COOLDOWN_MARGIN {
+			if now >= *known_reset && observed_reset > *known_reset + RATE_LIMIT_COOLDOWN_MARGIN {
+				let unresolved = self.outstanding.saturating_add(self.rollover_reserve);
 				self.epoch = self.epoch.wrapping_add(1);
 				self.outstanding = 0;
+				self.rollover_reserve = 0;
 				self.window = QuotaWindow::Known {
-					available: remaining,
+					available: remaining.saturating_sub(unresolved),
 					reset_at: observed_reset,
 				};
 				return;
@@ -270,18 +282,23 @@ impl QuotaGovernor {
 		match (&mut self.window, remaining) {
 			(QuotaWindow::Unknown { .. }, Some(remaining)) => {
 				self.window = QuotaWindow::Known {
-					available: remaining.saturating_sub(self.outstanding),
+					available: remaining.saturating_sub(self.outstanding).saturating_sub(self.rollover_reserve),
 					reset_at: reset_at.unwrap_or(now + MAX_RATE_LIMIT_COOLDOWN),
 				};
+				self.rollover_reserve = 0;
 			}
 			(QuotaWindow::Unknown { .. }, None) => {
-				self.window = QuotaWindow::Unreported;
+				self.window = QuotaWindow::Unknown {
+					not_before: now + QUOTA_UNKNOWN_RETRY,
+					probe_in_flight: false,
+				};
 			}
 			(QuotaWindow::Unreported, Some(remaining)) => {
 				self.window = QuotaWindow::Known {
-					available: remaining.saturating_sub(self.outstanding),
+					available: remaining.saturating_sub(self.outstanding).saturating_sub(self.rollover_reserve),
 					reset_at: reset_at.unwrap_or(now + MAX_RATE_LIMIT_COOLDOWN),
 				};
+				self.rollover_reserve = 0;
 			}
 			(QuotaWindow::Unreported, None) => {}
 			(QuotaWindow::Known { available, reset_at: known_reset }, Some(remaining)) => {
@@ -297,6 +314,16 @@ impl QuotaGovernor {
 					*known_reset = (*known_reset).max(observed_reset);
 				}
 			}
+		}
+	}
+
+	fn confirm_headerless_success(&mut self, attempt: &UpstreamAttempt) {
+		if attempt.generation == self.generation
+			&& attempt.quota_epoch == self.epoch
+			&& matches!(self.window, QuotaWindow::Unknown { .. })
+		{
+			self.rollover_reserve = 0;
+			self.window = QuotaWindow::Unreported;
 		}
 	}
 
@@ -395,7 +422,7 @@ impl UpstreamGuard {
 	fn active_cooldown(&self, now: Instant) -> Option<(Duration, CooldownReason)> {
 		let mut active = None;
 		let mut consider = |deadline: Option<Instant>, reason| {
-			if let Some(remaining) = deadline.and_then(|deadline| deadline.checked_duration_since(now)) {
+			if let Some(remaining) = deadline.filter(|deadline| *deadline > now).map(|deadline| deadline.duration_since(now)) {
 				if active.map_or(true, |(current, _)| remaining > current) {
 					active = Some((remaining, reason));
 				}
@@ -408,6 +435,27 @@ impl UpstreamGuard {
 			EdgeCircuitState::Open { until } => consider(Some(until), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::Closed => {}
+		}
+		active
+	}
+
+	fn redirect_cooldown(&self, now: Instant, attempt: EdgeAttempt) -> Option<(Duration, CooldownReason)> {
+		let mut active = None;
+		let mut consider = |deadline: Option<Instant>, reason| {
+			if let Some(remaining) = deadline.filter(|deadline| *deadline > now).map(|deadline| deadline.duration_since(now)) {
+				if active.map_or(true, |(current, _)| remaining > current) {
+					active = Some((remaining, reason));
+				}
+			}
+		};
+		consider(self.rate_limit_blocked_until, CooldownReason::RateLimit);
+		consider(self.upstream_failure_blocked_until, CooldownReason::UpstreamFailures);
+		match self.edge_state {
+			EdgeCircuitState::Closed if attempt.epoch == self.edge_epoch => {}
+			EdgeCircuitState::HalfOpen { epoch, .. } if attempt.half_open && attempt.epoch == epoch => {}
+			EdgeCircuitState::Open { until } => consider(Some(until), CooldownReason::EdgeThrottle),
+			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at), CooldownReason::EdgeThrottle),
+			EdgeCircuitState::Closed => consider(Some(now + Duration::from_secs(1)), CooldownReason::EdgeThrottle),
 		}
 		active
 	}
@@ -803,9 +851,22 @@ fn reconcile_rate_limit(attempt: &mut UpstreamAttempt, remaining: Option<u16>, r
 	upstream_guard().reconcile_quota(Instant::now(), attempt, remaining, reset, quota_exhausted);
 }
 
+fn confirm_headerless_quota(attempt: &UpstreamAttempt) {
+	upstream_guard().quota.confirm_headerless_success(attempt);
+}
+
 fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64) -> Result<(), ApiRequestError> {
 	let now = Instant::now();
 	let mut guard = upstream_guard();
+	if let Some((delay, reason)) = guard.redirect_cooldown(now, attempt.edge) {
+		drop(guard);
+		record_local_denial(reason);
+		return Err(ApiRequestError::Deferred(format!(
+			"{}. Retry in {} seconds",
+			reason.message(),
+			delay.as_secs().max(1)
+		)));
+	}
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
 		Err(error) => {
@@ -1096,6 +1157,9 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 fn validated_reddit_redirect_path(location: &str) -> Result<String, String> {
 	if location.starts_with("//") {
 		return Err("Reddit returned a scheme-relative redirect".to_string());
+	}
+	if location.starts_with('/') && location.contains('#') {
+		return Err("Reddit returned a redirect with a fragment".to_string());
 	}
 	let path = if location.starts_with('/') {
 		location.to_string()
@@ -1414,6 +1478,9 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 								} else if !status.is_success() {
 									Err(format!("Reddit returned an unexpected response status: {status}"))
 								} else {
+									if !quota_headers_present {
+										confirm_headerless_quota(&upstream_attempt);
+									}
 									record_upstream_success(&mut upstream_attempt);
 									Ok(json)
 								}
@@ -1590,6 +1657,7 @@ mod tests {
 			epoch: 2,
 			next_request_id: 0,
 			outstanding: 0,
+			rollover_reserve: 0,
 			window: QuotaWindow::Known {
 				available: QUOTA_SAFETY_RESERVE + 3,
 				reset_at: now + Duration::from_secs(120),
@@ -1610,6 +1678,7 @@ mod tests {
 			epoch: 4,
 			next_request_id: 2,
 			outstanding: 2,
+			rollover_reserve: 0,
 			window: QuotaWindow::Known {
 				available: 6,
 				reset_at: now + Duration::from_secs(120),
@@ -1638,6 +1707,7 @@ mod tests {
 			epoch: 2,
 			next_request_id: 8,
 			outstanding: 0,
+			rollover_reserve: 0,
 			window: QuotaWindow::Known {
 				available: 7,
 				reset_at: now + Duration::from_secs(90),
@@ -1656,6 +1726,7 @@ mod tests {
 			epoch: 3,
 			next_request_id: 1,
 			outstanding: 1,
+			rollover_reserve: 0,
 			window: QuotaWindow::Known {
 				available: 7,
 				reset_at: now + Duration::from_secs(90),
@@ -1684,7 +1755,14 @@ mod tests {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
 			generation: 2,
-			..QuotaGovernor::default()
+			epoch: 0,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			window: QuotaWindow::Unknown {
+				not_before: now,
+				probe_in_flight: false,
+			},
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		assert!(discovery_probe);
@@ -1699,8 +1777,43 @@ mod tests {
 			completed: true,
 		};
 		quota.reconcile(now, &attempt, None, None, false);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
+		assert!(quota.reserve(now, 2).is_err());
+		quota.confirm_headerless_success(&attempt);
 		assert!(matches!(quota.window, QuotaWindow::Unreported));
 		assert!(quota.reserve(now, 2).is_ok());
+	}
+
+	#[test]
+	fn test_stale_discovery_releases_probe_without_applying_headers() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 1,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			window: QuotaWindow::Unknown {
+				not_before: now,
+				probe_in_flight: false,
+			},
+		};
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 1).unwrap();
+		quota.install_generation(2);
+		let stale_attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 1,
+			quota_epoch,
+			request_id,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		quota.reconcile(now, &stale_attempt, Some(99), Some(Duration::from_secs(300)), false);
+		assert_eq!(quota.outstanding, 0);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
+		assert_eq!(quota.reserve(now + QUOTA_UNKNOWN_RETRY, 2).unwrap().2, true);
 	}
 
 	#[test]
@@ -1711,7 +1824,8 @@ mod tests {
 			generation: 8,
 			epoch: 12,
 			next_request_id: 3,
-			outstanding: 1,
+			outstanding: 3,
+			rollover_reserve: 0,
 			window: QuotaWindow::Known {
 				available: 6,
 				reset_at: old_reset,
@@ -1730,7 +1844,7 @@ mod tests {
 		quota.reconcile(now, &attempt, Some(90), Some(Duration::from_secs(300)), false);
 		assert_eq!(quota.epoch, 13);
 		assert_eq!(quota.outstanding, 0);
-		assert!(matches!(quota.window, QuotaWindow::Known { available: 90, .. }));
+		assert!(matches!(quota.window, QuotaWindow::Known { available: 88, .. }));
 	}
 
 	#[test]
@@ -1741,6 +1855,7 @@ mod tests {
 			epoch: 9,
 			next_request_id: 0,
 			outstanding: 0,
+			rollover_reserve: 0,
 			window: QuotaWindow::Known {
 				available: 0,
 				reset_at: now - RATE_LIMIT_COOLDOWN_MARGIN,
@@ -1756,8 +1871,9 @@ mod tests {
 		assert!(validated_reddit_redirect_path("https://example.com/r/rust").is_err());
 		assert!(validated_reddit_redirect_path("//oauth.reddit.com/r/rust").is_err());
 		assert!(validated_reddit_redirect_path("https://user@oauth.reddit.com/r/rust").is_err());
-		assert!(validated_reddit_redirect_path("https://oauth.reddit.com:443/r/rust").is_err());
+		assert!(validated_reddit_redirect_path("https://oauth.reddit.com:444/r/rust").is_err());
 		assert!(validated_reddit_redirect_path("https://oauth.reddit.com/r/rust#fragment").is_err());
+		assert!(validated_reddit_redirect_path("/r/rust#fragment").is_err());
 		assert_eq!(
 			validated_reddit_redirect_path("https://www.reddit.com/r/rust/hot.json?limit=25").unwrap(),
 			"/r/rust/hot.json?limit=25&raw_json=1"
@@ -1778,6 +1894,27 @@ mod tests {
 		assert!(guard.active_cooldown(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
 		guard.reset_failure_window();
 		assert_eq!(guard.failures_in_window, 0);
+	}
+
+	#[test]
+	fn test_redirect_continuation_observes_new_cooldowns() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let redirecting = guard.begin_attempt(now).unwrap();
+		let denied = guard.begin_attempt(now).unwrap();
+		guard.record_edge_throttle(now, denied, None);
+		assert_eq!(
+			guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason),
+			Some(CooldownReason::EdgeThrottle)
+		);
+
+		guard.edge_state = EdgeCircuitState::Closed;
+		guard.edge_epoch = redirecting.epoch;
+		guard.block_for_rate_limit(now, Duration::from_secs(20));
+		assert_eq!(
+			guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason),
+			Some(CooldownReason::RateLimit)
+		);
 	}
 
 	#[test]
