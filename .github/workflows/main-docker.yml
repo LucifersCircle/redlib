@@ -60,7 +60,7 @@ jobs:
           cargo test --locked --lib test_abandoned_half_open_probe_reopens_edge_circuit
           cargo test --locked --lib test_expired_half_open_probe_cannot_block_or_recover_circuit
           cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
-          cargo test --locked --lib test_metadata_cache_policy_is_narrow
+          cargo test --locked --lib test_json_cache_policy_is_narrow
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib temporary_errors_use_service_unavailable_retry_metadata
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
@@ -83,6 +83,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Calculate upstream divergence
+        id: divergence
+        run: |
+          git remote add upstream-status https://github.com/redlib-org/redlib.git
+          git fetch --no-tags upstream-status main
+          echo "ahead=$(git rev-list --count upstream-status/main..HEAD)" >> "$GITHUB_OUTPUT"
+          echo "behind=$(git rev-list --count HEAD..upstream-status/main)" >> "$GITHUB_OUTPUT"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -109,5 +118,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            REDLIB_BUILD_GIT_SHA=${{ github.sha }}
+            REDLIB_BUILD_UPSTREAM_AHEAD=${{ steps.divergence.outputs.ahead }}
+            REDLIB_BUILD_UPSTREAM_BEHIND=${{ steps.divergence.outputs.behind }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

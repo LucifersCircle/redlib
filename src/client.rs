@@ -1285,19 +1285,24 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 
 #[cached(size = 1024, time = 2, sync_writes = "by_key")]
 async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String> {
-	if is_metadata_path(&path) {
-		json_metadata_cached(path, quarantine).await
-	} else {
-		json_dynamic_cached(path, quarantine).await
+	match json_cache_policy(&path) {
+		JsonCachePolicy::Metadata => json_metadata_cached(path, quarantine).await,
+		JsonCachePolicy::Comments => json_comments_cached(path, quarantine).await,
+		JsonCachePolicy::Dynamic => json_dynamic_cached(path, quarantine).await,
 	}
 }
 
-#[cached(size = 1024, time = 60, result = true, result_fallback = true)]
+#[cached(size = 512, time = 60, result = true, result_fallback = true)]
 async fn json_dynamic_cached(path: String, quarantine: bool) -> Result<Value, String> {
 	json_uncached(path, quarantine).await
 }
 
-#[cached(size = 512, time = 300, result = true, result_fallback = true)]
+#[cached(size = 512, time = 180, result = true, result_fallback = true)]
+async fn json_comments_cached(path: String, quarantine: bool) -> Result<Value, String> {
+	json_uncached(path, quarantine).await
+}
+
+#[cached(size = 512, time = 900, result = true, result_fallback = true)]
 async fn json_metadata_cached(path: String, quarantine: bool) -> Result<Value, String> {
 	json_uncached(path, quarantine).await
 }
@@ -1317,6 +1322,44 @@ fn normalize_reddit_api_path(path: &str) -> String {
 	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
 	serializer.extend_pairs(pairs);
 	format!("{base}?{}", serializer.finish())
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum JsonCachePolicy {
+	Dynamic,
+	Comments,
+	Metadata,
+}
+
+fn json_cache_policy(path: &str) -> JsonCachePolicy {
+	if is_metadata_path(path) {
+		JsonCachePolicy::Metadata
+	} else if is_comments_path(path) {
+		JsonCachePolicy::Comments
+	} else {
+		JsonCachePolicy::Dynamic
+	}
+}
+
+fn is_comments_path(path: &str) -> bool {
+	let base = path.split('?').next().unwrap_or_default();
+	let base = base.strip_suffix(".json").unwrap_or(base).trim_end_matches('/');
+	let segments = base.trim_start_matches('/').split('/').collect::<Vec<_>>();
+	matches!(
+		segments.as_slice(),
+		["comments", _]
+			| ["comments", _, _]
+			| ["comments", _, _, _]
+			| ["r", _, "comments", _]
+			| ["r", _, "comments", _, _]
+			| ["r", _, "comments", _, _, _]
+			| ["u", _, "comments", _]
+			| ["u", _, "comments", _, _]
+			| ["u", _, "comments", _, _, _]
+			| ["user", _, "comments", _]
+			| ["user", _, "comments", _, _]
+			| ["user", _, "comments", _, _, _]
+	)
 }
 
 fn is_metadata_path(path: &str) -> bool {
@@ -2097,18 +2140,26 @@ mod tests {
 		let preserved = normalize_reddit_api_path("/comments/abc.json?context=3&q=a%2Bb");
 		assert!(preserved.contains("context=3"));
 		assert!(preserved.contains("q=a%2Bb"));
+		assert_ne!(
+			normalize_reddit_api_path("/comments/abc/title.json?sort=top"),
+			normalize_reddit_api_path("/comments/abc/title.json?sort=new")
+		);
 	}
 
 	#[test]
-	fn test_metadata_cache_policy_is_narrow() {
-		assert!(is_metadata_path("/r/rust/about.json?raw_json=1"));
-		assert!(is_metadata_path("/r/rust/wiki/index.json?raw_json=1"));
-		assert!(is_metadata_path("/subreddits/search.json?q=rust&raw_json=1"));
-		assert!(!is_metadata_path("/r/rust/hot.json?raw_json=1"));
-		assert!(!is_metadata_path("/comments/abc.json?raw_json=1"));
-		assert!(!is_metadata_path("/comments/about.json?raw_json=1"));
-		assert!(!is_metadata_path("/r/rust/comments/abc/wiki/def.json?raw_json=1"));
-		assert!(!is_metadata_path("/r/random/about.json?raw_json=1"));
+	fn test_json_cache_policy_is_narrow() {
+		assert_eq!(json_cache_policy("/r/rust/about.json?raw_json=1"), JsonCachePolicy::Metadata);
+		assert_eq!(json_cache_policy("/r/rust/wiki/index.json?raw_json=1"), JsonCachePolicy::Metadata);
+		assert_eq!(json_cache_policy("/subreddits/search.json?q=rust&raw_json=1"), JsonCachePolicy::Metadata);
+		assert_eq!(json_cache_policy("/comments/abc.json?raw_json=1"), JsonCachePolicy::Comments);
+		assert_eq!(json_cache_policy("/r/rust/comments/abc/title.json?raw_json=1"), JsonCachePolicy::Comments);
+		assert_eq!(json_cache_policy("/user/example/comments/abc/title/def.json?raw_json=1"), JsonCachePolicy::Comments);
+		assert_eq!(json_cache_policy("/r/rust/comments/abc/title/def/.json?raw_json=1"), JsonCachePolicy::Comments);
+		assert_eq!(json_cache_policy("/r/rust/hot.json?raw_json=1"), JsonCachePolicy::Dynamic);
+		assert_eq!(json_cache_policy("/comments/about.json?raw_json=1"), JsonCachePolicy::Comments);
+		assert_eq!(json_cache_policy("/r/random/about.json?raw_json=1"), JsonCachePolicy::Dynamic);
+		assert_eq!(json_cache_policy("/user/example/comments.json?raw_json=1"), JsonCachePolicy::Dynamic);
+		assert_eq!(json_cache_policy("/comments/abc/title/def/extra.json?raw_json=1"), JsonCachePolicy::Dynamic);
 	}
 
 	#[test]

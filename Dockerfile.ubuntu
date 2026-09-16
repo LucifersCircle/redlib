@@ -20,6 +20,12 @@ RUN cargo build --release --locked --bin redlib
 RUN rm ./src/main.rs && rmdir ./src
 
 # copy the source and build the redlib binary
+ARG REDLIB_BUILD_GIT_SHA=""
+ARG REDLIB_BUILD_UPSTREAM_AHEAD=""
+ARG REDLIB_BUILD_UPSTREAM_BEHIND=""
+ENV REDLIB_BUILD_GIT_SHA=${REDLIB_BUILD_GIT_SHA}
+ENV REDLIB_BUILD_UPSTREAM_AHEAD=${REDLIB_BUILD_UPSTREAM_AHEAD}
+ENV REDLIB_BUILD_UPSTREAM_BEHIND=${REDLIB_BUILD_UPSTREAM_BEHIND}
 COPY . ./
 RUN cargo build --release --locked --bin redlib
 RUN echo "finished building redlib!"
