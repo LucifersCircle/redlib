@@ -318,10 +318,7 @@ impl QuotaGovernor {
 	}
 
 	fn confirm_headerless_success(&mut self, attempt: &UpstreamAttempt) {
-		if attempt.generation == self.generation
-			&& attempt.quota_epoch == self.epoch
-			&& matches!(self.window, QuotaWindow::Unknown { .. })
-		{
+		if attempt.generation == self.generation && attempt.quota_epoch == self.epoch && matches!(self.window, QuotaWindow::Unknown { .. }) {
 			self.rollover_reserve = 0;
 			self.window = QuotaWindow::Unreported;
 		}
@@ -494,10 +491,7 @@ impl UpstreamGuard {
 					half_open: true,
 				})
 			}
-			EdgeCircuitState::HalfOpen { expires_at, .. } => Err((
-				expires_at.checked_duration_since(now).unwrap_or(Duration::from_secs(1)),
-				CooldownReason::EdgeThrottle,
-			)),
+			EdgeCircuitState::HalfOpen { expires_at, .. } => Err((expires_at.checked_duration_since(now).unwrap_or(Duration::from_secs(1)), CooldownReason::EdgeThrottle)),
 			EdgeCircuitState::Closed => Ok(EdgeAttempt {
 				epoch: self.edge_epoch,
 				half_open: false,
@@ -575,7 +569,6 @@ impl UpstreamGuard {
 	fn block_for_rate_limit(&mut self, now: Instant, duration: Duration) {
 		Self::extend_deadline(&mut self.rate_limit_blocked_until, now, duration);
 	}
-
 }
 
 fn max_concurrent_api_requests() -> usize {
@@ -861,11 +854,7 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64) -> Resul
 	if let Some((delay, reason)) = guard.redirect_cooldown(now, attempt.edge) {
 		drop(guard);
 		record_local_denial(reason);
-		return Err(ApiRequestError::Deferred(format!(
-			"{}. Retry in {} seconds",
-			reason.message(),
-			delay.as_secs().max(1)
-		)));
+		return Err(ApiRequestError::Deferred(format!("{}. Retry in {} seconds", reason.message(), delay.as_secs().max(1))));
 	}
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
@@ -1903,18 +1892,12 @@ mod tests {
 		let redirecting = guard.begin_attempt(now).unwrap();
 		let denied = guard.begin_attempt(now).unwrap();
 		guard.record_edge_throttle(now, denied, None);
-		assert_eq!(
-			guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason),
-			Some(CooldownReason::EdgeThrottle)
-		);
+		assert_eq!(guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
 
 		guard.edge_state = EdgeCircuitState::Closed;
 		guard.edge_epoch = redirecting.epoch;
 		guard.block_for_rate_limit(now, Duration::from_secs(20));
-		assert_eq!(
-			guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason),
-			Some(CooldownReason::RateLimit)
-		);
+		assert_eq!(guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason), Some(CooldownReason::RateLimit));
 	}
 
 	#[test]
