@@ -1401,7 +1401,34 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	.render()
 	.unwrap_or_default();
 
-	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+	let temporary = temporary_error_retry_after(msg);
+	let mut response = Response::builder()
+		.status(if temporary.is_some() { 503 } else { 404 })
+		.header("content-type", "text/html");
+	if let Some(Some(seconds)) = temporary {
+		response = response.header("Retry-After", seconds.to_string());
+	}
+	Ok(response.body(body.into()).unwrap_or_default())
+}
+
+fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
+	const TEMPORARY_ERRORS: [&str; 7] = [
+		"Reddit requests are temporarily paused",
+		"Reddit is temporarily rejecting this instance",
+		"Reddit rate limit exceeded",
+		"OAuth token refresh is temporarily unavailable",
+		"Reddit is having issues",
+		"Reddit returned an empty response",
+		"Reddit API request timed out",
+	];
+	if !TEMPORARY_ERRORS.iter().any(|prefix| msg.starts_with(prefix)) {
+		return None;
+	}
+	let retry_after = msg
+		.split_once("Retry in ")
+		.and_then(|(_, suffix)| suffix.split_whitespace().next())
+		.and_then(|seconds| seconds.parse::<u64>().ok());
+	Some(retry_after)
 }
 
 /// Renders a generic info landing page.
@@ -1524,7 +1551,20 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Media, Post, Preferences};
+	use super::{
+		deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after,
+		url_path_basename, Media, Post, Preferences,
+	};
+
+	#[test]
+	fn temporary_errors_use_service_unavailable_retry_metadata() {
+		assert_eq!(
+			temporary_error_retry_after("Reddit is temporarily rejecting this instance. Retry in 42 seconds"),
+			Some(Some(42))
+		);
+		assert_eq!(temporary_error_retry_after("Reddit is having issues, check if there's an outage"), Some(None));
+		assert_eq!(temporary_error_retry_after("r/example is a private community"), None);
+	}
 
 	#[test]
 	fn format_num_works() {
