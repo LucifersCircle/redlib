@@ -42,18 +42,24 @@ jobs:
           cargo test --locked --lib test_rate_limit_delay_adds_margin_and_respects_cap
           cargo test --locked --lib test_classify_throttle_response_separates_edge_denials
           cargo test --locked --lib test_edge_throttle_delay_escalates_and_caps
-          cargo test --locked --lib test_rate_limit_counter_does_not_underflow
-          cargo test --locked --lib test_stale_rate_limit_responses_cannot_replace_new_budget
-          cargo test --locked --lib test_oauth_install_only_resets_budget_for_fresh_identity
+          cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
+          cargo test --locked --lib test_out_of_order_quota_responses_cannot_replenish_budget
+          cargo test --locked --lib test_token_refresh_preserves_quota_window
+          cargo test --locked --lib test_stale_generation_cannot_reserve_or_replace_budget
+          cargo test --locked --lib test_headerless_backend_leaves_discovery_mode
+          cargo test --locked --lib test_response_after_reset_establishes_new_quota_window
+          cargo test --locked --lib test_reset_allows_exactly_one_discovery_probe
+          cargo test --locked --lib test_redirect_validation_rejects_off_origin_and_normalizes_reddit
           cargo test --locked --lib test_upstream_guard_opens_after_burst_and_recovers
           cargo test --locked --lib test_edge_throttle_uses_one_probe_and_escalates_until_success
-          cargo test --locked --lib test_oauth_refresh_only_clears_rate_limit_cooldown
+          cargo test --locked --lib test_oauth_refresh_preserves_all_cooldowns
           cargo test --locked --lib test_response_started_before_edge_denial_cannot_close_circuit
           cargo test --locked --lib test_abandoned_half_open_probe_reopens_edge_circuit
           cargo test --locked --lib test_expired_half_open_probe_cannot_block_or_recover_circuit
           cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
           cargo test --locked --lib test_metadata_cache_policy_is_narrow
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
+          cargo test --locked --lib temporary_errors_use_service_unavailable_retry_metadata
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
           cargo test --locked --lib test_comment_search_parameters_stay_local
           cargo test --locked --lib test_non_comment_query_is_preserved
@@ -64,8 +70,6 @@ jobs:
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
           cargo test --locked --lib test_token_refresh_delay_cannot_underflow
-          cargo test --locked --lib test_low_budget_rotation_delay_uses_reset_and_bounds
-          cargo test --locked --lib test_low_budget_rotation_suppression_clears_after_fresh_identity
           cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
           cargo test --locked --lib test_alternate_backend_changes_kind
 
