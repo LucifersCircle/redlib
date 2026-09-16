@@ -1402,9 +1402,7 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	.unwrap_or_default();
 
 	let temporary = temporary_error_retry_after(msg);
-	let mut response = Response::builder()
-		.status(if temporary.is_some() { 503 } else { 404 })
-		.header("content-type", "text/html");
+	let mut response = Response::builder().status(if temporary.is_some() { 503 } else { 404 }).header("content-type", "text/html");
 	if let Some(Some(seconds)) = temporary {
 		response = response.header("Retry-After", seconds.to_string());
 	}
@@ -1556,8 +1554,8 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::{
-		deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after,
-		url_path_basename, Media, Post, Preferences,
+		deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after, url_path_basename, Media,
+		Post, Preferences,
 	};
 
 	#[test]
