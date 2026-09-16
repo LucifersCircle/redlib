@@ -95,8 +95,13 @@ struct EdgeThrottleDecision {
 enum EdgeCircuitState {
 	#[default]
 	Closed,
-	Open { until: Instant },
-	HalfOpen { epoch: u64, expires_at: Instant },
+	Open {
+		until: Instant,
+	},
+	HalfOpen {
+		epoch: u64,
+		expires_at: Instant,
+	},
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
