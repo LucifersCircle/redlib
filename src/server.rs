@@ -27,7 +27,7 @@ use std::{
 };
 use time::OffsetDateTime;
 
-use crate::{config, dbg_msg};
+use crate::{client::record_inbound_request, config, dbg_msg};
 
 const BANNED_USER_AGENTS: &[&str] = &[
 	"AI2Bot",
@@ -318,6 +318,8 @@ impl Server {
 				Ok::<_, String>(service_fn(move |req: Request<Body>| {
 					let req_headers = req.headers().clone();
 					let def_headers = default_headers.clone();
+					let telemetry_method = req.method().as_str().to_string();
+					let telemetry_path = req.uri().path().to_string();
 
 					// Catch robots.txt-disrespecful bots who still identify themselves
 					// Typically justified as "human triggered" actions.
@@ -329,6 +331,7 @@ impl Server {
 							if let Ok(user_agent_str) = user_agent.to_str() {
 								for banned in BANNED_USER_AGENTS {
 									if user_agent_str.contains(banned) {
+										record_inbound_request(&telemetry_method, &telemetry_path, 403);
 										return new_boilerplate(def_headers, req_headers, 403, Body::from("Forbidden")).boxed();
 									}
 								}
@@ -369,15 +372,22 @@ impl Server {
 											let _ = compress_response(&req_headers, &mut res).await;
 										}
 
+										record_inbound_request(&telemetry_method, &telemetry_path, res.status().as_u16());
 										Ok(res)
 									}
-									Err(msg) => new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await,
+									Err(msg) => {
+										record_inbound_request(&telemetry_method, &telemetry_path, 500);
+										new_boilerplate(def_headers, req_headers, 500, if is_head { Body::empty() } else { Body::from(msg) }).await
+									}
 								}
 							}
 							.boxed()
 						}
 						// If there was a routing error
-						Err(e) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).boxed(),
+						Err(e) => {
+							record_inbound_request(&telemetry_method, &telemetry_path, 404);
+							new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).boxed()
+						}
 					}
 				}))
 			}
