@@ -48,6 +48,7 @@ jobs:
           cargo test --locked --lib test_stale_generation_cannot_reserve_or_replace_budget
           cargo test --locked --lib test_headerless_backend_leaves_discovery_mode
           cargo test --locked --lib test_stale_discovery_releases_probe_without_applying_headers
+          cargo test --locked --lib test_headerless_redirect_keeps_discovery_until_final_success
           cargo test --locked --lib test_response_after_reset_establishes_new_quota_window
           cargo test --locked --lib test_reset_allows_exactly_one_discovery_probe
           cargo test --locked --lib test_redirect_validation_rejects_off_origin_and_normalizes_reddit
