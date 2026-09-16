@@ -34,20 +34,19 @@ fn main() {
 	let git_hash = if git_hash.is_empty() { "dev" } else { &git_hash };
 	println!("cargo:rustc-env=GIT_HASH={git_hash}");
 	println!("cargo:rustc-env=CSS_HASH={:016x}", css_hash());
-	println!(
-		"cargo:rustc-env=UPSTREAM_AHEAD={}",
-		std::env::var("REDLIB_BUILD_UPSTREAM_AHEAD").unwrap_or_default()
-	);
-	println!(
-		"cargo:rustc-env=UPSTREAM_BEHIND={}",
-		std::env::var("REDLIB_BUILD_UPSTREAM_BEHIND").unwrap_or_default()
-	);
+	println!("cargo:rustc-env=UPSTREAM_AHEAD={}", std::env::var("REDLIB_BUILD_UPSTREAM_AHEAD").unwrap_or_default());
+	println!("cargo:rustc-env=UPSTREAM_BEHIND={}", std::env::var("REDLIB_BUILD_UPSTREAM_BEHIND").unwrap_or_default());
 }
 
 fn css_hash() -> u64 {
 	let mut files = vec![PathBuf::from("static/style.css")];
 	if let Ok(entries) = fs::read_dir("static/themes") {
-		files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|extension| extension == "css")));
+		files.extend(
+			entries
+				.flatten()
+				.map(|entry| entry.path())
+				.filter(|path| path.extension().is_some_and(|extension| extension == "css")),
+		);
 	}
 	files.sort();
 
