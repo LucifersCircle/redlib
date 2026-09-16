@@ -91,17 +91,12 @@ struct EdgeThrottleDecision {
 	started_cooldown: bool,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 enum EdgeCircuitState {
+	#[default]
 	Closed,
 	Open { until: Instant },
 	HalfOpen { epoch: u64, expires_at: Instant },
-}
-
-impl Default for EdgeCircuitState {
-	fn default() -> Self {
-		Self::Closed
-	}
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -442,11 +437,7 @@ fn upstream_request_summary() -> String {
 }
 
 fn maybe_rotate_low_budget(generation: u64, remaining: u16, used: Option<u16>, reset: Option<Duration>, path: &str) {
-	if remaining >= LOW_RATE_LIMIT_THRESHOLD
-		|| !is_current_oauth_generation(generation)
-		|| !edge_circuit_allows_oauth_rollover()
-		|| !spawn_rate_limit_refresh(reset)
-	{
+	if remaining >= LOW_RATE_LIMIT_THRESHOLD || !is_current_oauth_generation(generation) || !edge_circuit_allows_oauth_rollover() || !spawn_rate_limit_refresh(reset) {
 		return;
 	}
 
@@ -476,9 +467,9 @@ fn edge_circuit_allows_oauth_rollover() -> bool {
 }
 
 fn begin_upstream_attempt() -> Result<UpstreamAttempt, String> {
-	let edge = upstream_guard().begin_attempt(Instant::now()).map_err(|(remaining, reason)| {
-		format!("{}. Retry in {} seconds", reason.message(), remaining.as_secs().max(1))
-	})?;
+	let edge = upstream_guard()
+		.begin_attempt(Instant::now())
+		.map_err(|(remaining, reason)| format!("{}. Retry in {} seconds", reason.message(), remaining.as_secs().max(1)))?;
 	Ok(UpstreamAttempt { edge, completed: false })
 }
 
@@ -886,175 +877,175 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 	// Fetch the url...
 	let result = tokio::time::timeout(REDDIT_API_REQUEST_TIMEOUT, async {
 		match reddit_get(path.clone(), quarantine, oauth_client).await {
-		Ok(response) => {
-			let status = response.status();
-			let status_code = status.as_u16();
+			Ok(response) => {
+				let status = response.status();
+				let status_code = status.as_u16();
 
-			let remaining = response.headers().get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
-			let reset = response.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
-			let used = response.headers().get("x-ratelimit-used").and_then(|value| value.to_str().ok());
-			let retry_after = response.headers().get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
-			let parsed_remaining = parse_rate_limit_count(remaining);
-			let parsed_used = parse_rate_limit_count(used);
-			let reset_duration = parse_delay_seconds(reset);
-			let retry_after_duration = parse_delay_seconds(retry_after);
-			let quota_headers_present = remaining.is_some() || reset.is_some() || used.is_some();
+				let remaining = response.headers().get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
+				let reset = response.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
+				let used = response.headers().get("x-ratelimit-used").and_then(|value| value.to_str().ok());
+				let retry_after = response.headers().get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
+				let parsed_remaining = parse_rate_limit_count(remaining);
+				let parsed_used = parse_rate_limit_count(used);
+				let reset_duration = parse_delay_seconds(reset);
+				let retry_after_duration = parse_delay_seconds(retry_after);
+				let quota_headers_present = remaining.is_some() || reset.is_some() || used.is_some();
 
-			if let Some(remaining) = parsed_remaining {
-				let response_is_current = update_rate_limit_remaining(&OAUTH_RATELIMIT_STATE, reservation.generation, remaining);
-				trace!(
-					"Reddit rate-limit state: remaining={remaining} estimated_before={} reset_seconds={} used={} endpoint={} current_generation={response_is_current} rollover={}",
-					reservation.previous_remaining,
-					reset_duration.map_or(0, |duration| duration.as_secs()),
-					parsed_used.map_or(0, u16::from),
-					endpoint_class(&path),
-					OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst),
-				);
-
-				if response_is_current && remaining == 0 {
-					let _ = block_for_rate_limit(reservation.generation, rate_limit_delay(None, reset));
-				}
-			}
-
-			match classify_throttle_response(status_code, retry_after.is_some(), quota_headers_present) {
-				Some(ThrottleKind::Quota) => {
-					let delay = rate_limit_delay(retry_after, reset);
-					let response_is_current = block_for_rate_limit(reservation.generation, delay);
-					warn!(
-						"Reddit quota response: status={} endpoint={} retry_after_seconds={} remaining_present={} reset_seconds={} used_present={} current_generation={response_is_current}",
-						status,
-						endpoint_class(&path),
-						retry_after_duration.map_or(0, |duration| duration.as_secs()),
-						remaining.is_some(),
+				if let Some(remaining) = parsed_remaining {
+					let response_is_current = update_rate_limit_remaining(&OAUTH_RATELIMIT_STATE, reservation.generation, remaining);
+					trace!(
+						"Reddit rate-limit state: remaining={remaining} estimated_before={} reset_seconds={} used={} endpoint={} current_generation={response_is_current} rollover={}",
+						reservation.previous_remaining,
 						reset_duration.map_or(0, |duration| duration.as_secs()),
-						used.is_some(),
+						parsed_used.map_or(0, u16::from),
+						endpoint_class(&path),
+						OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst),
 					);
-					if let Some(remaining) = parsed_remaining {
-						maybe_rotate_low_budget(reservation.generation, remaining, parsed_used, reset_duration, &path);
+
+					if response_is_current && remaining == 0 {
+						let _ = block_for_rate_limit(reservation.generation, rate_limit_delay(None, reset));
 					}
-					return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
 				}
-				Some(ThrottleKind::Edge) => {
-					let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
-					match decision {
-						decision if decision.started_cooldown => warn!(
-							"Reddit edge throttle: status={} endpoint={} retry_after_seconds={} consecutive_failures={} cooldown_seconds={} half_open_probe={}",
+
+				match classify_throttle_response(status_code, retry_after.is_some(), quota_headers_present) {
+					Some(ThrottleKind::Quota) => {
+						let delay = rate_limit_delay(retry_after, reset);
+						let response_is_current = block_for_rate_limit(reservation.generation, delay);
+						warn!(
+							"Reddit quota response: status={} endpoint={} retry_after_seconds={} remaining_present={} reset_seconds={} used_present={} current_generation={response_is_current}",
 							status,
 							endpoint_class(&path),
 							retry_after_duration.map_or(0, |duration| duration.as_secs()),
-							decision.consecutive_failures,
-							decision.delay.as_secs(),
-							upstream_attempt.edge.half_open,
-						),
-						decision => trace!(
-							"Reddit edge throttle joined existing cooldown: endpoint={} cooldown_seconds={}",
-							endpoint_class(&path),
-							decision.delay.as_secs(),
-						),
+							remaining.is_some(),
+							reset_duration.map_or(0, |duration| duration.as_secs()),
+							used.is_some(),
+						);
+						if let Some(remaining) = parsed_remaining {
+							maybe_rotate_low_budget(reservation.generation, remaining, parsed_used, reset_duration, &path);
+						}
+						return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", delay.as_secs().max(1)));
 					}
-					let delay = decision.delay;
-					return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", delay.as_secs().max(1)));
-				}
-				None => {}
-			}
-
-			if status_code == 401 {
-				if !is_current_oauth_generation(reservation.generation) {
-					return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
-				}
-				error!("Reddit rejected the OAuth token; forcing a refresh");
-				let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
-				if let Some(delay) = outcome.retry_after() {
-					return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
-				}
-				return Err("OAuth token has expired. Please refresh the page!".to_string());
-			}
-
-			if status.is_server_error() {
-				record_upstream_failure("http_status", Some(status_code), &path, reservation.generation);
-				return Err("Reddit is having issues, check if there's an outage".to_string());
-			}
-
-			// asynchronously aggregate the chunks of the body
-			match hyper::body::aggregate(response.into_hyper_response()).await {
-				Ok(body) => {
-					let has_remaining = body.has_remaining();
-
-					if !has_remaining {
-						record_upstream_failure("empty_body", Some(status.as_u16()), &path, reservation.generation);
-						return Err(format!("Reddit returned an empty response (status {status})"));
+					Some(ThrottleKind::Edge) => {
+						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
+						match decision {
+							decision if decision.started_cooldown => warn!(
+								"Reddit edge throttle: status={} endpoint={} retry_after_seconds={} consecutive_failures={} cooldown_seconds={} half_open_probe={}",
+								status,
+								endpoint_class(&path),
+								retry_after_duration.map_or(0, |duration| duration.as_secs()),
+								decision.consecutive_failures,
+								decision.delay.as_secs(),
+								upstream_attempt.edge.half_open,
+							),
+							decision => trace!(
+								"Reddit edge throttle joined existing cooldown: endpoint={} cooldown_seconds={}",
+								endpoint_class(&path),
+								decision.delay.as_secs(),
+							),
+						}
+						let delay = decision.delay;
+						return Err(format!("Reddit is temporarily rejecting this instance. Retry in {} seconds", delay.as_secs().max(1)));
 					}
+					None => {}
+				}
 
-					// Parse the response from Reddit as JSON
-					match serde_json::from_reader(body.reader()) {
-						Ok(value) => {
-							let json: Value = value;
+				if status_code == 401 {
+					if !is_current_oauth_generation(reservation.generation) {
+						return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
+					}
+					error!("Reddit rejected the OAuth token; forcing a refresh");
+					let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
+					if let Some(delay) = outcome.retry_after() {
+						return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
+					}
+					return Err("OAuth token has expired. Please refresh the page!".to_string());
+				}
 
-							// If user is suspended
-							if let Some(data) = json.get("data") {
-								if let Some(is_suspended) = data.get("is_suspended").and_then(Value::as_bool) {
-									if is_suspended {
-										return Err("suspended".into());
+				if status.is_server_error() {
+					record_upstream_failure("http_status", Some(status_code), &path, reservation.generation);
+					return Err("Reddit is having issues, check if there's an outage".to_string());
+				}
+
+				// asynchronously aggregate the chunks of the body
+				match hyper::body::aggregate(response.into_hyper_response()).await {
+					Ok(body) => {
+						let has_remaining = body.has_remaining();
+
+						if !has_remaining {
+							record_upstream_failure("empty_body", Some(status.as_u16()), &path, reservation.generation);
+							return Err(format!("Reddit returned an empty response (status {status})"));
+						}
+
+						// Parse the response from Reddit as JSON
+						match serde_json::from_reader(body.reader()) {
+							Ok(value) => {
+								let json: Value = value;
+
+								// If user is suspended
+								if let Some(data) = json.get("data") {
+									if let Some(is_suspended) = data.get("is_suspended").and_then(Value::as_bool) {
+										if is_suspended {
+											return Err("suspended".into());
+										}
 									}
+								}
+
+								// If Reddit returned an error
+								if json["error"].is_i64() {
+									// OAuth token has expired; http status 401
+									if json["message"] == "Unauthorized" {
+										if !is_current_oauth_generation(reservation.generation) {
+											return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
+										}
+										error!("Forcing a token refresh");
+										let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
+										if let Some(delay) = outcome.retry_after() {
+											return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
+										}
+										return Err("OAuth token has expired. Please refresh the page!".to_string());
+									}
+
+									// Handle quarantined
+									if json["reason"] == "quarantined" {
+										return Err("quarantined".into());
+									}
+									// Handle gated
+									if json["reason"] == "gated" {
+										return Err("gated".into());
+									}
+									// Handle private subs
+									if json["reason"] == "private" {
+										return Err("private".into());
+									}
+									// Handle banned subs
+									if json["reason"] == "banned" {
+										return Err("banned".into());
+									}
+
+									Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
+								} else if !status.is_success() {
+									Err(format!("Reddit returned an unexpected response status: {status}"))
+								} else {
+									record_upstream_success(&mut upstream_attempt);
+									if let Some(remaining) = parsed_remaining {
+										maybe_rotate_low_budget(reservation.generation, remaining, parsed_used, reset_duration, &path);
+									}
+									Ok(json)
 								}
 							}
-
-							// If Reddit returned an error
-							if json["error"].is_i64() {
-								// OAuth token has expired; http status 401
-								if json["message"] == "Unauthorized" {
-									if !is_current_oauth_generation(reservation.generation) {
-										return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
-									}
-									error!("Forcing a token refresh");
-									let outcome = force_refresh_token(RefreshReason::Unauthorized).await;
-									if let Some(delay) = outcome.retry_after() {
-										return Err(format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", delay.as_secs().max(1)));
-									}
-									return Err("OAuth token has expired. Please refresh the page!".to_string());
-								}
-
-								// Handle quarantined
-								if json["reason"] == "quarantined" {
-									return Err("quarantined".into());
-								}
-								// Handle gated
-								if json["reason"] == "gated" {
-									return Err("gated".into());
-								}
-								// Handle private subs
-								if json["reason"] == "private" {
-									return Err("private".into());
-								}
-								// Handle banned subs
-								if json["reason"] == "banned" {
-									return Err("banned".into());
-								}
-
-								Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
-							} else if !status.is_success() {
-								Err(format!("Reddit returned an unexpected response status: {status}"))
-							} else {
-								record_upstream_success(&mut upstream_attempt);
-								if let Some(remaining) = parsed_remaining {
-									maybe_rotate_low_budget(reservation.generation, remaining, parsed_used, reset_duration, &path);
-								}
-								Ok(json)
+							Err(e) => {
+								error!("Got an invalid response from reddit {e}. Status code: {status}");
+								record_upstream_failure("invalid_json", Some(status.as_u16()), &path, reservation.generation);
+								err("Failed to parse page JSON data", e.to_string(), path)
 							}
 						}
-						Err(e) => {
-							error!("Got an invalid response from reddit {e}. Status code: {status}");
-							record_upstream_failure("invalid_json", Some(status.as_u16()), &path, reservation.generation);
-							err("Failed to parse page JSON data", e.to_string(), path)
-						}
+					}
+					Err(e) => {
+						record_upstream_failure("body_transport", Some(status.as_u16()), &path, reservation.generation);
+						err("Failed receiving body from Reddit", e.to_string(), path)
 					}
 				}
-				Err(e) => {
-					record_upstream_failure("body_transport", Some(status.as_u16()), &path, reservation.generation);
-					err("Failed receiving body from Reddit", e.to_string(), path)
-				}
 			}
-		}
 			Err(e) => {
 				record_upstream_failure("request_transport", None, &path, reservation.generation);
 				err("Couldn't send request to Reddit", e, path)
@@ -1241,7 +1232,10 @@ mod tests {
 		assert!(!guard.record_failure(now));
 		assert!(!guard.record_failure(now + Duration::from_secs(1)));
 		assert!(guard.record_failure(now + Duration::from_secs(2)));
-		assert_eq!(guard.active_cooldown(now + Duration::from_secs(3)).map(|(_, reason)| reason), Some(CooldownReason::UpstreamFailures));
+		assert_eq!(
+			guard.active_cooldown(now + Duration::from_secs(3)).map(|(_, reason)| reason),
+			Some(CooldownReason::UpstreamFailures)
+		);
 		assert!(guard.active_cooldown(now + FAILURE_COOLDOWN + Duration::from_secs(3)).is_none());
 		guard.reset_failure_window();
 		assert_eq!(guard.failures_in_window, 0);
