@@ -940,51 +940,51 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, attempt: &mut UpstreamAttempt) -> Result<WreqResponse, String> {
-		let generation = oauth_client.generation;
-		let mut path = path;
-		let mut visited = HashSet::new();
+	let generation = oauth_client.generation;
+	let mut path = path;
+	let mut visited = HashSet::new();
 
-		for redirect_count in 0..=MAX_API_REDIRECTS {
-			if !visited.insert(path.clone()) {
-				return Err("Reddit returned a redirect loop".to_string());
-			}
-
-			attempt.mark_sent();
-			record_api_send(&path, redirect_count > 0);
-			let response = request_once(&Method::GET, path.clone(), quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST, oauth_client.clone()).await?;
-			if !response.status().is_redirection() {
-				return Ok(response);
-			}
-
-			if redirect_count == MAX_API_REDIRECTS {
-				return Err(format!("Reddit exceeded the {MAX_API_REDIRECTS}-redirect limit"));
-			}
-
-			let location = response
-				.headers()
-				.get(wreq::header::LOCATION)
-				.and_then(|value| value.to_str().ok())
-				.ok_or_else(|| "Reddit returned a redirect without a valid Location header".to_string())?;
-			let next_path = validated_reddit_redirect_path(location)?;
-
-			let remaining = response
-				.headers()
-				.get("x-ratelimit-remaining")
-				.and_then(|value| value.to_str().ok())
-				.and_then(|value| parse_rate_limit_count(Some(value)));
-			let reset = response
-				.headers()
-				.get("x-ratelimit-reset")
-				.and_then(|value| value.to_str().ok())
-				.and_then(|value| parse_delay_seconds(Some(value)));
-			reconcile_rate_limit(attempt, remaining, reset, false);
-			record_upstream_success(attempt);
-
-			*attempt = begin_upstream_attempt(generation)?;
-			path = next_path;
+	for redirect_count in 0..=MAX_API_REDIRECTS {
+		if !visited.insert(path.clone()) {
+			return Err("Reddit returned a redirect loop".to_string());
 		}
 
-		Err("Reddit redirect handling terminated unexpectedly".to_string())
+		attempt.mark_sent();
+		record_api_send(&path, redirect_count > 0);
+		let response = request_once(&Method::GET, path.clone(), quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST, oauth_client.clone()).await?;
+		if !response.status().is_redirection() {
+			return Ok(response);
+		}
+
+		if redirect_count == MAX_API_REDIRECTS {
+			return Err(format!("Reddit exceeded the {MAX_API_REDIRECTS}-redirect limit"));
+		}
+
+		let location = response
+			.headers()
+			.get(wreq::header::LOCATION)
+			.and_then(|value| value.to_str().ok())
+			.ok_or_else(|| "Reddit returned a redirect without a valid Location header".to_string())?;
+		let next_path = validated_reddit_redirect_path(location)?;
+
+		let remaining = response
+			.headers()
+			.get("x-ratelimit-remaining")
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| parse_rate_limit_count(Some(value)));
+		let reset = response
+			.headers()
+			.get("x-ratelimit-reset")
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| parse_delay_seconds(Some(value)));
+		reconcile_rate_limit(attempt, remaining, reset, false);
+		record_upstream_success(attempt);
+
+		*attempt = begin_upstream_attempt(generation)?;
+		path = next_path;
+	}
+
+	Err("Reddit redirect handling terminated unexpectedly".to_string())
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
