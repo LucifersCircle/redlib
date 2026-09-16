@@ -862,7 +862,6 @@ mod tests {
 		assert!(!stable_is_fresh);
 		assert!(stable_fallback_is_fresh);
 		assert_eq!(stable_device_id, original_device_id);
-
 	}
 
 	#[test]
