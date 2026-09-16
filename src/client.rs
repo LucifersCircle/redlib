@@ -149,14 +149,8 @@ impl Drop for UpstreamAttempt {
 
 #[derive(Debug, Clone, Copy)]
 enum QuotaWindow {
-	Unknown {
-		not_before: Instant,
-		probe_in_flight: bool,
-	},
-	Known {
-		available: u16,
-		reset_at: Instant,
-	},
+	Unknown { not_before: Instant, probe_in_flight: bool },
+	Known { available: u16, reset_at: Instant },
 }
 
 #[derive(Debug)]
@@ -202,10 +196,7 @@ impl QuotaGovernor {
 		}
 
 		let discovery_probe = match &mut self.window {
-			QuotaWindow::Unknown {
-				not_before,
-				probe_in_flight,
-			} => {
+			QuotaWindow::Unknown { not_before, probe_in_flight } => {
 				if *probe_in_flight {
 					return Err(QUOTA_UNKNOWN_RETRY);
 				}
@@ -323,10 +314,7 @@ impl UpstreamGuard {
 			return Err((delay, CooldownReason::EdgeThrottle));
 		}
 
-		let (quota_epoch, request_id, discovery_probe) = self
-			.quota
-			.reserve(now, generation)
-			.map_err(|delay| (delay, CooldownReason::RateLimit))?;
+		let (quota_epoch, request_id, discovery_probe) = self.quota.reserve(now, generation).map_err(|delay| (delay, CooldownReason::RateLimit))?;
 		let edge = match self.begin_attempt(now) {
 			Ok(edge) => edge,
 			Err(error) => {
@@ -359,14 +347,7 @@ impl UpstreamGuard {
 		})
 	}
 
-	fn reconcile_quota(
-		&mut self,
-		now: Instant,
-		attempt: &mut UpstreamAttempt,
-		remaining: Option<u16>,
-		reset: Option<Duration>,
-		quota_exhausted: bool,
-	) {
+	fn reconcile_quota(&mut self, now: Instant, attempt: &mut UpstreamAttempt, remaining: Option<u16>, reset: Option<Duration>, quota_exhausted: bool) {
 		if attempt.quota_reconciled {
 			return;
 		}
@@ -556,9 +537,9 @@ fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration 
 		(Some(delay), None) | (None, Some(delay)) => Some(delay),
 		(None, None) => None,
 	}
-		.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
-		.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
-		.min(MAX_RATE_LIMIT_COOLDOWN)
+	.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
+	.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
+	.min(MAX_RATE_LIMIT_COOLDOWN)
 }
 
 fn edge_throttle_delay(consecutive_failures: u8, retry_after: Option<Duration>) -> Duration {
@@ -958,8 +939,7 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
-fn reddit_get<'a>(path: String, quarantine: bool, oauth_client: Arc<Oauth>, attempt: &'a mut UpstreamAttempt) -> Boxed<'a, Result<WreqResponse, String>> {
-	async move {
+async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, attempt: &mut UpstreamAttempt) -> Result<WreqResponse, String> {
 		let generation = oauth_client.generation;
 		let mut path = path;
 		let mut visited = HashSet::new();
@@ -1005,8 +985,6 @@ fn reddit_get<'a>(path: String, quarantine: bool, oauth_client: Arc<Oauth>, atte
 		}
 
 		Err("Reddit redirect handling terminated unexpectedly".to_string())
-	}
-	.boxed()
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
@@ -1027,12 +1005,7 @@ fn validated_reddit_redirect_path(location: &str) -> Result<String, String> {
 		location.to_string()
 	} else {
 		let url = url::Url::parse(location).map_err(|_| "Reddit returned an invalid redirect URL".to_string())?;
-		if url.scheme() != "https"
-			|| !matches!(
-				url.host_str(),
-				Some(REDDIT_URL_BASE_HOST | ALTERNATIVE_REDDIT_URL_BASE_HOST | REDDIT_SHORT_URL_BASE_HOST)
-			)
-		{
+		if url.scheme() != "https" || !matches!(url.host_str(), Some(REDDIT_URL_BASE_HOST | ALTERNATIVE_REDDIT_URL_BASE_HOST | REDDIT_SHORT_URL_BASE_HOST)) {
 			return Err("Reddit returned an off-origin redirect".to_string());
 		}
 		let mut path = url.path().to_string();
@@ -1538,10 +1511,7 @@ mod tests {
 			},
 		};
 		let attempt = |request_id| UpstreamAttempt {
-			edge: EdgeAttempt {
-				epoch: 0,
-				half_open: false,
-			},
+			edge: EdgeAttempt { epoch: 0, half_open: false },
 			quota_epoch: 4,
 			request_id,
 			discovery_probe: false,
