@@ -324,6 +324,14 @@ impl QuotaGovernor {
 		}
 	}
 
+	fn owns_discovery(&self, attempt: &UpstreamAttempt) -> bool {
+		attempt.generation == self.generation
+			&& attempt.quota_epoch == self.epoch
+			&& attempt.discovery_probe
+			&& !attempt.quota_reconciled
+			&& matches!(self.window, QuotaWindow::Unknown { probe_in_flight: true, .. })
+	}
+
 	fn abandon(&mut self, now: Instant, attempt: &UpstreamAttempt) {
 		if attempt.quota_reconciled || attempt.quota_epoch != self.epoch {
 			return;
@@ -450,8 +458,8 @@ impl UpstreamGuard {
 		match self.edge_state {
 			EdgeCircuitState::Closed if attempt.epoch == self.edge_epoch => {}
 			EdgeCircuitState::HalfOpen { epoch, .. } if attempt.half_open && attempt.epoch == epoch => {}
-			EdgeCircuitState::Open { until } => consider(Some(until), CooldownReason::EdgeThrottle),
-			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at), CooldownReason::EdgeThrottle),
+			EdgeCircuitState::Open { until } => consider(Some(until.max(now + Duration::from_secs(1))), CooldownReason::EdgeThrottle),
+			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at.max(now + Duration::from_secs(1))), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::Closed => consider(Some(now + Duration::from_secs(1)), CooldownReason::EdgeThrottle),
 		}
 		active
@@ -848,13 +856,16 @@ fn confirm_headerless_quota(attempt: &UpstreamAttempt) {
 	upstream_guard().quota.confirm_headerless_success(attempt);
 }
 
-fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64) -> Result<(), ApiRequestError> {
+fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, continue_discovery: bool) -> Result<(), ApiRequestError> {
 	let now = Instant::now();
 	let mut guard = upstream_guard();
 	if let Some((delay, reason)) = guard.redirect_cooldown(now, attempt.edge) {
 		drop(guard);
 		record_local_denial(reason);
 		return Err(ApiRequestError::Deferred(format!("{}. Retry in {} seconds", reason.message(), delay.as_secs().max(1))));
+	}
+	if continue_discovery && guard.quota.owns_discovery(attempt) {
+		return Ok(());
 	}
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
@@ -1122,8 +1133,11 @@ async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, at
 			.get("x-ratelimit-reset")
 			.and_then(|value| value.to_str().ok())
 			.and_then(|value| parse_delay_seconds(Some(value)));
-		reconcile_rate_limit(attempt, remaining, reset, false);
-		reserve_redirect_hop(attempt, generation)?;
+		let continue_discovery = remaining.is_none() && reset.is_none() && attempt.discovery_probe;
+		if !continue_discovery {
+			reconcile_rate_limit(attempt, remaining, reset, false);
+		}
+		reserve_redirect_hop(attempt, generation, continue_discovery)?;
 		path = next_path;
 	}
 
@@ -1806,6 +1820,40 @@ mod tests {
 	}
 
 	#[test]
+	fn test_headerless_redirect_keeps_discovery_until_final_success() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 3,
+			epoch: 7,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			window: QuotaWindow::Unknown {
+				not_before: now,
+				probe_in_flight: false,
+			},
+		};
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 3).unwrap();
+		let mut attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 3,
+			quota_epoch,
+			request_id,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: false,
+			completed: false,
+		};
+		assert!(quota.owns_discovery(&attempt));
+		assert_eq!(quota.outstanding, 1);
+		quota.reconcile(now, &attempt, None, None, false);
+		attempt.quota_reconciled = true;
+		quota.confirm_headerless_success(&attempt);
+		assert!(matches!(quota.window, QuotaWindow::Unreported));
+		attempt.completed = true;
+	}
+
+	#[test]
 	fn test_response_after_reset_establishes_new_quota_window() {
 		let now = Instant::now();
 		let old_reset = now - RATE_LIMIT_COOLDOWN_MARGIN;
@@ -1890,9 +1938,24 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
 		let redirecting = guard.begin_attempt(now).unwrap();
+		let second_redirecting = guard.begin_attempt(now).unwrap();
 		let denied = guard.begin_attempt(now).unwrap();
 		guard.record_edge_throttle(now, denied, None);
 		assert_eq!(guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
+		assert_eq!(
+			guard.redirect_cooldown(now + Duration::from_secs(6), redirecting).map(|(_, reason)| reason),
+			Some(CooldownReason::EdgeThrottle)
+		);
+		assert_eq!(
+			guard.redirect_cooldown(now + Duration::from_secs(6), second_redirecting).map(|(_, reason)| reason),
+			Some(CooldownReason::EdgeThrottle)
+		);
+		let recovery_probe = guard.begin_attempt(now + Duration::from_secs(6)).unwrap();
+		assert!(recovery_probe.half_open);
+		assert_eq!(
+			guard.redirect_cooldown(now + Duration::from_secs(6), redirecting).map(|(_, reason)| reason),
+			Some(CooldownReason::EdgeThrottle)
+		);
 
 		guard.edge_state = EdgeCircuitState::Closed;
 		guard.edge_epoch = redirecting.epoch;
