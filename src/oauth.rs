@@ -1,11 +1,11 @@
 use crate::{
-	client::{current_rate_limit_remaining, install_oauth_generation, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
+	client::{install_oauth_generation, record_oauth_send, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, trace, warn};
 use serde_json::json;
-use std::{collections::HashMap, fmt, sync::atomic::Ordering, sync::LazyLock, sync::Mutex, time::Duration, time::Instant};
+use std::{collections::HashMap, fmt, sync::atomic::Ordering, sync::LazyLock, sync::Mutex, time::Duration, time::Instant, time::SystemTime};
 use tegen::tegen::TextGenerator;
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -19,19 +19,13 @@ const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
 const TOKEN_REFRESH_EARLY_BY: u64 = 120;
-const DEFAULT_LOW_BUDGET_ROTATION_DELAY: Duration = Duration::from_secs(60);
-const LOW_BUDGET_ROTATION_MARGIN: Duration = Duration::from_secs(2);
-const MAX_LOW_BUDGET_ROTATION_DELAY: Duration = Duration::from_secs(600);
-
 static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
 static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
-static LOW_BUDGET_ROTATION_SUPPRESSION: LazyLock<Mutex<LowBudgetRotationSuppression>> = LazyLock::new(|| Mutex::new(LowBudgetRotationSuppression::default()));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RefreshReason {
 	Scheduled,
 	Unauthorized,
-	LowRateLimit,
 }
 
 impl RefreshReason {
@@ -39,7 +33,6 @@ impl RefreshReason {
 		match self {
 			Self::Scheduled => "scheduled",
 			Self::Unauthorized => "unauthorized",
-			Self::LowRateLimit => "low_rate_limit",
 		}
 	}
 }
@@ -168,8 +161,6 @@ impl Oauth {
 
 	fn refresh_backend(&self, reason: RefreshReason, fallback: bool) -> (OauthBackendImpl, bool) {
 		match (reason, fallback) {
-			(RefreshReason::LowRateLimit, false) => (OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new()), true),
-			(RefreshReason::LowRateLimit, true) => (OauthBackendImpl::GenericWeb(GenericWebAuth::new()), true),
 			(RefreshReason::Scheduled | RefreshReason::Unauthorized, false) => (self.backend.clone(), false),
 			(RefreshReason::Scheduled | RefreshReason::Unauthorized, true) => (self.backend.alternate(), true),
 		}
@@ -283,25 +274,6 @@ struct RefreshBackoff {
 	retry_not_before: Option<Instant>,
 }
 
-#[derive(Debug, Default)]
-struct LowBudgetRotationSuppression {
-	not_before: Option<Instant>,
-}
-
-impl LowBudgetRotationSuppression {
-	fn remaining(&self, now: Instant) -> Option<Duration> {
-		self.not_before.and_then(|deadline| deadline.checked_duration_since(now))
-	}
-
-	fn suppress_for(&mut self, now: Instant, duration: Duration) {
-		self.not_before = Some(now + duration);
-	}
-
-	fn clear(&mut self) {
-		self.not_before = None;
-	}
-}
-
 impl RefreshBackoff {
 	fn retry_remaining(&self, now: Instant) -> Option<Duration> {
 		self.retry_not_before.and_then(|deadline| deadline.checked_duration_since(now))
@@ -341,12 +313,16 @@ fn max_duration(first: Option<Duration>, second: Option<Duration>) -> Option<Dur
 }
 
 fn response_retry_after(headers: &wreq::header::HeaderMap) -> Option<Duration> {
-	headers
-		.get(wreq::header::RETRY_AFTER)
-		.and_then(|value| value.to_str().ok())
-		.and_then(|value| value.parse::<f64>().ok())
-		.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-		.map(Duration::from_secs_f64)
+	let value = headers.get(wreq::header::RETRY_AFTER)?.to_str().ok()?;
+	if let Ok(seconds) = value.parse::<f64>() {
+		if seconds.is_finite() && seconds >= 0.0 {
+			return Some(Duration::from_secs_f64(seconds.min(MAX_SERVER_RETRY_DELAY.as_secs_f64())));
+		}
+	}
+	httpdate::parse_http_date(value)
+		.ok()
+		.and_then(|deadline| deadline.duration_since(SystemTime::now()).ok())
+		.map(|delay| delay.min(MAX_SERVER_RETRY_DELAY))
 }
 
 fn token_refresh_delay(expires_in: u64) -> Duration {
@@ -355,31 +331,6 @@ fn token_refresh_delay(expires_in: u64) -> Duration {
 
 fn refresh_backoff_remaining() -> Option<Duration> {
 	refresh_backoff().retry_remaining(Instant::now())
-}
-
-fn low_budget_rotation_delay(reset_after: Option<Duration>) -> Duration {
-	reset_after
-		.unwrap_or(DEFAULT_LOW_BUDGET_ROTATION_DELAY)
-		.saturating_add(LOW_BUDGET_ROTATION_MARGIN)
-		.min(MAX_LOW_BUDGET_ROTATION_DELAY)
-}
-
-fn low_budget_rotation_remaining() -> Option<Duration> {
-	LOW_BUDGET_ROTATION_SUPPRESSION
-		.lock()
-		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.remaining(Instant::now())
-}
-
-fn suppress_low_budget_rotation_for(duration: Duration) {
-	LOW_BUDGET_ROTATION_SUPPRESSION
-		.lock()
-		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.suppress_for(Instant::now(), duration);
-}
-
-fn clear_low_budget_rotation_suppression() {
-	LOW_BUDGET_ROTATION_SUPPRESSION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -435,30 +386,6 @@ pub async fn token_daemon() {
 	}
 }
 
-pub(crate) fn spawn_rate_limit_refresh(reset_after: Option<Duration>) -> bool {
-	if refresh_backoff_remaining().is_some() || low_budget_rotation_remaining().is_some() {
-		return false;
-	}
-
-	let Some(rollover_guard) = RolloverGuard::acquire() else {
-		return false;
-	};
-
-	// Claim both the refresh guard and the rate-window suppression before the
-	// task is spawned. Concurrent low-budget responses therefore queue exactly
-	// one identity rotation and emit exactly one warning.
-	if refresh_backoff_remaining().is_some() || low_budget_rotation_remaining().is_some() {
-		drop(rollover_guard);
-		return false;
-	}
-	suppress_low_budget_rotation_for(low_budget_rotation_delay(reset_after));
-
-	tokio::spawn(async move {
-		let _ = refresh_token_with_guard(RefreshReason::LowRateLimit, rollover_guard).await;
-	});
-	true
-}
-
 pub(crate) async fn force_refresh_token(reason: RefreshReason) -> RefreshOutcome {
 	if let Some(delay) = refresh_backoff_remaining() {
 		trace!("Skipping {} OAuth refresh during backoff ({delay:?} remaining)", reason.label());
@@ -480,7 +407,7 @@ pub(crate) async fn force_refresh_token(reason: RefreshReason) -> RefreshOutcome
 }
 
 async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: RolloverGuard) -> RefreshOutcome {
-	trace!("Refreshing OAuth token: reason={} current_rate_limit={}", reason.label(), current_rate_limit_remaining());
+	trace!("Refreshing OAuth token: reason={}", reason.label());
 	let current_client = OAUTH_CLIENT.load_full();
 	match current_client.refreshed(reason).await {
 		Ok(mut refreshed) => {
@@ -488,12 +415,6 @@ async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: Rollov
 			let generation = refreshed.oauth.generation;
 			OAUTH_CLIENT.swap(refreshed.oauth.into());
 			install_oauth_generation(generation, refreshed.fresh_identity);
-			if refreshed.fresh_identity {
-				// The suppression deadline belongs to the previous identity's
-				// rate-limit window. A successfully installed fresh identity has
-				// its own budget and must not inherit that stale deadline.
-				clear_low_budget_rotation_suppression();
-			}
 			refresh_backoff().record_success();
 			TOKEN_REFRESH_NOTIFY.notify_waiters();
 			info!(
@@ -505,9 +426,7 @@ async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: Rollov
 		}
 		Err(error) => {
 			let delay = refresh_backoff().record_failure(Instant::now(), error.retry_after());
-			if reason != RefreshReason::LowRateLimit {
-				TOKEN_REFRESH_NOTIFY.notify_waiters();
-			}
+			TOKEN_REFRESH_NOTIFY.notify_waiters();
 			error!(
 				"OAuth token refresh failed: reason={}; retaining the current client and retrying in {delay:?}: {error}",
 				reason.label()
@@ -545,6 +464,7 @@ impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
+		record_oauth_send();
 		let mut builder = CLIENT.post(&url);
 
 		// Add headers from spoofed client
@@ -575,7 +495,6 @@ impl OauthBackend for MobileSpoofAuth {
 
 		let status = resp.status();
 		trace!("Received response with status {} and length {:?}", status, resp.headers().get("content-length"));
-		trace!("OAuth headers: {:#?}", resp.headers());
 		if !status.is_success() {
 			return Err(AuthError::HttpStatus {
 				status: status.as_u16(),
@@ -676,6 +595,7 @@ impl OauthBackend for GenericWebAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let url = "https://www.reddit.com/api/v1/access_token";
+		record_oauth_send();
 		let mut builder = CLIENT.post(url);
 
 		// Add minimal headers
@@ -704,7 +624,6 @@ impl OauthBackend for GenericWebAuth {
 
 		let status = resp.status();
 		trace!("Received response with status {} and length {:?}", status, resp.headers().get("content-length"));
-		trace!("GenericWebAuth headers: {:#?}", resp.headers());
 		if !status.is_success() {
 			return Err(AuthError::HttpStatus {
 				status: status.as_u16(),
@@ -921,23 +840,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_low_budget_rotation_delay_uses_reset_and_bounds() {
-		assert_eq!(low_budget_rotation_delay(Some(Duration::from_secs(30))), Duration::from_secs(32));
-		assert_eq!(low_budget_rotation_delay(None), Duration::from_secs(62));
-		assert_eq!(low_budget_rotation_delay(Some(Duration::from_secs(9999))), MAX_LOW_BUDGET_ROTATION_DELAY);
-	}
-
-	#[test]
-	fn test_low_budget_rotation_suppression_clears_after_fresh_identity() {
-		let now = Instant::now();
-		let mut suppression = LowBudgetRotationSuppression::default();
-		suppression.suppress_for(now, Duration::from_secs(30));
-		assert_eq!(suppression.remaining(now + Duration::from_secs(5)), Some(Duration::from_secs(25)));
-		suppression.clear();
-		assert_eq!(suppression.remaining(now), None);
-	}
-
-	#[test]
 	fn test_refresh_reason_selects_stable_or_fresh_identity() {
 		let original_backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
 		let original_device_id = match &original_backend {
@@ -961,15 +863,6 @@ mod tests {
 		assert!(stable_fallback_is_fresh);
 		assert_eq!(stable_device_id, original_device_id);
 
-		let (rotated, rotated_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit, false);
-		let (_, rotated_fallback_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit, true);
-		let rotated_device_id = match rotated {
-			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
-			OauthBackendImpl::GenericWeb(_) => unreachable!(),
-		};
-		assert!(rotated_is_fresh);
-		assert!(rotated_fallback_is_fresh);
-		assert_ne!(rotated_device_id, original_device_id);
 	}
 
 	#[test]
