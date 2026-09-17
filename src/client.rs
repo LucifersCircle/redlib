@@ -1,5 +1,5 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
+use crate::oauth::{force_refresh_token, spawn_rate_limit_refresh, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::{format_url, Post};
@@ -50,6 +50,7 @@ const FAILURE_THRESHOLD: u8 = 3;
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
+const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
 const QUOTA_SAFETY_RESERVE: u16 = 5;
 const QUOTA_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
@@ -190,10 +191,19 @@ impl Default for QuotaGovernor {
 }
 
 impl QuotaGovernor {
-	fn install_generation(&mut self, generation: u64) {
-		// OAuth tokens and backend fallbacks do not establish a new Reddit quota
-		// window. Preserve the known allowance and cooldown across refreshes.
+	fn install_generation(&mut self, generation: u64, fresh_identity: bool) {
 		self.generation = generation;
+		if fresh_identity {
+			// A newly generated anonymous device has its own quota window. Advance
+			// the epoch so late responses from the previous identity cannot alter it.
+			self.epoch = self.epoch.wrapping_add(1);
+			self.outstanding = 0;
+			self.rollover_reserve = 0;
+			self.window = QuotaWindow::Unknown {
+				not_before: Instant::now(),
+				probe_in_flight: false,
+			};
+		}
 	}
 
 	fn reserve(&mut self, now: Instant, generation: u64) -> Result<(u64, u64, bool), QuotaReserveError> {
@@ -242,9 +252,9 @@ impl QuotaGovernor {
 		Ok((self.epoch, self.next_request_id, discovery_probe))
 	}
 
-	fn reconcile(&mut self, now: Instant, attempt: &UpstreamAttempt, remaining: Option<u16>, reset: Option<Duration>, quota_exhausted: bool) {
+	fn reconcile(&mut self, now: Instant, attempt: &UpstreamAttempt, remaining: Option<u16>, reset: Option<Duration>, quota_exhausted: bool) -> bool {
 		if attempt.quota_epoch != self.epoch {
-			return;
+			return false;
 		}
 		self.outstanding = self.outstanding.saturating_sub(1);
 		if attempt.generation != self.generation {
@@ -254,7 +264,7 @@ impl QuotaGovernor {
 					probe_in_flight: false,
 				};
 			}
-			return;
+			return false;
 		}
 
 		let reset_at = reset.map(|delay| now + delay.min(MAX_RATE_LIMIT_COOLDOWN));
@@ -263,7 +273,7 @@ impl QuotaGovernor {
 				available: 0,
 				reset_at: reset_at.unwrap_or(now + DEFAULT_RATE_LIMIT_COOLDOWN),
 			};
-			return;
+			return true;
 		}
 
 		if let (QuotaWindow::Known { reset_at: known_reset, .. }, Some(remaining), Some(observed_reset)) = (&self.window, remaining, reset_at) {
@@ -276,7 +286,7 @@ impl QuotaGovernor {
 					available: remaining.saturating_sub(unresolved),
 					reset_at: observed_reset,
 				};
-				return;
+				return true;
 			}
 		}
 
@@ -316,6 +326,7 @@ impl QuotaGovernor {
 				}
 			}
 		}
+		true
 	}
 
 	fn confirm_headerless_success(&mut self, attempt: &UpstreamAttempt) {
@@ -357,6 +368,7 @@ impl QuotaGovernor {
 #[derive(Debug, Default)]
 struct UpstreamGuard {
 	quota: QuotaGovernor,
+	quota_rotation_armed: bool,
 	failure_window_started: Option<Instant>,
 	failures_in_window: u8,
 	upstream_failure_blocked_until: Option<Instant>,
@@ -367,6 +379,24 @@ struct UpstreamGuard {
 }
 
 impl UpstreamGuard {
+	fn install_oauth_generation(&mut self, generation: u64, fresh_identity: bool) {
+		self.quota.install_generation(generation, fresh_identity);
+		if fresh_identity {
+			self.quota_rotation_armed = false;
+			self.rate_limit_blocked_until = None;
+		}
+	}
+
+	fn quota_rotation_candidate(&self, now: Instant, generation: u64) -> Option<u64> {
+		if !self.quota_rotation_armed || generation != self.quota.generation {
+			return None;
+		}
+		if self.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now) || !matches!(self.edge_state, EdgeCircuitState::Closed) {
+			return None;
+		}
+		matches!(self.quota.window, QuotaWindow::Known { available, .. } if available < LOW_RATE_LIMIT_THRESHOLD).then_some(self.quota.epoch)
+	}
+
 	fn try_admit(&mut self, now: Instant, generation: u64) -> Result<UpstreamAttempt, (Duration, CooldownReason)> {
 		if let Some(active) = self.active_cooldown(now) {
 			return Err(active);
@@ -414,7 +444,10 @@ impl UpstreamGuard {
 		if attempt.quota_reconciled {
 			return;
 		}
-		self.quota.reconcile(now, attempt, remaining, reset, quota_exhausted);
+		let applied = self.quota.reconcile(now, attempt, remaining, reset, quota_exhausted);
+		if applied && !quota_exhausted && remaining.is_some_and(|remaining| remaining >= LOW_RATE_LIMIT_THRESHOLD) {
+			self.quota_rotation_armed = true;
+		}
 		attempt.quota_reconciled = true;
 	}
 
@@ -683,8 +716,40 @@ fn is_current_oauth_generation(generation: u64) -> bool {
 	OAUTH_CLIENT.load().generation == generation
 }
 
-pub(crate) fn install_oauth_generation(generation: u64, _fresh_identity: bool) {
-	upstream_guard().quota.install_generation(generation);
+pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_quota: Option<(u64, u64)>) -> bool {
+	let generation = oauth.generation;
+	let mut guard = upstream_guard();
+	if let Some((expected_generation, expected_quota_epoch)) = expected_quota {
+		if OAUTH_CLIENT.load().generation != expected_generation
+			|| guard.quota_rotation_candidate(Instant::now(), expected_generation) != Some(expected_quota_epoch)
+		{
+			return false;
+		}
+	}
+	OAUTH_CLIENT.swap(oauth.into());
+	guard.install_oauth_generation(generation, fresh_identity);
+	true
+}
+
+pub(crate) fn quota_rotation_still_needed(generation: u64, quota_epoch: u64) -> bool {
+	upstream_guard().quota_rotation_candidate(Instant::now(), generation) == Some(quota_epoch)
+}
+
+fn maybe_rotate_low_budget(generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str) {
+	let Some(quota_epoch) = upstream_guard().quota_rotation_candidate(Instant::now(), generation) else {
+		return;
+	};
+	if !is_current_oauth_generation(generation) || !spawn_rate_limit_refresh(generation, quota_epoch) {
+		return;
+	}
+
+	warn!(
+		"Reddit request budget is low: remaining={} used={} reset_seconds={} endpoint={}; rotating to a fresh anonymous OAuth identity",
+		remaining.map_or(0, u16::from),
+		used.map_or(0, u16::from),
+		reset.map_or(0, |duration| duration.as_secs()),
+		endpoint_class(path),
+	);
 }
 
 fn endpoint_class_index(path: &str) -> usize {
@@ -859,8 +924,19 @@ fn cooldown_error() -> Option<String> {
 	})
 }
 
-fn begin_upstream_attempt(generation: u64) -> Result<UpstreamAttempt, String> {
-	upstream_guard().try_admit(Instant::now(), generation).map_err(|(remaining, reason)| {
+fn begin_upstream_attempt() -> Result<(Arc<Oauth>, UpstreamAttempt), String> {
+	let mut guard = upstream_guard();
+	let oauth_client = OAUTH_CLIENT.load_full();
+	let generation = oauth_client.generation;
+	let result = guard.try_admit(Instant::now(), generation);
+	let rotation_candidate = result.is_err().then(|| guard.quota_rotation_candidate(Instant::now(), generation)).flatten();
+	drop(guard);
+	result.map(|attempt| (oauth_client, attempt)).map_err(|(remaining, reason)| {
+		if let Some(quota_epoch) = rotation_candidate.filter(|_| is_current_oauth_generation(generation)) {
+			if spawn_rate_limit_refresh(generation, quota_epoch) {
+				warn!("Local Reddit quota reserve reached; rotating to a fresh anonymous OAuth identity");
+			}
+		}
 		record_local_denial(reason);
 		format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(remaining))
 	})
@@ -898,11 +974,17 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, continue
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
 		Err(error) => {
+			let rotation_candidate = guard.quota_rotation_candidate(now, generation);
 			let delay = match error {
 				QuotaReserveError::Deferred(delay) => delay,
 				QuotaReserveError::StaleGeneration => Duration::from_secs(1),
 			};
 			drop(guard);
+			if let Some(quota_epoch) = rotation_candidate.filter(|_| is_current_oauth_generation(generation)) {
+				if spawn_rate_limit_refresh(generation, quota_epoch) {
+					warn!("Local Reddit quota reserve reached during redirect; rotating to a fresh anonymous OAuth identity");
+				}
+			}
 			record_local_denial(CooldownReason::RateLimit);
 			return Err(ApiRequestError::Deferred(format!(
 				"{}. Retry in {} seconds",
@@ -1392,11 +1474,10 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
-	let oauth_client = OAUTH_CLIENT.load_full();
+	let (oauth_client, mut upstream_attempt) = begin_upstream_attempt()?;
 	let request_generation = oauth_client.generation;
-	// A cooldown may have started while this request was waiting for a permit.
-	// Admission atomically owns any quota reservation and edge half-open probe.
-	let mut upstream_attempt = begin_upstream_attempt(request_generation)?;
+	// Admission atomically selects the OAuth client and owns its quota
+	// reservation and edge half-open probe.
 	record_admitted_json(&path);
 	let timeout_path = path.clone();
 
@@ -1424,6 +1505,9 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 					reset_duration,
 					matches!(throttle_kind, Some(ThrottleKind::Quota)) || parsed_remaining == Some(0),
 				);
+				if !matches!(throttle_kind, Some(ThrottleKind::Edge)) {
+					maybe_rotate_low_budget(request_generation, parsed_remaining, parsed_used, reset_duration, &path);
+				}
 				trace!(
 					"Reddit rate-limit observation: remaining={} reset_seconds={} used={} endpoint={} current_generation={} request_id={} discovery_probe={} rollover={}",
 					parsed_remaining.map_or(0, u16::from),
@@ -1757,6 +1841,84 @@ mod tests {
 	}
 
 	#[test]
+	fn test_quota_rotation_requires_known_exhausted_current_generation() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard {
+			quota: QuotaGovernor {
+				generation: 7,
+				epoch: 1,
+				next_request_id: 0,
+				outstanding: 0,
+				rollover_reserve: 0,
+				window: QuotaWindow::Known {
+					available: LOW_RATE_LIMIT_THRESHOLD - 1,
+					reset_at: now + Duration::from_secs(60),
+				},
+			},
+			quota_rotation_armed: true,
+			..UpstreamGuard::default()
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7), Some(1));
+		assert_eq!(guard.quota_rotation_candidate(now, 6), None);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: LOW_RATE_LIMIT_THRESHOLD,
+			reset_at: now + Duration::from_secs(60),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+
+		guard.quota.window = QuotaWindow::Unknown {
+			not_before: now,
+			probe_in_flight: true,
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		guard.quota.window = QuotaWindow::Unreported;
+		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: LOW_RATE_LIMIT_THRESHOLD - 1,
+			reset_at: now + Duration::from_secs(60),
+		};
+		guard.edge_state = EdgeCircuitState::Open {
+			until: now + Duration::from_secs(10),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		guard.edge_state = EdgeCircuitState::Closed;
+		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
+		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+	}
+
+	#[test]
+	fn test_fresh_low_discovery_does_not_rearm_rotation() {
+		let mut guard = UpstreamGuard::default();
+		guard.install_oauth_generation(1, true);
+		let now = Instant::now();
+		let mut attempt = guard.try_admit(now + Duration::from_millis(1), 1).unwrap();
+		guard.reconcile_quota(now + Duration::from_millis(2), &mut attempt, Some(9), Some(Duration::from_secs(120)), false);
+		assert!(!guard.quota_rotation_armed);
+		assert_eq!(guard.quota_rotation_candidate(now + Duration::from_millis(3), 1), None);
+	}
+
+	#[test]
+	fn test_healthy_discovery_arms_quota_rotation() {
+		let mut guard = UpstreamGuard::default();
+		guard.install_oauth_generation(1, true);
+		let now = Instant::now();
+		let mut attempt = guard.try_admit(now + Duration::from_millis(1), 1).unwrap();
+		guard.reconcile_quota(now + Duration::from_millis(2), &mut attempt, Some(99), Some(Duration::from_secs(120)), false);
+		assert!(guard.quota_rotation_armed);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: LOW_RATE_LIMIT_THRESHOLD - 1,
+			reset_at: now + Duration::from_secs(120),
+		};
+		let candidate = guard.quota_rotation_candidate(now + Duration::from_millis(3), 1);
+		assert_eq!(candidate, Some(guard.quota.epoch));
+		guard.quota.epoch = guard.quota.epoch.wrapping_add(1);
+		assert_ne!(candidate, guard.quota_rotation_candidate(now + Duration::from_millis(4), 1));
+	}
+
+	#[test]
 	fn test_out_of_order_quota_responses_cannot_replenish_budget() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
@@ -1799,9 +1961,63 @@ mod tests {
 				reset_at: now + Duration::from_secs(90),
 			},
 		};
-		quota.install_generation(5);
+		quota.install_generation(5, false);
 		assert_eq!(quota.generation, 5);
 		assert!(matches!(quota.window, QuotaWindow::Known { available: 7, .. }));
+	}
+
+	#[test]
+	fn test_fresh_identity_starts_unknown_quota_window_and_ignores_late_responses() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 4,
+			epoch: 2,
+			next_request_id: 8,
+			outstanding: 2,
+			rollover_reserve: 1,
+			window: QuotaWindow::Known {
+				available: 5,
+				reset_at: now + Duration::from_secs(90),
+			},
+		};
+		let stale_attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 4,
+			quota_epoch: 2,
+			request_id: 8,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		let mut stale_unsent_attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 4,
+			quota_epoch: 2,
+			request_id: 9,
+			discovery_probe: false,
+			sent: false,
+			quota_reconciled: false,
+			completed: false,
+		};
+
+		quota.install_generation(5, true);
+		let fresh_now = Instant::now();
+		assert_eq!(quota.generation, 5);
+		assert_eq!(quota.epoch, 3);
+		assert_eq!(quota.outstanding, 0);
+		assert_eq!(quota.rollover_reserve, 0);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
+
+		quota.reconcile(now, &stale_attempt, Some(99), Some(Duration::from_secs(300)), false);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
+		assert!(quota.reserve(fresh_now + Duration::from_secs(1), 5).is_ok());
+		quota.abandon(fresh_now + Duration::from_secs(1), &stale_unsent_attempt);
+		stale_unsent_attempt.quota_reconciled = true;
+		stale_unsent_attempt.completed = true;
+		assert_eq!(quota.outstanding, 1);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+		assert!(quota.reserve(fresh_now + Duration::from_secs(1), 5).is_err());
 	}
 
 	#[test]
@@ -1885,7 +2101,7 @@ mod tests {
 			},
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 1).unwrap();
-		quota.install_generation(2);
+		quota.install_generation(2, false);
 		let stale_attempt = UpstreamAttempt {
 			edge: EdgeAttempt { epoch: 0, half_open: false },
 			generation: 1,
@@ -2080,9 +2296,28 @@ mod tests {
 		let attempt = guard.begin_attempt(now).unwrap();
 		guard.record_edge_throttle(now, attempt, None);
 		guard.block_for_rate_limit(now, Duration::from_secs(20));
-		guard.quota.install_generation(2);
+		guard.install_oauth_generation(2, false);
 		assert_eq!(guard.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::RateLimit));
 		assert_eq!(guard.edge_throttle_failures, 1);
+		assert_eq!(guard.quota.generation, 2);
+	}
+
+	#[test]
+	fn test_fresh_identity_clears_only_quota_cooldown() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let attempt = guard.begin_attempt(now).unwrap();
+		guard.record_edge_throttle(now, attempt, None);
+		guard.block_for_rate_limit(now, Duration::from_secs(20));
+		let failure_deadline = now + Duration::from_secs(30);
+		guard.upstream_failure_blocked_until = Some(failure_deadline);
+
+		guard.install_oauth_generation(2, true);
+
+		assert!(guard.rate_limit_blocked_until.is_none());
+		assert_eq!(guard.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::UpstreamFailures));
+		assert_eq!(guard.edge_throttle_failures, 1);
+		assert_eq!(guard.upstream_failure_blocked_until, Some(failure_deadline));
 		assert_eq!(guard.quota.generation, 2);
 	}
 
