@@ -720,9 +720,7 @@ pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_
 	let generation = oauth.generation;
 	let mut guard = upstream_guard();
 	if let Some((expected_generation, expected_quota_epoch)) = expected_quota {
-		if OAUTH_CLIENT.load().generation != expected_generation
-			|| guard.quota_rotation_candidate(Instant::now(), expected_generation) != Some(expected_quota_epoch)
-		{
+		if OAUTH_CLIENT.load().generation != expected_generation || guard.quota_rotation_candidate(Instant::now(), expected_generation) != Some(expected_quota_epoch) {
 			return false;
 		}
 	}

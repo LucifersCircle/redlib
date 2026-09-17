@@ -427,21 +427,13 @@ pub(crate) fn spawn_rate_limit_refresh(expected_generation: u64, expected_quota_
 		return false;
 	};
 
-	if refresh_backoff_remaining().is_some()
-		|| OAUTH_CLIENT.load().generation != expected_generation
-		|| !quota_rotation_still_needed(expected_generation, expected_quota_epoch)
-	{
+	if refresh_backoff_remaining().is_some() || OAUTH_CLIENT.load().generation != expected_generation || !quota_rotation_still_needed(expected_generation, expected_quota_epoch) {
 		drop(rollover_guard);
 		return false;
 	}
 
 	tokio::spawn(async move {
-		let _ = refresh_token_with_guard(
-			RefreshReason::LowRateLimit,
-			rollover_guard,
-			Some((expected_generation, expected_quota_epoch)),
-		)
-		.await;
+		let _ = refresh_token_with_guard(RefreshReason::LowRateLimit, rollover_guard, Some((expected_generation, expected_quota_epoch))).await;
 	});
 	true
 }
