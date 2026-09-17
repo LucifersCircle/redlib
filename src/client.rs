@@ -2037,10 +2037,16 @@ mod tests {
 			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING,
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
-		assert_eq!(guard.take_short_reset_notice(now, 7), Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING)));
+		assert_eq!(
+			guard.take_short_reset_notice(now, 7),
+			Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING))
+		);
 		assert_eq!(guard.take_short_reset_notice(now, 7), None);
 		guard.quota.epoch = guard.quota.epoch.wrapping_add(1);
-		assert_eq!(guard.take_short_reset_notice(now, 7), Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING)));
+		assert_eq!(
+			guard.take_short_reset_notice(now, 7),
+			Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING))
+		);
 
 		guard.quota.window = QuotaWindow::Known {
 			available: LOW_RATE_LIMIT_THRESHOLD,
@@ -2545,7 +2551,9 @@ mod tests {
 		assert!(replacement_probe.half_open);
 		assert!(guard.record_api_success(stale_probe_at, stale_probe).is_none());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::HalfOpen { .. }));
-		assert!(guard.record_api_success(stale_probe_at + REDDIT_API_REQUEST_TIMEOUT + Duration::from_secs(1), replacement_probe).is_some());
+		assert!(guard
+			.record_api_success(stale_probe_at + REDDIT_API_REQUEST_TIMEOUT + Duration::from_secs(1), replacement_probe)
+			.is_some());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::Closed));
 	}
 
