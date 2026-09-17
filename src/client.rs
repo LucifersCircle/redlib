@@ -51,10 +51,11 @@ const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
 const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
+const QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(120);
 const QUOTA_SAFETY_RESERVE: u16 = 5;
 const QUOTA_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
-const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
+const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(300);
 const REDDIT_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_API_REDIRECTS: usize = 3;
 const TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
@@ -75,6 +76,8 @@ static LOCAL_DENIAL_COUNTS: LazyLock<[AtomicU64; 3]> = LazyLock::new(|| std::arr
 static REDIRECT_HOPS: AtomicU64 = AtomicU64::new(0);
 static CANONICAL_HEAD_SENDS: AtomicU64 = AtomicU64::new(0);
 static MEDIA_SENDS: AtomicU64 = AtomicU64::new(0);
+static MEDIA_DESTINATION_SENDS: LazyLock<[AtomicU64; 6]> = LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
+static MEDIA_RESULT_COUNTS: LazyLock<[AtomicU64; 6]> = LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static OAUTH_SENDS: AtomicU64 = AtomicU64::new(0);
 static LAST_TRAFFIC_SUMMARY: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
 
@@ -100,6 +103,17 @@ struct EdgeThrottleDecision {
 	delay: Duration,
 	consecutive_failures: u8,
 	started_cooldown: bool,
+	episode_seconds: u64,
+	current_generation: u64,
+	identity_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct EdgeRecovery {
+	consecutive_failures: u8,
+	episode_seconds: u64,
+	current_generation: u64,
+	identity_age_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -365,10 +379,11 @@ impl QuotaGovernor {
 	}
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UpstreamGuard {
 	quota: QuotaGovernor,
 	quota_rotation_armed: bool,
+	quota_wait_logged_epoch: Option<u64>,
 	failure_window_started: Option<Instant>,
 	failures_in_window: u8,
 	upstream_failure_blocked_until: Option<Instant>,
@@ -376,6 +391,27 @@ struct UpstreamGuard {
 	edge_throttle_failures: u8,
 	edge_epoch: u64,
 	edge_state: EdgeCircuitState,
+	edge_episode_started_at: Option<Instant>,
+	identity_installed_at: Instant,
+}
+
+impl Default for UpstreamGuard {
+	fn default() -> Self {
+		Self {
+			quota: QuotaGovernor::default(),
+			quota_rotation_armed: false,
+			quota_wait_logged_epoch: None,
+			failure_window_started: None,
+			failures_in_window: 0,
+			upstream_failure_blocked_until: None,
+			rate_limit_blocked_until: None,
+			edge_throttle_failures: 0,
+			edge_epoch: 0,
+			edge_state: EdgeCircuitState::Closed,
+			edge_episode_started_at: None,
+			identity_installed_at: Instant::now(),
+		}
+	}
 }
 
 impl UpstreamGuard {
@@ -383,7 +419,9 @@ impl UpstreamGuard {
 		self.quota.install_generation(generation, fresh_identity);
 		if fresh_identity {
 			self.quota_rotation_armed = false;
+			self.quota_wait_logged_epoch = None;
 			self.rate_limit_blocked_until = None;
+			self.identity_installed_at = Instant::now();
 		}
 	}
 
@@ -394,7 +432,28 @@ impl UpstreamGuard {
 		if self.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now) || !matches!(self.edge_state, EdgeCircuitState::Closed) {
 			return None;
 		}
-		matches!(self.quota.window, QuotaWindow::Known { available, .. } if available < LOW_RATE_LIMIT_THRESHOLD).then_some(self.quota.epoch)
+		matches!(
+			self.quota.window,
+			QuotaWindow::Known { available, reset_at }
+				if available < LOW_RATE_LIMIT_THRESHOLD
+					&& reset_at.checked_duration_since(now).is_some_and(|remaining| remaining > QUOTA_ROTATION_MIN_RESET_REMAINING)
+		)
+		.then_some(self.quota.epoch)
+	}
+
+	fn take_short_reset_notice(&mut self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
+		if !self.quota_rotation_armed || generation != self.quota.generation || self.quota_wait_logged_epoch == Some(self.quota.epoch) {
+			return None;
+		}
+		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+			return None;
+		};
+		let reset_remaining = reset_at.saturating_duration_since(now);
+		if available >= LOW_RATE_LIMIT_THRESHOLD || reset_remaining > QUOTA_ROTATION_MIN_RESET_REMAINING {
+			return None;
+		}
+		self.quota_wait_logged_epoch = Some(self.quota.epoch);
+		Some((available, reset_remaining))
 	}
 
 	fn try_admit(&mut self, now: Instant, generation: u64) -> Result<UpstreamAttempt, (Duration, CooldownReason)> {
@@ -563,20 +622,31 @@ impl UpstreamGuard {
 		self.failures_in_window = 0;
 	}
 
-	fn record_api_success(&mut self, attempt: EdgeAttempt) {
+	fn record_api_success(&mut self, now: Instant, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
 		self.reset_failure_window();
 		let closes_probe = matches!(self.edge_state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
 		let current_closed_attempt = matches!(self.edge_state, EdgeCircuitState::Closed) && attempt.epoch == self.edge_epoch;
+		let recovery = closes_probe.then(|| EdgeRecovery {
+			consecutive_failures: self.edge_throttle_failures,
+			episode_seconds: self.edge_episode_started_at.map_or(0, |started| now.saturating_duration_since(started).as_secs()),
+			current_generation: self.quota.generation,
+			identity_age_seconds: now.saturating_duration_since(self.identity_installed_at).as_secs(),
+		});
 		if closes_probe {
 			self.edge_throttle_failures = 0;
 			self.edge_epoch = self.edge_epoch.wrapping_add(1);
 			self.edge_state = EdgeCircuitState::Closed;
+			self.edge_episode_started_at = None;
 		} else if current_closed_attempt {
 			self.edge_throttle_failures = 0;
+			self.edge_episode_started_at = None;
 		}
+		recovery
 	}
 
 	fn record_edge_throttle(&mut self, now: Instant, attempt: EdgeAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
+		let episode_seconds = self.edge_episode_started_at.map_or(0, |started| now.saturating_duration_since(started).as_secs());
+		let identity_age_seconds = now.saturating_duration_since(self.identity_installed_at).as_secs();
 		if attempt.epoch != self.edge_epoch {
 			let delay = match self.edge_state {
 				EdgeCircuitState::Open { until } => until.checked_duration_since(now).unwrap_or_default(),
@@ -587,8 +657,13 @@ impl UpstreamGuard {
 				delay,
 				consecutive_failures: self.edge_throttle_failures,
 				started_cooldown: false,
+				episode_seconds,
+				current_generation: self.quota.generation,
+				identity_age_seconds,
 			};
 		}
+		let episode_started_at = *self.edge_episode_started_at.get_or_insert(now);
+		let episode_seconds = now.saturating_duration_since(episode_started_at).as_secs();
 
 		self.edge_throttle_failures = self.edge_throttle_failures.saturating_add(1);
 		let delay = edge_throttle_delay(self.edge_throttle_failures, retry_after);
@@ -598,6 +673,9 @@ impl UpstreamGuard {
 			delay,
 			consecutive_failures: self.edge_throttle_failures,
 			started_cooldown: true,
+			episode_seconds,
+			current_generation: self.quota.generation,
+			identity_age_seconds,
 		}
 	}
 
@@ -734,7 +812,24 @@ pub(crate) fn quota_rotation_still_needed(generation: u64, quota_epoch: u64) -> 
 }
 
 fn maybe_rotate_low_budget(generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str) {
-	let Some(quota_epoch) = upstream_guard().quota_rotation_candidate(Instant::now(), generation) else {
+	let now = Instant::now();
+	let mut guard = upstream_guard();
+	let quota_epoch = guard.quota_rotation_candidate(now, generation);
+	let short_reset = quota_epoch.is_none().then(|| guard.take_short_reset_notice(now, generation)).flatten();
+	drop(guard);
+
+	if let Some((available, reset_remaining)) = short_reset {
+		info!(
+			"Reddit request budget is low but resets soon: remaining={} effective_available={} used={} reset_seconds={} endpoint={}; preserving the current anonymous OAuth identity",
+			remaining.map_or(0, u16::from),
+			available,
+			used.map_or(0, u16::from),
+			reset_remaining.as_secs(),
+			endpoint_class(path),
+		);
+	}
+
+	let Some(quota_epoch) = quota_epoch else {
 		return;
 	};
 	if !is_current_oauth_generation(generation) || !spawn_rate_limit_refresh(generation, quota_epoch) {
@@ -809,6 +904,43 @@ fn record_local_denial(reason: CooldownReason) {
 	maybe_log_traffic_summary();
 }
 
+fn media_destination_index(format: &str) -> usize {
+	if format.contains("v.redd.it") {
+		0
+	} else if format.contains("i.redd.it") {
+		1
+	} else if format.contains("view.redd.it") {
+		2
+	} else if format.contains("redditmedia.com") || format.contains("redditstatic.com") || format.contains("reddit-econ-prod-assets") {
+		3
+	} else if format.contains("giphy.com") {
+		4
+	} else {
+		5
+	}
+}
+
+fn media_result_index(status: Option<u16>) -> usize {
+	match status {
+		Some(200..=299) => 0,
+		Some(300..=399) => 1,
+		Some(400..=499) => 2,
+		Some(500..=599) => 3,
+		Some(_) => 4,
+		None => 5,
+	}
+}
+
+fn record_media_send(destination: usize) {
+	MEDIA_SENDS.fetch_add(1, Ordering::Relaxed);
+	MEDIA_DESTINATION_SENDS[destination].fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_media_result(status: Option<u16>) {
+	MEDIA_RESULT_COUNTS[media_result_index(status)].fetch_add(1, Ordering::Relaxed);
+	maybe_log_traffic_summary();
+}
+
 fn inbound_route_index(path: &str) -> usize {
 	if path == "/" {
 		return 0;
@@ -875,7 +1007,7 @@ fn maybe_log_traffic_summary() {
 	drop(last);
 
 	info!(
-		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} admitted_json={} api_sends={} redirect_hops={} canonical_heads={} media_sends={} oauth_sends={} local_denials={}",
+		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} admitted_json={} api_sends={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_sends={} local_denials={}",
 		elapsed.as_secs().max(1),
 		take_counter_summary(
 			["home", "subreddit", "comments", "user", "search", "rss", "media", "health", "other"],
@@ -898,6 +1030,8 @@ fn maybe_log_traffic_summary() {
 		REDIRECT_HOPS.swap(0, Ordering::Relaxed),
 		CANONICAL_HEAD_SENDS.swap(0, Ordering::Relaxed),
 		MEDIA_SENDS.swap(0, Ordering::Relaxed),
+		take_counter_summary(["video", "image", "preview", "reddit_assets", "third_party", "other"], &MEDIA_DESTINATION_SENDS),
+		take_counter_summary(["2xx", "3xx", "4xx", "5xx", "other", "transport"], &MEDIA_RESULT_COUNTS),
 		OAUTH_SENDS.swap(0, Ordering::Relaxed),
 		take_counter_summary(["quota", "edge", "failures"], &LOCAL_DENIAL_COUNTS),
 	);
@@ -1020,8 +1154,18 @@ fn record_upstream_failure(kind: &str, status: Option<u16>, path: &str, generati
 	);
 }
 
-fn record_upstream_success(attempt: &mut UpstreamAttempt) {
-	upstream_guard().record_api_success(attempt.edge);
+fn record_upstream_success(attempt: &mut UpstreamAttempt, path: &str) {
+	if let Some(recovery) = upstream_guard().record_api_success(Instant::now(), attempt.edge) {
+		info!(
+			"Reddit edge circuit recovered: endpoint={} consecutive_failures={} episode_seconds={} request_generation={} current_generation={} current_identity_age_seconds={}",
+			endpoint_class(path),
+			recovery.consecutive_failures,
+			recovery.episode_seconds,
+			attempt.generation,
+			recovery.current_generation,
+			recovery.identity_age_seconds,
+		);
+	}
 	attempt.complete();
 }
 
@@ -1142,8 +1286,7 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 }
 
 pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
-	MEDIA_SENDS.fetch_add(1, Ordering::Relaxed);
-	maybe_log_traffic_summary();
+	let media_destination = media_destination_index(format);
 	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
 
 	// For each parameter in request
@@ -1173,10 +1316,10 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
 	builder = builder.header(wreq_header::ACCEPT, "*/*");
 
-	builder
-		.send()
-		.await
-		.map(|mut res| {
+	record_media_send(media_destination);
+	match builder.send().await {
+		Ok(mut res) => {
+			record_media_result(Some(res.status().as_u16()));
 			let headers = res.headers_mut();
 
 			let mut rm = |key: &str| headers.remove(key);
@@ -1194,9 +1337,13 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 			rm("Nel");
 			rm("Report-To");
 
-			res.into_hyper_response()
-		})
-		.map_err(|e| e.to_string())
+			Ok(res.into_hyper_response())
+		}
+		Err(error) => {
+			record_media_result(None);
+			Err(error.to_string())
+		}
+	}
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
@@ -1536,13 +1683,20 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
 						match decision {
 							decision if decision.started_cooldown => warn!(
-								"Reddit edge throttle: status={} endpoint={} retry_after_seconds={} consecutive_failures={} cooldown_seconds={} half_open_probe={}",
+								"Reddit edge throttle: status={} endpoint={} retry_after_present={} retry_after_valid={} retry_after_seconds={} quota_headers_present={} consecutive_failures={} episode_seconds={} cooldown_seconds={} half_open_probe={} request_generation={} current_generation={} current_identity_age_seconds={}",
 								status,
 								endpoint_class(&path),
+								retry_after.is_some(),
+								retry_after_duration.is_some(),
 								retry_after_duration.map_or(0, |duration| duration.as_secs()),
+								quota_headers_present,
 								decision.consecutive_failures,
+								decision.episode_seconds,
 								decision.delay.as_secs(),
 								upstream_attempt.edge.half_open,
+								request_generation,
+								decision.current_generation,
+								decision.identity_age_seconds,
 							),
 							decision => trace!(
 								"Reddit edge throttle joined existing cooldown: endpoint={} cooldown_seconds={}",
@@ -1636,7 +1790,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 									if !quota_headers_present {
 										confirm_headerless_quota(&upstream_attempt);
 									}
-									record_upstream_success(&mut upstream_attempt);
+									record_upstream_success(&mut upstream_attempt, &path);
 									Ok(json)
 								}
 							}
@@ -1801,13 +1955,15 @@ mod tests {
 		assert_eq!(edge_throttle_base_delay(2, None), (Duration::from_secs(10), false));
 		assert_eq!(edge_throttle_base_delay(3, None), (Duration::from_secs(20), false));
 		assert_eq!(edge_throttle_base_delay(4, None), (Duration::from_secs(40), false));
-		assert_eq!(edge_throttle_base_delay(5, None), (EDGE_THROTTLE_MAX_COOLDOWN, false));
+		assert_eq!(edge_throttle_base_delay(5, None), (Duration::from_secs(80), false));
+		assert_eq!(edge_throttle_base_delay(6, None), (Duration::from_secs(160), false));
 		assert_eq!(edge_throttle_base_delay(8, None), (EDGE_THROTTLE_MAX_COOLDOWN, false));
 		assert_eq!(edge_throttle_base_delay(1, Some(Duration::from_secs(90))), (Duration::from_secs(92), true));
+		assert_eq!(edge_throttle_base_delay(8, Some(Duration::from_secs(500))), (Duration::from_secs(502), true));
 		let delay = edge_throttle_delay(1, None);
 		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&delay));
 		let saturated = edge_throttle_delay(8, None);
-		assert!((EDGE_THROTTLE_MAX_COOLDOWN..=Duration::from_secs(75)).contains(&saturated));
+		assert!((EDGE_THROTTLE_MAX_COOLDOWN..=Duration::from_secs(375)).contains(&saturated));
 	}
 
 	#[test]
@@ -1815,6 +1971,23 @@ mod tests {
 		assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
 		assert_eq!(retry_after_seconds(Duration::from_secs(2)), 2);
 		assert_eq!(retry_after_seconds(Duration::from_millis(2001)), 3);
+	}
+
+	#[test]
+	fn test_media_diagnostics_group_destinations_and_results() {
+		assert_eq!(media_destination_index("https://v.redd.it/{id}/DASH_{size}"), 0);
+		assert_eq!(media_destination_index("https://i.redd.it/{path}"), 1);
+		assert_eq!(media_destination_index("https://preview.redd.it/{id}"), 2);
+		assert_eq!(media_destination_index("https://emoji.redditmedia.com/{id}/{name}"), 3);
+		assert_eq!(media_destination_index("https://media.giphy.com/media/{id}/giphy.gif"), 4);
+		assert_eq!(media_destination_index("https://example.com/{path}"), 5);
+
+		assert_eq!(media_result_index(Some(200)), 0);
+		assert_eq!(media_result_index(Some(304)), 1);
+		assert_eq!(media_result_index(Some(403)), 2);
+		assert_eq!(media_result_index(Some(503)), 3);
+		assert_eq!(media_result_index(Some(101)), 4);
+		assert_eq!(media_result_index(None), 5);
 	}
 
 	#[test]
@@ -1850,7 +2023,7 @@ mod tests {
 				rollover_reserve: 0,
 				window: QuotaWindow::Known {
 					available: LOW_RATE_LIMIT_THRESHOLD - 1,
-					reset_at: now + Duration::from_secs(60),
+					reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_nanos(1),
 				},
 			},
 			quota_rotation_armed: true,
@@ -1858,6 +2031,16 @@ mod tests {
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7), Some(1));
 		assert_eq!(guard.quota_rotation_candidate(now, 6), None);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: LOW_RATE_LIMIT_THRESHOLD - 1,
+			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING,
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.take_short_reset_notice(now, 7), Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING)));
+		assert_eq!(guard.take_short_reset_notice(now, 7), None);
+		guard.quota.epoch = guard.quota.epoch.wrapping_add(1);
+		assert_eq!(guard.take_short_reset_notice(now, 7), Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING)));
 
 		guard.quota.window = QuotaWindow::Known {
 			available: LOW_RATE_LIMIT_THRESHOLD,
@@ -1875,7 +2058,7 @@ mod tests {
 
 		guard.quota.window = QuotaWindow::Known {
 			available: LOW_RATE_LIMIT_THRESHOLD - 1,
-			reset_at: now + Duration::from_secs(60),
+			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
 		};
 		guard.edge_state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(10),
@@ -1908,7 +2091,7 @@ mod tests {
 
 		guard.quota.window = QuotaWindow::Known {
 			available: LOW_RATE_LIMIT_THRESHOLD - 1,
-			reset_at: now + Duration::from_secs(120),
+			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
 		};
 		let candidate = guard.quota_rotation_candidate(now + Duration::from_millis(3), 1);
 		assert_eq!(candidate, Some(guard.quota.epoch));
@@ -2280,11 +2463,17 @@ mod tests {
 
 		let recovery_at = first_probe_at + second.delay + Duration::from_millis(1);
 		let recovery_probe = guard.begin_attempt(recovery_at).unwrap();
-		guard.record_api_success(recovery_probe);
+		let recovery = guard.record_api_success(recovery_at, recovery_probe).unwrap();
+		assert_eq!(recovery.consecutive_failures, 2);
+		assert!(recovery.episode_seconds >= 15);
+		let stale = guard.record_edge_throttle(recovery_at, original, None);
+		assert!(!stale.started_cooldown);
+		assert!(guard.edge_episode_started_at.is_none());
 		let recovered_attempt = guard.begin_attempt(recovery_at).unwrap();
 		let recovered = guard.record_edge_throttle(recovery_at, recovered_attempt, Some(Duration::from_secs(2)));
 		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&recovered.delay));
 		assert_eq!(recovered.consecutive_failures, 1);
+		assert_eq!(recovered.episode_seconds, 0);
 	}
 
 	#[test]
@@ -2326,7 +2515,7 @@ mod tests {
 		let denied = guard.begin_attempt(now).unwrap();
 		let late_success = guard.begin_attempt(now).unwrap();
 		guard.record_edge_throttle(now, denied, None);
-		guard.record_api_success(late_success);
+		assert!(guard.record_api_success(now, late_success).is_none());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
 		assert_eq!(guard.edge_throttle_failures, 1);
 	}
@@ -2354,9 +2543,9 @@ mod tests {
 		let stale_probe = guard.begin_attempt(stale_probe_at).unwrap();
 		let replacement_probe = guard.begin_attempt(stale_probe_at + REDDIT_API_REQUEST_TIMEOUT + Duration::from_secs(1)).unwrap();
 		assert!(replacement_probe.half_open);
-		guard.record_api_success(stale_probe);
+		assert!(guard.record_api_success(stale_probe_at, stale_probe).is_none());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::HalfOpen { .. }));
-		guard.record_api_success(replacement_probe);
+		assert!(guard.record_api_success(stale_probe_at + REDDIT_API_REQUEST_TIMEOUT + Duration::from_secs(1), replacement_probe).is_some());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::Closed));
 	}
 
