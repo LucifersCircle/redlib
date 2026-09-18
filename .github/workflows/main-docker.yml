@@ -50,6 +50,9 @@ jobs:
           cargo test --locked --lib test_fresh_low_discovery_does_not_rearm_rotation
           cargo test --locked --lib test_healthy_discovery_arms_quota_rotation
           cargo test --locked --lib test_out_of_order_quota_responses_cannot_replenish_budget
+          cargo test --locked --lib test_early_new_window_response_cannot_poison_low_budget_deadline
+          cargo test --locked --lib test_reset_only_response_cannot_poison_known_deadline
+          cargo test --locked --lib test_small_same_window_reset_jitter_is_preserved
           cargo test --locked --lib test_token_refresh_preserves_quota_window
           cargo test --locked --lib test_fresh_identity_starts_unknown_quota_window_and_ignores_late_responses
           cargo test --locked --lib test_stale_generation_cannot_reserve_or_replace_budget

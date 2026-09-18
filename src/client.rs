@@ -228,6 +228,20 @@ impl Default for QuotaGovernor {
 }
 
 impl QuotaGovernor {
+	fn reconcile_same_window_reset(known_reset: &mut Instant, observed_reset: Option<Instant>) {
+		let Some(observed_reset) = observed_reset else {
+			return;
+		};
+		// A response from Reddit's next quota window can arrive just before our
+		// latency-inflated estimate of the current boundary. Do not let that
+		// response move a nearly exhausted allowance an entire window forward.
+		// Small drift is still accepted, while larger jumps are rediscovered once
+		// the existing boundary has passed.
+		if observed_reset <= *known_reset + RATE_LIMIT_COOLDOWN_MARGIN {
+			*known_reset = (*known_reset).max(observed_reset);
+		}
+	}
+
 	fn install_generation(&mut self, generation: u64, fresh_identity: bool) {
 		self.generation = generation;
 		if fresh_identity {
@@ -353,14 +367,10 @@ impl QuotaGovernor {
 				// The local allowance already excludes every admitted request.
 				// Therefore an out-of-order response may lower, but never raise it.
 				*available = (*available).min(remaining.saturating_sub(self.outstanding));
-				if let Some(observed_reset) = reset_at {
-					*known_reset = (*known_reset).max(observed_reset);
-				}
+				Self::reconcile_same_window_reset(known_reset, reset_at);
 			}
 			(QuotaWindow::Known { reset_at: known_reset, .. }, None) => {
-				if let Some(observed_reset) = reset_at {
-					*known_reset = (*known_reset).max(observed_reset);
-				}
+				Self::reconcile_same_window_reset(known_reset, reset_at);
 			}
 		}
 		true
@@ -440,6 +450,16 @@ impl Default for UpstreamGuard {
 }
 
 impl UpstreamGuard {
+	fn known_quota_state(&self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
+		if generation != self.quota.generation {
+			return None;
+		}
+		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+			return None;
+		};
+		Some((available, reset_at.saturating_duration_since(now)))
+	}
+
 	fn install_oauth_generation(&mut self, generation: u64, fresh_identity: bool) {
 		self.quota.install_generation(generation, fresh_identity);
 		if fresh_identity {
@@ -907,6 +927,7 @@ fn maybe_rotate_low_budget(generation: u64, remaining: Option<u16>, used: Option
 	let now = Instant::now();
 	let mut guard = upstream_guard();
 	let rotation_ticket = guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Proactive);
+	let effective_quota = guard.known_quota_state(now, generation);
 	let short_reset = rotation_ticket.is_none().then(|| guard.take_short_reset_notice(now, generation)).flatten();
 	drop(guard);
 
@@ -929,10 +950,12 @@ fn maybe_rotate_low_budget(generation: u64, remaining: Option<u16>, used: Option
 	}
 
 	warn!(
-		"Reddit request budget is low: remaining={} used={} reset_seconds={} endpoint={}; rotating to a fresh anonymous OAuth identity",
+		"Reddit request budget is low: remaining={} effective_available={} used={} reset_seconds={} effective_reset_seconds={} endpoint={}; rotating to a fresh anonymous OAuth identity",
 		remaining.map_or(0, u16::from),
+		effective_quota.map_or(0, |(available, _)| available),
 		used.map_or(0, u16::from),
 		reset.map_or(0, |duration| duration.as_secs()),
+		effective_quota.map_or(0, |(_, duration)| duration.as_secs()),
 		endpoint_class(path),
 	);
 }
@@ -2386,6 +2409,149 @@ mod tests {
 		quota.reconcile(now, &attempt(1), Some(8), Some(Duration::from_secs(120)), false);
 		quota.reconcile(now, &attempt(2), Some(9), Some(Duration::from_secs(119)), false);
 		assert!(matches!(quota.window, QuotaWindow::Known { available: 6, .. }));
+	}
+
+	#[test]
+	fn test_early_new_window_response_cannot_poison_low_budget_deadline() {
+		let now = Instant::now();
+		let old_reset = now + Duration::from_secs(5);
+		let mut quota = QuotaGovernor {
+			generation: 3,
+			epoch: 4,
+			next_request_id: 2,
+			outstanding: 2,
+			rollover_reserve: 0,
+			window: QuotaWindow::Known {
+				available: LOW_RATE_LIMIT_THRESHOLD - 1,
+				reset_at: old_reset,
+			},
+		};
+		let attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 3,
+			quota_epoch: 4,
+			request_id: 1,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+
+		// Reddit has already started its next window, but our latency-adjusted
+		// deadline is still a few seconds away. Keep the old boundary instead of
+		// moving the exhausted allowance forward by another full window.
+		assert!(quota.reconcile(now, &attempt, Some(81), Some(Duration::from_secs(565)), false));
+		assert_eq!(quota.outstanding, 1);
+		assert!(matches!(
+			quota.window,
+			QuotaWindow::Known { available, reset_at }
+				if available == LOW_RATE_LIMIT_THRESHOLD - 1 && reset_at == old_reset
+		));
+
+		let mut guard = UpstreamGuard::default();
+		guard.quota = quota;
+		guard.quota_rotation_armed = true;
+		assert_eq!(guard.quota_rotation_candidate(now, 3, QuotaRotationMode::Proactive), None);
+		assert_eq!(guard.take_short_reset_notice(now, 3), Some((LOW_RATE_LIMIT_THRESHOLD - 1, Duration::from_secs(5))));
+
+		let after_old_boundary = old_reset + RATE_LIMIT_COOLDOWN_MARGIN;
+		let (quota_epoch, request_id, discovery_probe) = guard.quota.reserve(after_old_boundary, 3).unwrap();
+		assert_eq!(quota_epoch, 5);
+		assert!(discovery_probe);
+		let discovery_attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 3,
+			quota_epoch,
+			request_id,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		assert!(guard
+			.quota
+			.reconcile(after_old_boundary, &discovery_attempt, Some(81), Some(Duration::from_secs(565)), false,));
+		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 80, .. }));
+
+		let late_old_attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 3,
+			quota_epoch: 4,
+			request_id: 2,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		assert!(!guard.quota.reconcile(
+			after_old_boundary + Duration::from_millis(1),
+			&late_old_attempt,
+			Some(82),
+			Some(Duration::from_secs(564)),
+			false,
+		));
+		guard.quota.abandon(after_old_boundary + Duration::from_millis(1), &late_old_attempt);
+		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 80, .. }));
+	}
+
+	#[test]
+	fn test_reset_only_response_cannot_poison_known_deadline() {
+		let now = Instant::now();
+		let old_reset = now + Duration::from_secs(5);
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 3,
+			next_request_id: 1,
+			outstanding: 1,
+			rollover_reserve: 0,
+			window: QuotaWindow::Known {
+				available: LOW_RATE_LIMIT_THRESHOLD - 1,
+				reset_at: old_reset,
+			},
+		};
+		let attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch: 3,
+			request_id: 1,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+
+		assert!(quota.reconcile(now, &attempt, None, Some(Duration::from_secs(565)), false));
+		assert!(matches!(quota.window, QuotaWindow::Known { reset_at, .. } if reset_at == old_reset));
+	}
+
+	#[test]
+	fn test_small_same_window_reset_jitter_is_preserved() {
+		let now = Instant::now();
+		let old_reset = now + Duration::from_secs(60);
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 3,
+			next_request_id: 1,
+			outstanding: 1,
+			rollover_reserve: 0,
+			window: QuotaWindow::Known {
+				available: 40,
+				reset_at: old_reset,
+			},
+		};
+		let attempt = UpstreamAttempt {
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch: 3,
+			request_id: 1,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+
+		assert!(quota.reconcile(now, &attempt, Some(39), Some(Duration::from_secs(61)), false));
+		assert!(matches!(quota.window, QuotaWindow::Known { reset_at, .. } if reset_at == old_reset + Duration::from_secs(1)));
 	}
 
 	#[test]
