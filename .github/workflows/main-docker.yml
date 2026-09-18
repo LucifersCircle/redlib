@@ -67,6 +67,7 @@ jobs:
           cargo test --locked --lib test_edge_throttle_uses_one_probe_and_escalates_until_success
           cargo test --locked --lib test_edge_fallback_is_lane_isolated_and_never_bypasses_quota
           cargo test --locked --lib test_tor_retry_requires_this_request_to_be_edge_rejected
+          cargo test --locked --lib test_only_edge_redirect_deferrals_qualify_for_tor_retry
           cargo test --locked --lib test_equal_numbered_quota_tickets_remain_lane_scoped
           cargo test --locked --lib test_oauth_refresh_preserves_all_cooldowns
           cargo test --locked --lib test_fresh_identity_clears_only_quota_cooldown

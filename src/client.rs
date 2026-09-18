@@ -914,8 +914,20 @@ enum ThrottleKind {
 
 #[derive(Debug)]
 enum ApiRequestError {
-	Deferred(String),
+	Deferred {
+		message: String,
+		edge_rejected: bool,
+	},
 	Upstream(String),
+}
+
+impl ApiRequestError {
+	fn deferred(message: String, reason: CooldownReason) -> Self {
+		Self::Deferred {
+			message,
+			edge_rejected: reason == CooldownReason::EdgeThrottle,
+		}
+	}
 }
 
 fn classify_throttle_response(status: u16, retry_after_present: bool, quota_headers_present: bool) -> Option<ThrottleKind> {
@@ -1335,7 +1347,10 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 	if let Some((delay, reason)) = guard.redirect_cooldown(now, attempt.edge) {
 		drop(guard);
 		record_local_denial(reason);
-		return Err(ApiRequestError::Deferred(format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(delay))));
+		return Err(ApiRequestError::deferred(
+			format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(delay)),
+			reason,
+		));
 	}
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
@@ -1364,16 +1379,22 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 			}
 			record_local_denial(CooldownReason::RateLimit);
 			if short_refresh_retry {
-				return Err(ApiRequestError::Deferred(format!(
-					"Refreshing the anonymous Reddit session. Retry in {} seconds",
-					retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
-				)));
+				return Err(ApiRequestError::deferred(
+					format!(
+						"Refreshing the anonymous Reddit session. Retry in {} seconds",
+						retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
+					),
+					CooldownReason::RateLimit,
+				));
 			}
-			return Err(ApiRequestError::Deferred(format!(
-				"{}. Retry in {} seconds",
-				CooldownReason::RateLimit.message(),
-				retry_after_seconds(delay)
-			)));
+			return Err(ApiRequestError::deferred(
+				format!(
+					"{}. Retry in {} seconds",
+					CooldownReason::RateLimit.message(),
+					retry_after_seconds(delay)
+				),
+				CooldownReason::RateLimit,
+			));
 		}
 	};
 	attempt.generation = generation;
@@ -2138,7 +2159,13 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 					}
 				}
 			}
-			Err(ApiRequestError::Deferred(message)) => Err(message),
+			Err(ApiRequestError::Deferred {
+				message,
+				edge_rejected: deferred_edge_rejected,
+			}) => {
+				edge_rejected |= deferred_edge_rejected;
+				Err(message)
+			}
 			Err(ApiRequestError::Upstream(error)) => {
 			record_upstream_failure(lane, "request_transport", None, &path, request_generation);
 				err("Couldn't send request to Reddit", error, path)
@@ -3140,6 +3167,23 @@ mod tests {
 		assert!(!should_retry_on_tor(RedditLane::Direct, true, false, true));
 		assert!(!should_retry_on_tor(RedditLane::Direct, true, true, false));
 		assert!(!should_retry_on_tor(RedditLane::Tor, true, true, true));
+	}
+
+	#[test]
+	fn test_only_edge_redirect_deferrals_qualify_for_tor_retry() {
+		let deferred = |reason| ApiRequestError::deferred("deferred".to_string(), reason);
+		assert!(matches!(
+			deferred(CooldownReason::EdgeThrottle),
+			ApiRequestError::Deferred { edge_rejected: true, .. }
+		));
+		assert!(matches!(
+			deferred(CooldownReason::RateLimit),
+			ApiRequestError::Deferred { edge_rejected: false, .. }
+		));
+		assert!(matches!(
+			deferred(CooldownReason::UpstreamFailures),
+			ApiRequestError::Deferred { edge_rejected: false, .. }
+		));
 	}
 
 	#[test]
