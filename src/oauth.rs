@@ -1,7 +1,7 @@
 use crate::{
 	client::{
-		claim_quota_rotation, client_for_lane, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket,
-		OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
+		claim_quota_rotation, client_for_lane, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, OAUTH_IS_ROLLING_OVER,
+		TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::RedditLane,
@@ -167,9 +167,7 @@ impl Oauth {
 			RedditLane::Direct => OAUTH_TIMEOUT,
 			RedditLane::Tor => TOR_OAUTH_TIMEOUT,
 		};
-		let response = timeout(oauth_timeout, backend.authenticate())
-			.await
-			.map_err(|_| AuthError::Timeout(oauth_timeout))??;
+		let response = timeout(oauth_timeout, backend.authenticate()).await.map_err(|_| AuthError::Timeout(oauth_timeout))??;
 
 		// Build headers_map from backend headers + Authorization header
 		let mut headers_map = backend.get_headers();
@@ -437,26 +435,19 @@ impl RolloverGuard {
 		rollover_flag(lane)
 			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
 			.ok()
-			.map(|_| Self {
-				lane,
-				quota_rotation: None,
-			})
+			.map(|_| Self { lane, quota_rotation: None })
 	}
 
 	fn track_quota_rotation(&mut self, ticket: QuotaRotationTicket) {
 		self.quota_rotation = Some(ticket);
-		*active_quota_rotation(self.lane)
-			.lock()
-			.unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ticket);
+		*active_quota_rotation(self.lane).lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ticket);
 	}
 }
 
 impl Drop for RolloverGuard {
 	fn drop(&mut self) {
 		if self.quota_rotation.is_some() {
-			*active_quota_rotation(self.lane)
-				.lock()
-				.unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+			*active_quota_rotation(self.lane).lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 		}
 		rollover_flag(self.lane).store(false, Ordering::SeqCst);
 	}
@@ -477,7 +468,10 @@ pub(crate) async fn token_daemon(lane: RedditLane) {
 		};
 		let (duration, reason) = match refresh_backoff_remaining(lane) {
 			Some(duration) => (duration, "OAuth refresh retry"),
-			None => (current_client.refresh_at.checked_duration_since(Instant::now()).unwrap_or_default(), "scheduled OAuth refresh"),
+			None => (
+				current_client.refresh_at.checked_duration_since(Instant::now()).unwrap_or_default(),
+				"scheduled OAuth refresh",
+			),
 		};
 
 		info!("[⏳] Waiting {duration:?} for {reason}: lane={}", lane.label());

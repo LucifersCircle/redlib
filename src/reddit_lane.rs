@@ -110,9 +110,7 @@ impl TorFallbackConfig {
 			return Err("REDLIB_TOR_PROXY must use socks5h://host:port without credentials, a path, query, or fragment".to_string());
 		}
 
-		Ok(Some(Self {
-			proxy_url: proxy_url.to_string(),
-		}))
+		Ok(Some(Self { proxy_url: proxy_url.to_string() }))
 	}
 }
 

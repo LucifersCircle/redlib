@@ -1230,9 +1230,7 @@ fn tor_fallback_ready() -> bool {
 }
 
 fn edge_fallback_active(guard: &UpstreamGuard, now: Instant) -> bool {
-	if guard.rate_limit_blocked_until.is_some_and(|deadline| deadline > now)
-		|| guard.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now)
-	{
+	if guard.rate_limit_blocked_until.is_some_and(|deadline| deadline > now) || guard.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now) {
 		return false;
 	}
 	match guard.edge_state {
@@ -1334,8 +1332,7 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64) -> Resul
 			let emergency_started = emergency_ticket
 				.filter(|_| is_current_oauth_generation(attempt.lane, generation))
 				.is_some_and(spawn_rate_limit_refresh);
-			let matching_refresh_in_progress =
-				denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
+			let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
 			let short_refresh_retry = emergency_started || matching_refresh_in_progress;
 			if emergency_started {
 				let reset_remaining = delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
@@ -1436,10 +1433,7 @@ pub fn start_tor_fallback() {
 			return;
 		}
 	};
-	if TOR_WARMUP_STARTED
-		.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-		.is_err()
-	{
+	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
 	if let Err(error) = client_for_lane(RedditLane::Tor) {
@@ -1476,15 +1470,11 @@ fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqC
 		"Building Wreq client: lane={} browser={selected_emulation:?} os={selected_operating_system:?}",
 		lane.label()
 	);
-	let mut builder = WreqClient::builder()
-		.emulation(emulation)
-		.redirect(Policy::none());
+	let mut builder = WreqClient::builder().emulation(emulation).redirect(Policy::none());
 	if let Some(proxy) = proxy {
 		builder = builder.proxy(proxy);
 	}
-	builder
-		.build()
-		.map_err(|error| format!("failed to build {} Reddit client: {error}", lane.label()))
+	builder.build().map_err(|error| format!("failed to build {} Reddit client: {error}", lane.label()))
 }
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
@@ -1695,15 +1685,7 @@ async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, at
 fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
 	CANONICAL_HEAD_SENDS.fetch_add(1, Ordering::Relaxed);
 	maybe_log_traffic_summary();
-	request_once(
-		&Method::HEAD,
-		path,
-		quarantine,
-		base_path,
-		host,
-		OAUTH_CLIENT.load_full(),
-		RedditLane::Direct,
-	)
+	request_once(&Method::HEAD, path, quarantine, base_path, host, OAUTH_CLIENT.load_full(), RedditLane::Direct)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -3142,12 +3124,8 @@ mod tests {
 			quota_rotation_armed: true,
 			..UpstreamGuard::new(lane)
 		};
-		let direct_ticket = guard(RedditLane::Direct)
-			.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive)
-			.unwrap();
-		let tor_ticket = guard(RedditLane::Tor)
-			.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive)
-			.unwrap();
+		let direct_ticket = guard(RedditLane::Direct).quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive).unwrap();
+		let tor_ticket = guard(RedditLane::Tor).quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive).unwrap();
 		assert_eq!(direct_ticket.generation, tor_ticket.generation);
 		assert_eq!(direct_ticket.quota_epoch, tor_ticket.quota_epoch);
 		assert_ne!(direct_ticket.lane, tor_ticket.lane);
@@ -3218,9 +3196,7 @@ mod tests {
 		let denial = guard.record_edge_throttle(now, attempt, None);
 		let stale_probe_at = now + denial.delay + Duration::from_millis(1);
 		let stale_probe = guard.begin_attempt(stale_probe_at).unwrap();
-		let replacement_probe = guard
-			.begin_attempt(stale_probe_at + RedditLane::Direct.request_timeout() + Duration::from_secs(1))
-			.unwrap();
+		let replacement_probe = guard.begin_attempt(stale_probe_at + RedditLane::Direct.request_timeout() + Duration::from_secs(1)).unwrap();
 		assert!(replacement_probe.half_open);
 		assert!(guard.record_api_success(stale_probe_at, stale_probe).is_none());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::HalfOpen { .. }));
