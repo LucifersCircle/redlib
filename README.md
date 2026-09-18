@@ -196,6 +196,22 @@ Stream logs from the Redlib container:
 docker logs -f redlib
 ```
 
+#### Optional edge-triggered Tor fallback
+
+This fork can keep an independently authenticated Tor lane warm and use it when Reddit returns the narrow edge-throttle signature that Redlib classifies as `403 + Retry-After + no quota headers`. Direct access remains primary, and a direct half-open probe periodically checks for recovery. Ordinary Reddit quota exhaustion, generic failures, media proxy requests, and canonical `HEAD` requests do not switch to Tor.
+
+The fallback is disabled by default. For the supplied Portainer stack:
+
+1. Deploy [`compose.portainer-tor.yaml`](compose.portainer-tor.yaml). It preserves the external `cloudflare_tunnel` network, adds a private Redlib-to-Tor network, and does not publish the SOCKS or Tor control ports.
+2. Add these values to Portainer's `stack.env`:
+
+   ```env
+   REDLIB_TOR_FALLBACK=on
+   REDLIB_TOR_PROXY=socks5h://tor:9050
+   ```
+
+The Tor sidecar has its own outbound network because Tor must reach the public Tor network. Redlib connects to it only over the internal `tor_private` network. Startup of the direct lane does not wait for Tor; the fallback becomes eligible after its separate OAuth identity is ready. If Tor is unavailable, Redlib retains the direct circuit's cooldown rather than sending onion hostnames outside the configured SOCKS proxy.
+
 ### Docker CLI
 
 Deploy Redlib:
@@ -421,6 +437,8 @@ Assign a default value for each instance-specific setting by passing environment
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
 | `REDDIT_MAX_CONCURRENCY`  | Integer 1-64    | `8`                    | Caps simultaneous Reddit JSON API requests to flatten bursts and reduce upstream rate-limit pressure.    |
+| `TOR_FALLBACK`            | `["on", "off"]` | `off`                | Enables the separate Tor API/OAuth lane only during a confirmed direct edge-throttle episode.             |
+| `TOR_PROXY`               | `socks5h://host:port` | (empty)          | Required with `TOR_FALLBACK=on`; credentials, paths, queries, and non-`socks5h` schemes are rejected.      |
 
 ## Default user settings
 
