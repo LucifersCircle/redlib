@@ -1,5 +1,6 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
+use crate::reddit_lane::{RedditLane, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::{format_url, Post};
@@ -20,7 +21,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Semaphore;
 use wreq::redirect::Policy;
-use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Response as WreqResponse};
+use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Proxy, Response as WreqResponse};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
@@ -33,6 +34,8 @@ const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
+
+static TOR_CLIENT: LazyLock<Result<WreqClient, String>> = LazyLock::new(build_tor_client);
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -1323,6 +1326,17 @@ const URL_PAIRS: [(&str, &str); 2] = [
 ];
 
 pub fn build_client() -> WreqClient {
+	build_emulated_client(RedditLane::Direct, None).expect("Should always be able to build the direct Reddit client")
+}
+
+fn build_tor_client() -> Result<WreqClient, String> {
+	let config = TOR_FALLBACK_CONFIG.as_ref().map_err(|error| error.clone())?;
+	let config = config.as_ref().ok_or_else(|| "Tor fallback is disabled".to_string())?;
+	let proxy = Proxy::all(&config.proxy_url).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
+	build_emulated_client(RedditLane::Tor, Some(proxy))
+}
+
+fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqClient, String> {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
@@ -1338,12 +1352,19 @@ pub fn build_client() -> WreqClient {
 		.build()
 		.emulation();
 
-	info!("Building Wreq client: browser={selected_emulation:?} os={selected_operating_system:?}");
-	WreqClient::builder()
+	info!(
+		"Building Wreq client: lane={} browser={selected_emulation:?} os={selected_operating_system:?}",
+		lane.label()
+	);
+	let mut builder = WreqClient::builder()
 		.emulation(emulation)
-		.redirect(Policy::none())
+		.redirect(Policy::none());
+	if let Some(proxy) = proxy {
+		builder = builder.proxy(proxy);
+	}
+	builder
 		.build()
-		.expect("Should always be able to build a client")
+		.map_err(|error| format!("failed to build {} Reddit client: {error}", lane.label()))
 }
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
