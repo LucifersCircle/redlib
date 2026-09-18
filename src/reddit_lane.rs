@@ -105,7 +105,7 @@ impl TorFallbackConfig {
 			|| parsed.password().is_some()
 			|| parsed.query().is_some()
 			|| parsed.fragment().is_some()
-			|| parsed.path() != "/"
+			|| !matches!(parsed.path(), "" | "/")
 		{
 			return Err("REDLIB_TOR_PROXY must use socks5h://host:port without credentials, a path, query, or fragment".to_string());
 		}
@@ -125,10 +125,17 @@ mod tests {
 		assert!(TorFallbackConfig::parse(Some("on"), None).is_err());
 		assert!(TorFallbackConfig::parse(Some("on"), Some("socks5://tor:9050")).is_err());
 		assert!(TorFallbackConfig::parse(Some("on"), Some("socks5h://user:pass@tor:9050")).is_err());
+		assert!(TorFallbackConfig::parse(Some("on"), Some("socks5h://tor:9050/path")).is_err());
 		assert_eq!(
 			TorFallbackConfig::parse(Some("on"), Some("socks5h://tor:9050")),
 			Ok(Some(TorFallbackConfig {
 				proxy_url: "socks5h://tor:9050".to_string(),
+			}))
+		);
+		assert_eq!(
+			TorFallbackConfig::parse(Some("on"), Some("socks5h://tor:9050/")),
+			Ok(Some(TorFallbackConfig {
+				proxy_url: "socks5h://tor:9050/".to_string(),
 			}))
 		);
 	}

@@ -210,7 +210,7 @@ The fallback is disabled by default. For the supplied Portainer stack:
    REDLIB_TOR_PROXY=socks5h://tor:9050
    ```
 
-The Tor sidecar has its own outbound network because Tor must reach the public Tor network. Redlib connects to it only over the internal `tor_private` network. Startup of the direct lane does not wait for Tor; the fallback becomes eligible after its separate OAuth identity is ready. If Tor is unavailable, Redlib retains the direct circuit's cooldown rather than sending onion hostnames outside the configured SOCKS proxy.
+The Tor sidecar has its own outbound network because Tor must reach the public Tor network. Redlib connects to it only over the internal `tor_private` network. Startup of the direct lane does not wait for Tor; the fallback becomes eligible after its separate OAuth identity is ready. If Tor is unavailable, Redlib retains the direct circuit's cooldown rather than sending onion hostnames outside the configured SOCKS proxy. This first version is API failover after normal startup: the process still requires direct OAuth to initialize before it starts serving requests.
 
 ### Docker CLI
 
