@@ -1,5 +1,5 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, spawn_rate_limit_refresh, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
+use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::{format_url, Post};
@@ -52,8 +52,10 @@ const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
 const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
 const QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(120);
+const EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(30);
 const QUOTA_SAFETY_RESERVE: u16 = 5;
 const QUOTA_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
+const EMERGENCY_QUOTA_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(300);
 const REDDIT_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,6 +98,13 @@ impl CooldownReason {
 			Self::UpstreamFailures => "Reddit requests are temporarily paused after repeated upstream failures",
 		}
 	}
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct AdmissionDenied {
+	delay: Duration,
+	reason: CooldownReason,
+	reserve_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -147,6 +156,19 @@ struct UpstreamAttempt {
 	completed: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum QuotaRotationMode {
+	Proactive,
+	Emergency,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct QuotaRotationTicket {
+	pub(crate) generation: u64,
+	pub(crate) quota_epoch: u64,
+	pub(crate) mode: QuotaRotationMode,
+}
+
 impl UpstreamAttempt {
 	fn mark_sent(&mut self) {
 		self.sent = true;
@@ -175,6 +197,7 @@ enum QuotaWindow {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum QuotaReserveError {
 	Deferred(Duration),
+	ReserveExhausted(Duration),
 	StaleGeneration,
 }
 
@@ -254,7 +277,7 @@ impl QuotaGovernor {
 						.unwrap_or_default()
 						.saturating_add(RATE_LIMIT_COOLDOWN_MARGIN)
 						.min(MAX_RATE_LIMIT_COOLDOWN);
-					return Err(QuotaReserveError::Deferred(delay.max(Duration::from_secs(1))));
+					return Err(QuotaReserveError::ReserveExhausted(delay.max(Duration::from_secs(1))));
 				}
 				*available = available.saturating_sub(1);
 				false
@@ -384,6 +407,7 @@ struct UpstreamGuard {
 	quota: QuotaGovernor,
 	quota_rotation_armed: bool,
 	quota_wait_logged_epoch: Option<u64>,
+	emergency_rotation_claimed_epoch: Option<u64>,
 	failure_window_started: Option<Instant>,
 	failures_in_window: u8,
 	upstream_failure_blocked_until: Option<Instant>,
@@ -401,6 +425,7 @@ impl Default for UpstreamGuard {
 			quota: QuotaGovernor::default(),
 			quota_rotation_armed: false,
 			quota_wait_logged_epoch: None,
+			emergency_rotation_claimed_epoch: None,
 			failure_window_started: None,
 			failures_in_window: 0,
 			upstream_failure_blocked_until: None,
@@ -420,25 +445,67 @@ impl UpstreamGuard {
 		if fresh_identity {
 			self.quota_rotation_armed = false;
 			self.quota_wait_logged_epoch = None;
+			self.emergency_rotation_claimed_epoch = None;
 			self.rate_limit_blocked_until = None;
 			self.identity_installed_at = Instant::now();
 		}
 	}
 
-	fn quota_rotation_candidate(&self, now: Instant, generation: u64) -> Option<u64> {
+	fn quota_rotation_allowed(&self, now: Instant, generation: u64) -> bool {
 		if !self.quota_rotation_armed || generation != self.quota.generation {
+			return false;
+		}
+		if self.rate_limit_blocked_until.is_some_and(|deadline| deadline > now)
+			|| self.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now)
+			|| !matches!(self.edge_state, EdgeCircuitState::Closed)
+		{
+			return false;
+		}
+		true
+	}
+
+	fn quota_rotation_window_matches(&self, now: Instant, mode: QuotaRotationMode) -> bool {
+		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+			return false;
+		};
+		let Some(remaining) = reset_at.checked_duration_since(now) else {
+			return false;
+		};
+		match mode {
+			QuotaRotationMode::Proactive => available < LOW_RATE_LIMIT_THRESHOLD && remaining > QUOTA_ROTATION_MIN_RESET_REMAINING,
+			QuotaRotationMode::Emergency => available <= QUOTA_SAFETY_RESERVE && remaining > EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+		}
+	}
+
+	fn quota_rotation_candidate(&self, now: Instant, generation: u64, mode: QuotaRotationMode) -> Option<QuotaRotationTicket> {
+		if !self.quota_rotation_allowed(now, generation) || !self.quota_rotation_window_matches(now, mode) {
 			return None;
 		}
-		if self.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now) || !matches!(self.edge_state, EdgeCircuitState::Closed) {
+		if mode == QuotaRotationMode::Emergency && self.emergency_rotation_claimed_epoch == Some(self.quota.epoch) {
 			return None;
 		}
-		matches!(
-			self.quota.window,
-			QuotaWindow::Known { available, reset_at }
-				if available < LOW_RATE_LIMIT_THRESHOLD
-					&& reset_at.checked_duration_since(now).is_some_and(|remaining| remaining > QUOTA_ROTATION_MIN_RESET_REMAINING)
-		)
-		.then_some(self.quota.epoch)
+		Some(QuotaRotationTicket {
+			generation,
+			quota_epoch: self.quota.epoch,
+			mode,
+		})
+	}
+
+	fn claim_quota_rotation(&mut self, now: Instant, ticket: QuotaRotationTicket) -> bool {
+		if self.quota_rotation_candidate(now, ticket.generation, ticket.mode) != Some(ticket) {
+			return false;
+		}
+		if ticket.mode == QuotaRotationMode::Emergency {
+			self.emergency_rotation_claimed_epoch = Some(ticket.quota_epoch);
+		}
+		true
+	}
+
+	fn quota_rotation_still_needed(&self, now: Instant, ticket: QuotaRotationTicket) -> bool {
+		if ticket.quota_epoch != self.quota.epoch || !self.quota_rotation_allowed(now, ticket.generation) || !self.quota_rotation_window_matches(now, ticket.mode) {
+			return false;
+		}
+		ticket.mode != QuotaRotationMode::Emergency || self.emergency_rotation_claimed_epoch == Some(ticket.quota_epoch)
 	}
 
 	fn take_short_reset_notice(&mut self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
@@ -456,14 +523,31 @@ impl UpstreamGuard {
 		Some((available, reset_remaining))
 	}
 
-	fn try_admit(&mut self, now: Instant, generation: u64) -> Result<UpstreamAttempt, (Duration, CooldownReason)> {
-		if let Some(active) = self.active_cooldown(now) {
-			return Err(active);
+	fn try_admit(&mut self, now: Instant, generation: u64) -> Result<UpstreamAttempt, AdmissionDenied> {
+		if let Some((delay, reason)) = self.active_cooldown(now) {
+			return Err(AdmissionDenied {
+				delay,
+				reason,
+				reserve_exhausted: false,
+			});
 		}
 
 		let (quota_epoch, request_id, discovery_probe) = self.quota.reserve(now, generation).map_err(|error| match error {
-			QuotaReserveError::Deferred(delay) => (delay, CooldownReason::RateLimit),
-			QuotaReserveError::StaleGeneration => (Duration::from_secs(1), CooldownReason::RateLimit),
+			QuotaReserveError::Deferred(delay) => AdmissionDenied {
+				delay,
+				reason: CooldownReason::RateLimit,
+				reserve_exhausted: false,
+			},
+			QuotaReserveError::ReserveExhausted(delay) => AdmissionDenied {
+				delay,
+				reason: CooldownReason::RateLimit,
+				reserve_exhausted: true,
+			},
+			QuotaReserveError::StaleGeneration => AdmissionDenied {
+				delay: Duration::from_secs(1),
+				reason: CooldownReason::RateLimit,
+				reserve_exhausted: false,
+			},
 		})?;
 		let edge = match self.begin_attempt(now) {
 			Ok(edge) => edge,
@@ -483,7 +567,11 @@ impl UpstreamGuard {
 				};
 				self.quota.abandon(now, &placeholder);
 				placeholder.quota_reconciled = true;
-				return Err(error);
+				return Err(AdmissionDenied {
+					delay: error.0,
+					reason: error.1,
+					reserve_exhausted: false,
+				});
 			}
 		};
 
@@ -794,11 +882,11 @@ fn is_current_oauth_generation(generation: u64) -> bool {
 	OAUTH_CLIENT.load().generation == generation
 }
 
-pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_quota: Option<(u64, u64)>) -> bool {
+pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_rotation: Option<QuotaRotationTicket>) -> bool {
 	let generation = oauth.generation;
 	let mut guard = upstream_guard();
-	if let Some((expected_generation, expected_quota_epoch)) = expected_quota {
-		if OAUTH_CLIENT.load().generation != expected_generation || guard.quota_rotation_candidate(Instant::now(), expected_generation) != Some(expected_quota_epoch) {
+	if let Some(ticket) = expected_rotation {
+		if OAUTH_CLIENT.load().generation != ticket.generation || !guard.quota_rotation_still_needed(Instant::now(), ticket) {
 			return false;
 		}
 	}
@@ -807,15 +895,19 @@ pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_
 	true
 }
 
-pub(crate) fn quota_rotation_still_needed(generation: u64, quota_epoch: u64) -> bool {
-	upstream_guard().quota_rotation_candidate(Instant::now(), generation) == Some(quota_epoch)
+pub(crate) fn claim_quota_rotation(ticket: QuotaRotationTicket) -> bool {
+	upstream_guard().claim_quota_rotation(Instant::now(), ticket)
+}
+
+pub(crate) fn quota_rotation_still_needed(ticket: QuotaRotationTicket) -> bool {
+	upstream_guard().quota_rotation_still_needed(Instant::now(), ticket)
 }
 
 fn maybe_rotate_low_budget(generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str) {
 	let now = Instant::now();
 	let mut guard = upstream_guard();
-	let quota_epoch = guard.quota_rotation_candidate(now, generation);
-	let short_reset = quota_epoch.is_none().then(|| guard.take_short_reset_notice(now, generation)).flatten();
+	let rotation_ticket = guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Proactive);
+	let short_reset = rotation_ticket.is_none().then(|| guard.take_short_reset_notice(now, generation)).flatten();
 	drop(guard);
 
 	if let Some((available, reset_remaining)) = short_reset {
@@ -829,10 +921,10 @@ fn maybe_rotate_low_budget(generation: u64, remaining: Option<u16>, used: Option
 		);
 	}
 
-	let Some(quota_epoch) = quota_epoch else {
+	let Some(rotation_ticket) = rotation_ticket else {
 		return;
 	};
-	if !is_current_oauth_generation(generation) || !spawn_rate_limit_refresh(generation, quota_epoch) {
+	if !is_current_oauth_generation(generation) || !spawn_rate_limit_refresh(rotation_ticket) {
 		return;
 	}
 
@@ -1060,17 +1152,35 @@ fn begin_upstream_attempt() -> Result<(Arc<Oauth>, UpstreamAttempt), String> {
 	let mut guard = upstream_guard();
 	let oauth_client = OAUTH_CLIENT.load_full();
 	let generation = oauth_client.generation;
-	let result = guard.try_admit(Instant::now(), generation);
-	let rotation_candidate = result.is_err().then(|| guard.quota_rotation_candidate(Instant::now(), generation)).flatten();
+	let now = Instant::now();
+	let result = guard.try_admit(now, generation);
+	let denied_quota_epoch = result.as_ref().err().filter(|denial| denial.reserve_exhausted).map(|_| guard.quota.epoch);
+	let emergency_ticket = result
+		.as_ref()
+		.err()
+		.filter(|denial| denial.reserve_exhausted)
+		.and_then(|_| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency));
 	drop(guard);
-	result.map(|attempt| (oauth_client, attempt)).map_err(|(remaining, reason)| {
-		if let Some(quota_epoch) = rotation_candidate.filter(|_| is_current_oauth_generation(generation)) {
-			if spawn_rate_limit_refresh(generation, quota_epoch) {
-				warn!("Local Reddit quota reserve reached; rotating to a fresh anonymous OAuth identity");
-			}
+	result.map(|attempt| (oauth_client, attempt)).map_err(|denial| {
+		let emergency_started = emergency_ticket.filter(|_| is_current_oauth_generation(generation)).is_some_and(spawn_rate_limit_refresh);
+		let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(generation, quota_epoch));
+		let short_refresh_retry = emergency_started || matching_refresh_in_progress;
+		if emergency_started {
+			let reset_remaining = denial.delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
+			warn!(
+				"Local Reddit quota reserve reached with {} seconds left in the current window; rotating once to avoid a prolonged pause",
+				reset_remaining.as_secs()
+			);
 		}
-		record_local_denial(reason);
-		format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(remaining))
+		record_local_denial(denial.reason);
+		if short_refresh_retry {
+			format!(
+				"Refreshing the anonymous Reddit session. Retry in {} seconds",
+				retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
+			)
+		} else {
+			format!("{}. Retry in {} seconds", denial.reason.message(), retry_after_seconds(denial.delay))
+		}
 	})
 }
 
@@ -1106,18 +1216,33 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, continue
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
 		Err(error) => {
-			let rotation_candidate = guard.quota_rotation_candidate(now, generation);
-			let delay = match error {
-				QuotaReserveError::Deferred(delay) => delay,
-				QuotaReserveError::StaleGeneration => Duration::from_secs(1),
+			let (delay, denied_quota_epoch, emergency_ticket) = match error {
+				QuotaReserveError::Deferred(delay) => (delay, None, None),
+				QuotaReserveError::ReserveExhausted(delay) => (
+					delay,
+					Some(guard.quota.epoch),
+					guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency),
+				),
+				QuotaReserveError::StaleGeneration => (Duration::from_secs(1), None, None),
 			};
 			drop(guard);
-			if let Some(quota_epoch) = rotation_candidate.filter(|_| is_current_oauth_generation(generation)) {
-				if spawn_rate_limit_refresh(generation, quota_epoch) {
-					warn!("Local Reddit quota reserve reached during redirect; rotating to a fresh anonymous OAuth identity");
-				}
+			let emergency_started = emergency_ticket.filter(|_| is_current_oauth_generation(generation)).is_some_and(spawn_rate_limit_refresh);
+			let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(generation, quota_epoch));
+			let short_refresh_retry = emergency_started || matching_refresh_in_progress;
+			if emergency_started {
+				let reset_remaining = delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
+				warn!(
+					"Local Reddit quota reserve reached during redirect with {} seconds left in the current window; rotating once to avoid a prolonged pause",
+					reset_remaining.as_secs()
+				);
 			}
 			record_local_denial(CooldownReason::RateLimit);
+			if short_refresh_retry {
+				return Err(ApiRequestError::Deferred(format!(
+					"Refreshing the anonymous Reddit session. Retry in {} seconds",
+					retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
+				)));
+			}
 			return Err(ApiRequestError::Deferred(format!(
 				"{}. Retry in {} seconds",
 				CooldownReason::RateLimit.message(),
@@ -2007,7 +2132,7 @@ mod tests {
 		assert!(quota.reserve(now, 7).is_ok());
 		assert!(quota.reserve(now, 7).is_ok());
 		assert!(quota.reserve(now, 7).is_ok());
-		assert!(quota.reserve(now, 7).is_err());
+		assert!(matches!(quota.reserve(now, 7), Err(QuotaReserveError::ReserveExhausted(_))));
 		assert_eq!(quota.outstanding, 3);
 	}
 
@@ -2029,14 +2154,21 @@ mod tests {
 			quota_rotation_armed: true,
 			..UpstreamGuard::default()
 		};
-		assert_eq!(guard.quota_rotation_candidate(now, 7), Some(1));
-		assert_eq!(guard.quota_rotation_candidate(now, 6), None);
+		assert_eq!(
+			guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive),
+			Some(QuotaRotationTicket {
+				generation: 7,
+				quota_epoch: 1,
+				mode: QuotaRotationMode::Proactive,
+			})
+		);
+		assert_eq!(guard.quota_rotation_candidate(now, 6, QuotaRotationMode::Proactive), None);
 
 		guard.quota.window = QuotaWindow::Known {
 			available: LOW_RATE_LIMIT_THRESHOLD - 1,
 			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING,
 		};
-		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		assert_eq!(
 			guard.take_short_reset_notice(now, 7),
 			Some((LOW_RATE_LIMIT_THRESHOLD - 1, QUOTA_ROTATION_MIN_RESET_REMAINING))
@@ -2052,15 +2184,15 @@ mod tests {
 			available: LOW_RATE_LIMIT_THRESHOLD,
 			reset_at: now + Duration::from_secs(60),
 		};
-		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 
 		guard.quota.window = QuotaWindow::Unknown {
 			not_before: now,
 			probe_in_flight: true,
 		};
-		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		guard.quota.window = QuotaWindow::Unreported;
-		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 
 		guard.quota.window = QuotaWindow::Known {
 			available: LOW_RATE_LIMIT_THRESHOLD - 1,
@@ -2069,10 +2201,125 @@ mod tests {
 		guard.edge_state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(10),
 		};
-		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		guard.edge_state = EdgeCircuitState::Closed;
 		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
-		assert_eq!(guard.quota_rotation_candidate(now, 7), None);
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+	}
+
+	#[test]
+	fn test_emergency_quota_rotation_requires_reserve_exhaustion_and_long_wait() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard {
+			quota: QuotaGovernor {
+				generation: 7,
+				epoch: 4,
+				next_request_id: 0,
+				outstanding: 0,
+				rollover_reserve: 0,
+				window: QuotaWindow::Known {
+					available: QUOTA_SAFETY_RESERVE + 1,
+					reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
+				},
+			},
+			quota_rotation_armed: true,
+			..UpstreamGuard::default()
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_nanos(1),
+		};
+		let ticket = guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency).unwrap();
+		assert_eq!(
+			ticket,
+			QuotaRotationTicket {
+				generation: 7,
+				quota_epoch: 4,
+				mode: QuotaRotationMode::Emergency,
+			}
+		);
+		let denial = guard.try_admit(now, 7).unwrap_err();
+		assert!(denial.reserve_exhausted);
+		assert_eq!(denial.reason, CooldownReason::RateLimit);
+		assert!(guard.claim_quota_rotation(now, ticket));
+		assert!(guard.quota_rotation_still_needed(now, ticket));
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+		assert!(!guard.claim_quota_rotation(now, ticket));
+		guard.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE + 1,
+			reset_at: now + Duration::from_secs(90),
+		};
+		assert!(!guard.quota_rotation_still_needed(now, ticket));
+
+		guard.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+		};
+		assert!(!guard.quota_rotation_still_needed(now, ticket));
+
+		guard.emergency_rotation_claimed_epoch = None;
+		guard.quota.window = QuotaWindow::Unknown {
+			not_before: now,
+			probe_in_flight: false,
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+		guard.quota.window = QuotaWindow::Unreported;
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+		guard.quota_rotation_armed = false;
+		guard.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + Duration::from_secs(90),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+	}
+
+	#[test]
+	fn test_emergency_quota_rotation_claim_survives_stable_refresh_but_not_new_epoch() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard {
+			quota: QuotaGovernor {
+				generation: 3,
+				epoch: 8,
+				next_request_id: 0,
+				outstanding: 0,
+				rollover_reserve: 0,
+				window: QuotaWindow::Known {
+					available: QUOTA_SAFETY_RESERVE,
+					reset_at: now + Duration::from_secs(90),
+				},
+			},
+			quota_rotation_armed: true,
+			..UpstreamGuard::default()
+		};
+		let ticket = guard.quota_rotation_candidate(now, 3, QuotaRotationMode::Emergency).unwrap();
+		assert!(guard.claim_quota_rotation(now, ticket));
+
+		guard.install_oauth_generation(4, false);
+		assert_eq!(guard.emergency_rotation_claimed_epoch, Some(8));
+		assert_eq!(guard.quota_rotation_candidate(now, 4, QuotaRotationMode::Emergency), None);
+
+		guard.quota.epoch = 9;
+		let next_ticket = guard.quota_rotation_candidate(now, 4, QuotaRotationMode::Emergency).unwrap();
+		assert!(!guard.quota_rotation_still_needed(now, ticket));
+		assert!(guard.claim_quota_rotation(now, next_ticket));
+		guard.rate_limit_blocked_until = Some(now + Duration::from_secs(10));
+		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
+		guard.rate_limit_blocked_until = None;
+		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
+		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
+		guard.upstream_failure_blocked_until = None;
+		guard.edge_state = EdgeCircuitState::Open {
+			until: now + Duration::from_secs(10),
+		};
+		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
 	}
 
 	#[test]
@@ -2083,7 +2330,7 @@ mod tests {
 		let mut attempt = guard.try_admit(now + Duration::from_millis(1), 1).unwrap();
 		guard.reconcile_quota(now + Duration::from_millis(2), &mut attempt, Some(9), Some(Duration::from_secs(120)), false);
 		assert!(!guard.quota_rotation_armed);
-		assert_eq!(guard.quota_rotation_candidate(now + Duration::from_millis(3), 1), None);
+		assert_eq!(guard.quota_rotation_candidate(now + Duration::from_millis(3), 1, QuotaRotationMode::Proactive), None);
 	}
 
 	#[test]
@@ -2099,10 +2346,17 @@ mod tests {
 			available: LOW_RATE_LIMIT_THRESHOLD - 1,
 			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
 		};
-		let candidate = guard.quota_rotation_candidate(now + Duration::from_millis(3), 1);
-		assert_eq!(candidate, Some(guard.quota.epoch));
+		let candidate = guard.quota_rotation_candidate(now + Duration::from_millis(3), 1, QuotaRotationMode::Proactive);
+		assert_eq!(
+			candidate,
+			Some(QuotaRotationTicket {
+				generation: 1,
+				quota_epoch: guard.quota.epoch,
+				mode: QuotaRotationMode::Proactive,
+			})
+		);
 		guard.quota.epoch = guard.quota.epoch.wrapping_add(1);
-		assert_ne!(candidate, guard.quota_rotation_candidate(now + Duration::from_millis(4), 1));
+		assert_ne!(candidate, guard.quota_rotation_candidate(now + Duration::from_millis(4), 1, QuotaRotationMode::Proactive));
 	}
 
 	#[test]
