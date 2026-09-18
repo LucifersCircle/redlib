@@ -1,5 +1,8 @@
 use crate::{
-	client::{install_oauth_client, quota_rotation_still_needed, record_oauth_send, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
+	client::{
+		claim_quota_rotation, install_oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, CLIENT, OAUTH_CLIENT,
+		OAUTH_IS_ROLLING_OVER,
+	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	timing::{positive_jitter, proportional_positive_jitter},
 };
@@ -23,6 +26,7 @@ const TOKEN_REFRESH_MIN_EARLY_BY: u64 = 120;
 const TOKEN_REFRESH_MAX_EARLY_BY: u64 = 240;
 static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
 static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static ACTIVE_QUOTA_ROTATION: LazyLock<Mutex<Option<QuotaRotationTicket>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RefreshReason {
@@ -378,18 +382,38 @@ impl RefreshOutcome {
 	}
 }
 
-struct RolloverGuard;
+struct RolloverGuard {
+	quota_rotation: Option<QuotaRotationTicket>,
+}
 
 impl RolloverGuard {
 	fn acquire() -> Option<Self> {
-		OAUTH_IS_ROLLING_OVER.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).ok().map(|_| Self)
+		OAUTH_IS_ROLLING_OVER
+			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+			.ok()
+			.map(|_| Self { quota_rotation: None })
+	}
+
+	fn track_quota_rotation(&mut self, ticket: QuotaRotationTicket) {
+		self.quota_rotation = Some(ticket);
+		*ACTIVE_QUOTA_ROTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ticket);
 	}
 }
 
 impl Drop for RolloverGuard {
 	fn drop(&mut self) {
+		if self.quota_rotation.is_some() {
+			*ACTIVE_QUOTA_ROTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+		}
 		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 	}
+}
+
+pub(crate) fn quota_rotation_in_progress(generation: u64, quota_epoch: u64) -> bool {
+	ACTIVE_QUOTA_ROTATION
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.is_some_and(|ticket| ticket.generation == generation && ticket.quota_epoch == quota_epoch)
 }
 
 pub async fn token_daemon() {
@@ -418,23 +442,23 @@ pub async fn token_daemon() {
 	}
 }
 
-pub(crate) fn spawn_rate_limit_refresh(expected_generation: u64, expected_quota_epoch: u64) -> bool {
+pub(crate) fn spawn_rate_limit_refresh(ticket: QuotaRotationTicket) -> bool {
 	if refresh_backoff_remaining().is_some() {
 		return false;
 	}
 
-	let Some(rollover_guard) = RolloverGuard::acquire() else {
+	let Some(mut rollover_guard) = RolloverGuard::acquire() else {
 		return false;
 	};
+	rollover_guard.track_quota_rotation(ticket);
 
-	if refresh_backoff_remaining().is_some() || OAUTH_CLIENT.load().generation != expected_generation || !quota_rotation_still_needed(expected_generation, expected_quota_epoch)
-	{
+	if refresh_backoff_remaining().is_some() || OAUTH_CLIENT.load().generation != ticket.generation || !claim_quota_rotation(ticket) {
 		drop(rollover_guard);
 		return false;
 	}
 
 	tokio::spawn(async move {
-		let _ = refresh_token_with_guard(RefreshReason::LowRateLimit, rollover_guard, Some((expected_generation, expected_quota_epoch))).await;
+		let _ = refresh_token_with_guard(RefreshReason::LowRateLimit, rollover_guard, Some(ticket)).await;
 	});
 	true
 }
@@ -459,18 +483,18 @@ pub(crate) async fn force_refresh_token(reason: RefreshReason) -> RefreshOutcome
 	refresh_token_with_guard(reason, rollover_guard, None).await
 }
 
-async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: RolloverGuard, expected_quota: Option<(u64, u64)>) -> RefreshOutcome {
+async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: RolloverGuard, expected_rotation: Option<QuotaRotationTicket>) -> RefreshOutcome {
 	trace!("Refreshing OAuth token: reason={}", reason.label());
 	let current_client = OAUTH_CLIENT.load_full();
-	if let Some((expected_generation, expected_quota_epoch)) = expected_quota {
-		if current_client.generation != expected_generation || !quota_rotation_still_needed(expected_generation, expected_quota_epoch) {
+	if let Some(ticket) = expected_rotation {
+		if current_client.generation != ticket.generation || !quota_rotation_still_needed(ticket) {
 			return RefreshOutcome::Superseded;
 		}
 	}
 	match current_client.refreshed(reason).await {
 		Ok(mut refreshed) => {
 			refreshed.oauth.generation = current_client.generation.wrapping_add(1);
-			if !install_oauth_client(refreshed.oauth, refreshed.fresh_identity, expected_quota) {
+			if !install_oauth_client(refreshed.oauth, refreshed.fresh_identity, expected_rotation) {
 				info!("Discarding completed low-budget OAuth refresh because the quota window recovered or changed");
 				refresh_backoff().record_success();
 				return RefreshOutcome::Superseded;
@@ -876,6 +900,26 @@ mod tests {
 		assert_eq!(refresh_retry_base_delay(20, None), (MAX_REFRESH_RETRY_DELAY, false));
 		let saturated = refresh_retry_delay(20, None);
 		assert!((MAX_REFRESH_RETRY_DELAY..=Duration::from_secs(375)).contains(&saturated));
+	}
+
+	#[test]
+	fn test_active_quota_rotation_matches_generation_and_epoch() {
+		let ticket = QuotaRotationTicket {
+			generation: 12,
+			quota_epoch: 34,
+			mode: crate::client::QuotaRotationMode::Emergency,
+		};
+		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
+		{
+			let mut rollover_guard = RolloverGuard::acquire().unwrap();
+			rollover_guard.track_quota_rotation(ticket);
+			assert!(OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst));
+			assert!(quota_rotation_in_progress(12, 34));
+			assert!(!quota_rotation_in_progress(11, 34));
+			assert!(!quota_rotation_in_progress(12, 35));
+		}
+		assert!(!quota_rotation_in_progress(12, 34));
+		assert!(!OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst));
 	}
 
 	#[test]

@@ -45,6 +45,8 @@ jobs:
           cargo test --locked --lib test_media_diagnostics_group_destinations_and_results
           cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
           cargo test --locked --lib test_quota_rotation_requires_known_exhausted_current_generation
+          cargo test --locked --lib test_emergency_quota_rotation_requires_reserve_exhaustion_and_long_wait
+          cargo test --locked --lib test_emergency_quota_rotation_claim_survives_stable_refresh_but_not_new_epoch
           cargo test --locked --lib test_fresh_low_discovery_does_not_rearm_rotation
           cargo test --locked --lib test_healthy_discovery_arms_quota_rotation
           cargo test --locked --lib test_out_of_order_quota_responses_cannot_replenish_budget
@@ -76,6 +78,7 @@ jobs:
           cargo test --locked --lib test_subscription_names_are_compared_case_insensitively
           cargo test --locked --lib test_preference_membership_is_case_insensitive
           cargo test --locked --lib test_refresh_retry_delay_is_exponential_and_capped
+          cargo test --locked --lib test_active_quota_rotation_matches_generation_and_epoch
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
           cargo test --locked --lib test_token_refresh_delay_cannot_underflow

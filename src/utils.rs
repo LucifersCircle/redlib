@@ -1410,10 +1410,11 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 }
 
 fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
-	const TEMPORARY_ERRORS: [&str; 11] = [
+	const TEMPORARY_ERRORS: [&str; 12] = [
 		"Reddit requests are temporarily paused",
 		"Reddit is temporarily rejecting this instance",
 		"Reddit rate limit exceeded",
+		"Refreshing the anonymous Reddit session",
 		"OAuth token refresh is temporarily unavailable",
 		"Reddit is having issues",
 		"Reddit returned an empty response",
@@ -1564,6 +1565,7 @@ mod tests {
 			temporary_error_retry_after("Reddit is temporarily rejecting this instance. Retry in 42 seconds"),
 			Some(Some(42))
 		);
+		assert_eq!(temporary_error_retry_after("Refreshing the anonymous Reddit session. Retry in 2 seconds"), Some(Some(2)));
 		assert_eq!(temporary_error_retry_after("Reddit is having issues, check if there's an outage"), Some(None));
 		assert_eq!(temporary_error_retry_after("r/example is a private community"), None);
 	}
