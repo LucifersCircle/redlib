@@ -202,7 +202,7 @@ This fork can keep an independently authenticated Tor lane warm and use it when 
 
 The fallback is disabled by default. For the supplied Portainer stack:
 
-1. Deploy [`compose.portainer-tor.yaml`](compose.portainer-tor.yaml). It preserves the external `cloudflare_tunnel` network, adds a private Redlib-to-Tor network, and does not publish the SOCKS or Tor control ports.
+1. Deploy [`compose.portainer-tor.yaml`](compose.portainer-tor.yaml). It preserves the external `cloudflare_tunnel` network, adds a private Redlib-to-Tor network, and does not publish the SOCKS or Tor control ports. The supplied sidecar image is version- and digest-pinned for reproducible deployment.
 2. Add these values to Portainer's `stack.env`:
 
    ```env
