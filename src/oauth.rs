@@ -1,6 +1,10 @@
 use crate::{
-	client::{claim_quota_rotation, install_oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
+	client::{
+		claim_quota_rotation, client_for_lane, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, OAUTH_IS_ROLLING_OVER,
+		TOR_OAUTH_IS_ROLLING_OVER,
+	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
+	reddit_lane::RedditLane,
 	timing::{positive_jitter, proportional_positive_jitter},
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -13,17 +17,19 @@ use tokio::time::timeout;
 
 const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 
-const AUTH_ENDPOINT: &str = "https://www.reddit.com";
-
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const TOR_OAUTH_TIMEOUT: Duration = Duration::from_secs(45);
 const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
 const TOKEN_REFRESH_MIN_EARLY_BY: u64 = 120;
 const TOKEN_REFRESH_MAX_EARLY_BY: u64 = 240;
-static REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
-static TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
-static ACTIVE_QUOTA_ROTATION: LazyLock<Mutex<Option<QuotaRotationTicket>>> = LazyLock::new(|| Mutex::new(None));
+static DIRECT_REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
+static TOR_REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
+static DIRECT_TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static TOR_TOKEN_REFRESH_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static DIRECT_ACTIVE_QUOTA_ROTATION: LazyLock<Mutex<Option<QuotaRotationTicket>>> = LazyLock::new(|| Mutex::new(None));
+static TOR_ACTIVE_QUOTA_ROTATION: LazyLock<Mutex<Option<QuotaRotationTicket>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RefreshReason {
@@ -88,6 +94,13 @@ impl OauthBackend for OauthBackendImpl {
 }
 
 impl OauthBackendImpl {
+	fn lane(&self) -> RedditLane {
+		match self {
+			Self::MobileSpoof(backend) => backend.lane,
+			Self::GenericWeb(backend) => backend.lane,
+		}
+	}
+
 	fn name(&self) -> &'static str {
 		match self {
 			Self::MobileSpoof(_) => "MobileSpoofAuth",
@@ -97,8 +110,8 @@ impl OauthBackendImpl {
 
 	fn alternate(&self) -> Self {
 		match self {
-			Self::MobileSpoof(_) => Self::GenericWeb(GenericWebAuth::new()),
-			Self::GenericWeb(_) => Self::MobileSpoof(MobileSpoofAuth::new()),
+			Self::MobileSpoof(backend) => Self::GenericWeb(GenericWebAuth::new(backend.lane)),
+			Self::GenericWeb(backend) => Self::MobileSpoof(MobileSpoofAuth::new(backend.lane)),
 		}
 	}
 }
@@ -110,6 +123,7 @@ pub struct Oauth {
 	refresh_at: Instant,
 	pub(crate) backend: OauthBackendImpl,
 	pub(crate) generation: u64,
+	pub(crate) lane: RedditLane,
 }
 
 struct RefreshedOauth {
@@ -119,11 +133,11 @@ struct RefreshedOauth {
 
 impl Oauth {
 	/// Create a new OAuth client
-	pub(crate) async fn new() -> Self {
+	pub(crate) async fn new(lane: RedditLane) -> Self {
 		// Keep both identities stable across startup retries. Startup cannot serve
 		// requests without a token, so retry indefinitely with bounded backoff.
-		let mut primary = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
-		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new());
+		let mut primary = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
+		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new(lane));
 		let mut failure_count = 0_u32;
 
 		loop {
@@ -131,7 +145,7 @@ impl Oauth {
 			for backend in [&mut primary, &mut fallback] {
 				match Self::authenticate_with_backend(backend).await {
 					Ok(oauth) => {
-						info!("[✅] Successfully created OAuth client with {}", backend.name());
+						info!("[✅] Successfully created OAuth client: lane={} backend={}", lane.label(), backend.name());
 						return oauth;
 					}
 					Err(error) => {
@@ -149,7 +163,11 @@ impl Oauth {
 	}
 
 	async fn authenticate_with_backend(backend: &mut OauthBackendImpl) -> Result<Self, AuthError> {
-		let response = timeout(OAUTH_TIMEOUT, backend.authenticate()).await.map_err(|_| AuthError::Timeout)??;
+		let oauth_timeout = match backend.lane() {
+			RedditLane::Direct => OAUTH_TIMEOUT,
+			RedditLane::Tor => TOR_OAUTH_TIMEOUT,
+		};
+		let response = timeout(oauth_timeout, backend.authenticate()).await.map_err(|_| AuthError::Timeout(oauth_timeout))??;
 
 		// Build headers_map from backend headers + Authorization header
 		let mut headers_map = backend.get_headers();
@@ -162,13 +180,14 @@ impl Oauth {
 			refresh_at,
 			backend: backend.clone(),
 			generation: 0,
+			lane: backend.lane(),
 		})
 	}
 
 	fn refresh_backend(&self, reason: RefreshReason, fallback: bool) -> (OauthBackendImpl, bool) {
 		match (reason, fallback) {
-			(RefreshReason::LowRateLimit, false) => (OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new()), true),
-			(RefreshReason::LowRateLimit, true) => (OauthBackendImpl::GenericWeb(GenericWebAuth::new()), true),
+			(RefreshReason::LowRateLimit, false) => (OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(self.lane)), true),
+			(RefreshReason::LowRateLimit, true) => (OauthBackendImpl::GenericWeb(GenericWebAuth::new(self.lane)), true),
 			(RefreshReason::Scheduled | RefreshReason::Unauthorized, false) => (self.backend.clone(), false),
 			(RefreshReason::Scheduled | RefreshReason::Unauthorized, true) => (self.backend.alternate(), true),
 		}
@@ -209,11 +228,12 @@ impl Oauth {
 
 #[derive(Debug)]
 enum AuthError {
+	Configuration(String),
 	Wreq(wreq::Error),
 	SerdeDeserialize(serde_json::Error),
 	Field(&'static str),
 	HttpStatus { status: u16, retry_after: Option<Duration> },
-	Timeout,
+	Timeout(Duration),
 }
 
 impl AuthError {
@@ -228,6 +248,7 @@ impl AuthError {
 impl fmt::Display for AuthError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
+			Self::Configuration(error) => write!(formatter, "transport configuration failed: {error}"),
 			Self::Wreq(error) => write!(formatter, "request failed: {error}"),
 			Self::SerdeDeserialize(error) => write!(formatter, "invalid response body: {error}"),
 			Self::Field(field) => write!(formatter, "OAuth response is missing or has an invalid {field} field"),
@@ -235,7 +256,7 @@ impl fmt::Display for AuthError {
 				Some(delay) => write!(formatter, "HTTP {status} (Retry-After {delay:?})"),
 				None => write!(formatter, "HTTP {status}"),
 			},
-			Self::Timeout => write!(formatter, "request timed out after {OAUTH_TIMEOUT:?}"),
+			Self::Timeout(duration) => write!(formatter, "request timed out after {duration:?}"),
 		}
 	}
 }
@@ -300,8 +321,33 @@ impl RefreshBackoff {
 	}
 }
 
-fn refresh_backoff() -> std::sync::MutexGuard<'static, RefreshBackoff> {
-	REFRESH_BACKOFF.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn refresh_backoff(lane: RedditLane) -> std::sync::MutexGuard<'static, RefreshBackoff> {
+	match lane {
+		RedditLane::Direct => DIRECT_REFRESH_BACKOFF.lock(),
+		RedditLane::Tor => TOR_REFRESH_BACKOFF.lock(),
+	}
+	.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn token_refresh_notify(lane: RedditLane) -> &'static Notify {
+	match lane {
+		RedditLane::Direct => &DIRECT_TOKEN_REFRESH_NOTIFY,
+		RedditLane::Tor => &TOR_TOKEN_REFRESH_NOTIFY,
+	}
+}
+
+fn active_quota_rotation(lane: RedditLane) -> &'static Mutex<Option<QuotaRotationTicket>> {
+	match lane {
+		RedditLane::Direct => &DIRECT_ACTIVE_QUOTA_ROTATION,
+		RedditLane::Tor => &TOR_ACTIVE_QUOTA_ROTATION,
+	}
+}
+
+fn rollover_flag(lane: RedditLane) -> &'static std::sync::atomic::AtomicBool {
+	match lane {
+		RedditLane::Direct => &OAUTH_IS_ROLLING_OVER,
+		RedditLane::Tor => &TOR_OAUTH_IS_ROLLING_OVER,
+	}
 }
 
 fn refresh_retry_delay(failure_count: u32, retry_after: Option<Duration>) -> Duration {
@@ -357,8 +403,8 @@ fn token_refresh_delay(expires_in: u64, early_by: u64) -> Duration {
 	Duration::from_secs(expires_in.saturating_sub(early_by.min(expires_in / 2)).max(1))
 }
 
-fn refresh_backoff_remaining() -> Option<Duration> {
-	refresh_backoff().retry_remaining(Instant::now())
+fn refresh_backoff_remaining(lane: RedditLane) -> Option<Duration> {
+	refresh_backoff(lane).retry_remaining(Instant::now())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -380,76 +426,82 @@ impl RefreshOutcome {
 }
 
 struct RolloverGuard {
+	lane: RedditLane,
 	quota_rotation: Option<QuotaRotationTicket>,
 }
 
 impl RolloverGuard {
-	fn acquire() -> Option<Self> {
-		OAUTH_IS_ROLLING_OVER
+	fn acquire(lane: RedditLane) -> Option<Self> {
+		rollover_flag(lane)
 			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
 			.ok()
-			.map(|_| Self { quota_rotation: None })
+			.map(|_| Self { lane, quota_rotation: None })
 	}
 
 	fn track_quota_rotation(&mut self, ticket: QuotaRotationTicket) {
 		self.quota_rotation = Some(ticket);
-		*ACTIVE_QUOTA_ROTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ticket);
+		*active_quota_rotation(self.lane).lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ticket);
 	}
 }
 
 impl Drop for RolloverGuard {
 	fn drop(&mut self) {
 		if self.quota_rotation.is_some() {
-			*ACTIVE_QUOTA_ROTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+			*active_quota_rotation(self.lane).lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 		}
-		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
+		rollover_flag(self.lane).store(false, Ordering::SeqCst);
 	}
 }
 
-pub(crate) fn quota_rotation_in_progress(generation: u64, quota_epoch: u64) -> bool {
-	ACTIVE_QUOTA_ROTATION
+pub(crate) fn quota_rotation_in_progress(lane: RedditLane, generation: u64, quota_epoch: u64) -> bool {
+	active_quota_rotation(lane)
 		.lock()
 		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.is_some_and(|ticket| ticket.generation == generation && ticket.quota_epoch == quota_epoch)
+		.is_some_and(|ticket| ticket.lane == lane && ticket.generation == generation && ticket.quota_epoch == quota_epoch)
 }
 
-pub async fn token_daemon() {
+pub(crate) async fn token_daemon(lane: RedditLane) {
 	loop {
-		let (duration, reason) = match refresh_backoff_remaining() {
+		let Some(current_client) = oauth_client(lane) else {
+			warn!("Stopping OAuth refresh daemon because the {} lane has no client", lane.label());
+			return;
+		};
+		let (duration, reason) = match refresh_backoff_remaining(lane) {
 			Some(duration) => (duration, "OAuth refresh retry"),
-			None => {
-				let refresh_at = OAUTH_CLIENT.load_full().refresh_at;
-				(refresh_at.checked_duration_since(Instant::now()).unwrap_or_default(), "scheduled OAuth refresh")
-			}
+			None => (
+				current_client.refresh_at.checked_duration_since(Instant::now()).unwrap_or_default(),
+				"scheduled OAuth refresh",
+			),
 		};
 
-		info!("[⏳] Waiting {duration:?} for {reason}");
+		info!("[⏳] Waiting {duration:?} for {reason}: lane={}", lane.label());
 		tokio::select! {
 			_ = tokio::time::sleep(duration) => {
-				if force_refresh_token(RefreshReason::Scheduled).await == RefreshOutcome::InProgress {
+				if force_refresh_token(lane, RefreshReason::Scheduled).await == RefreshOutcome::InProgress {
 					// Another request owns the refresh. Avoid a zero-delay loop while
 					// its replacement token is still being fetched.
 					tokio::time::sleep(OAUTH_TIMEOUT).await;
 				}
 			}
-			_ = TOKEN_REFRESH_NOTIFY.notified() => {
-				trace!("OAuth refresh schedule changed; recalculating");
+			_ = token_refresh_notify(lane).notified() => {
+				trace!("OAuth refresh schedule changed; recalculating: lane={}", lane.label());
 			}
 		}
 	}
 }
 
 pub(crate) fn spawn_rate_limit_refresh(ticket: QuotaRotationTicket) -> bool {
-	if refresh_backoff_remaining().is_some() {
+	let lane = ticket.lane;
+	if refresh_backoff_remaining(lane).is_some() {
 		return false;
 	}
 
-	let Some(mut rollover_guard) = RolloverGuard::acquire() else {
+	let Some(mut rollover_guard) = RolloverGuard::acquire(lane) else {
 		return false;
 	};
 	rollover_guard.track_quota_rotation(ticket);
 
-	if refresh_backoff_remaining().is_some() || OAUTH_CLIENT.load().generation != ticket.generation || !claim_quota_rotation(ticket) {
+	if refresh_backoff_remaining(lane).is_some() || !oauth_client(lane).is_some_and(|client| client.generation == ticket.generation) || !claim_quota_rotation(ticket) {
 		drop(rollover_guard);
 		return false;
 	}
@@ -460,29 +512,32 @@ pub(crate) fn spawn_rate_limit_refresh(ticket: QuotaRotationTicket) -> bool {
 	true
 }
 
-pub(crate) async fn force_refresh_token(reason: RefreshReason) -> RefreshOutcome {
-	if let Some(delay) = refresh_backoff_remaining() {
-		trace!("Skipping {} OAuth refresh during backoff ({delay:?} remaining)", reason.label());
+pub(crate) async fn force_refresh_token(lane: RedditLane, reason: RefreshReason) -> RefreshOutcome {
+	if let Some(delay) = refresh_backoff_remaining(lane) {
+		trace!("Skipping {} OAuth refresh during backoff ({delay:?} remaining): lane={}", reason.label(), lane.label());
 		return RefreshOutcome::BackingOff(delay);
 	}
 
-	let Some(rollover_guard) = RolloverGuard::acquire() else {
-		trace!("Skipping refresh token roll over, already in progress");
+	let Some(rollover_guard) = RolloverGuard::acquire(lane) else {
+		trace!("Skipping refresh token roll over, already in progress: lane={}", lane.label());
 		return RefreshOutcome::InProgress;
 	};
 
 	// The backoff may have started between the first check and acquiring the
 	// single-refresh guard.
-	if let Some(delay) = refresh_backoff_remaining() {
+	if let Some(delay) = refresh_backoff_remaining(lane) {
 		return RefreshOutcome::BackingOff(delay);
 	}
 
 	refresh_token_with_guard(reason, rollover_guard, None).await
 }
 
-async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: RolloverGuard, expected_rotation: Option<QuotaRotationTicket>) -> RefreshOutcome {
-	trace!("Refreshing OAuth token: reason={}", reason.label());
-	let current_client = OAUTH_CLIENT.load_full();
+async fn refresh_token_with_guard(reason: RefreshReason, rollover_guard: RolloverGuard, expected_rotation: Option<QuotaRotationTicket>) -> RefreshOutcome {
+	let lane = rollover_guard.lane;
+	trace!("Refreshing OAuth token: lane={} reason={}", lane.label(), reason.label());
+	let Some(current_client) = oauth_client(lane) else {
+		return RefreshOutcome::Superseded;
+	};
 	if let Some(ticket) = expected_rotation {
 		if current_client.generation != ticket.generation || !quota_rotation_still_needed(ticket) {
 			return RefreshOutcome::Superseded;
@@ -493,25 +548,27 @@ async fn refresh_token_with_guard(reason: RefreshReason, _rollover_guard: Rollov
 			refreshed.oauth.generation = current_client.generation.wrapping_add(1);
 			if !install_oauth_client(refreshed.oauth, refreshed.fresh_identity, expected_rotation) {
 				info!("Discarding completed low-budget OAuth refresh because the quota window recovered or changed");
-				refresh_backoff().record_success();
+				refresh_backoff(lane).record_success();
 				return RefreshOutcome::Superseded;
 			}
-			refresh_backoff().record_success();
-			TOKEN_REFRESH_NOTIFY.notify_waiters();
+			refresh_backoff(lane).record_success();
+			token_refresh_notify(lane).notify_waiters();
 			info!(
-				"[✅] OAuth token refreshed successfully: reason={} fresh_identity={}",
+				"[✅] OAuth token refreshed successfully: lane={} reason={} fresh_identity={}",
+				lane.label(),
 				reason.label(),
 				refreshed.fresh_identity
 			);
 			RefreshOutcome::Refreshed
 		}
 		Err(error) => {
-			let delay = refresh_backoff().record_failure(Instant::now(), error.retry_after());
+			let delay = refresh_backoff(lane).record_failure(Instant::now(), error.retry_after());
 			if reason != RefreshReason::LowRateLimit {
-				TOKEN_REFRESH_NOTIFY.notify_waiters();
+				token_refresh_notify(lane).notify_waiters();
 			}
 			error!(
-				"OAuth token refresh failed: reason={}; retaining the current client and retrying in {delay:?}: {error}",
+				"OAuth token refresh failed: lane={} reason={}; retaining the current client and retrying in {delay:?}: {error}",
+				lane.label(),
 				reason.label()
 			);
 			RefreshOutcome::Failed(delay)
@@ -530,13 +587,15 @@ struct Device {
 // MobileSpoofAuth backend - spoofs an Android mobile device
 #[derive(Debug, Clone)]
 pub struct MobileSpoofAuth {
+	lane: RedditLane,
 	device: Device,
 	additional_headers: HashMap<String, String>,
 }
 
 impl MobileSpoofAuth {
-	fn new() -> Self {
+	fn new(lane: RedditLane) -> Self {
 		Self {
+			lane,
 			device: Device::new(),
 			additional_headers: HashMap::new(),
 		}
@@ -546,9 +605,11 @@ impl MobileSpoofAuth {
 impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
-		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
-		record_oauth_send();
-		let mut builder = CLIENT.post(&url);
+		let origin = self.lane.auth_origin();
+		let url = format!("{}/auth/v2/oauth/access-token/loid", origin.base);
+		record_oauth_send(self.lane);
+		let mut builder = client_for_lane(self.lane).map_err(AuthError::Configuration)?.post(&url);
+		builder = builder.header("Host", origin.host);
 
 		// Add headers from spoofed client
 		for (key, value) in &self.device.initial_headers {
@@ -648,13 +709,14 @@ impl OauthBackend for MobileSpoofAuth {
 // GenericWebAuth backend - simple web-based authentication
 #[derive(Debug, Clone)]
 pub struct GenericWebAuth {
+	lane: RedditLane,
 	device_id: String,
 	user_agent: String,
 	additional_headers: HashMap<String, String>,
 }
 
 impl GenericWebAuth {
-	fn new() -> Self {
+	fn new(lane: RedditLane) -> Self {
 		// Generate random 20-character alphanumeric device_id
 		let device_id: String = (0..20)
 			.map(|_| {
@@ -667,6 +729,7 @@ impl GenericWebAuth {
 		info!("[🔄] Using GenericWebAuth");
 
 		Self {
+			lane,
 			device_id,
 			user_agent: fake_user_agent::get_rua().to_owned(),
 			additional_headers: HashMap::new(),
@@ -677,12 +740,13 @@ impl GenericWebAuth {
 impl OauthBackend for GenericWebAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
-		let url = "https://www.reddit.com/api/v1/access_token";
-		record_oauth_send();
-		let mut builder = CLIENT.post(url);
+		let origin = self.lane.auth_origin();
+		let url = format!("{}/api/v1/access_token", origin.base);
+		record_oauth_send(self.lane);
+		let mut builder = client_for_lane(self.lane).map_err(AuthError::Configuration)?.post(&url);
 
 		// Add minimal headers
-		builder = builder.header("Host", "www.reddit.com");
+		builder = builder.header("Host", origin.host);
 		builder = builder.header("User-Agent", &self.user_agent);
 		builder = builder.header("Accept", "*/*");
 		builder = builder.header("Accept-Language", "en-US,en;q=0.5");
@@ -757,7 +821,7 @@ impl OauthBackend for GenericWebAuth {
 		info!("[✅] GenericWebAuth retrieved an OAuth token that expires in {expires_in} seconds");
 
 		// Insert a few necessary headers
-		self.additional_headers.insert("Origin".to_owned(), "https://www.reddit.com".to_owned());
+		self.additional_headers.insert("Origin".to_owned(), origin.base.to_owned());
 		self.additional_headers.insert("User-Agent".to_owned(), self.user_agent.to_owned());
 
 		Ok(OauthResponse {
@@ -827,11 +891,12 @@ fn choose<T: Copy>(list: &[T]) -> T {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::client::OAUTH_CLIENT;
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_mobile_spoof_backend() {
 		// Test MobileSpoofAuth backend specifically
-		let mut backend = MobileSpoofAuth::new();
+		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
 		let response = backend.authenticate().await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
@@ -845,7 +910,7 @@ mod tests {
 	#[ignore = "requires live Reddit GenericWeb OAuth access"]
 	async fn test_generic_web_backend() {
 		// Test GenericWebAuth backend specifically
-		let mut backend = GenericWebAuth::new();
+		let mut backend = GenericWebAuth::new(RedditLane::Direct);
 		let response = backend.authenticate().await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
@@ -862,7 +927,7 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_oauth_client_refresh() {
-		force_refresh_token(RefreshReason::Scheduled).await;
+		force_refresh_token(RedditLane::Direct, RefreshReason::Scheduled).await;
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -885,8 +950,8 @@ mod tests {
 	#[test]
 	fn test_creating_backends() {
 		// Test that both backends can be created
-		MobileSpoofAuth::new();
-		GenericWebAuth::new();
+		MobileSpoofAuth::new(RedditLane::Direct);
+		GenericWebAuth::new(RedditLane::Direct);
 	}
 
 	#[test]
@@ -902,20 +967,22 @@ mod tests {
 	#[test]
 	fn test_active_quota_rotation_matches_generation_and_epoch() {
 		let ticket = QuotaRotationTicket {
+			lane: RedditLane::Direct,
 			generation: 12,
 			quota_epoch: 34,
 			mode: crate::client::QuotaRotationMode::Emergency,
 		};
 		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 		{
-			let mut rollover_guard = RolloverGuard::acquire().unwrap();
+			let mut rollover_guard = RolloverGuard::acquire(RedditLane::Direct).unwrap();
 			rollover_guard.track_quota_rotation(ticket);
 			assert!(OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst));
-			assert!(quota_rotation_in_progress(12, 34));
-			assert!(!quota_rotation_in_progress(11, 34));
-			assert!(!quota_rotation_in_progress(12, 35));
+			assert!(quota_rotation_in_progress(RedditLane::Direct, 12, 34));
+			assert!(!quota_rotation_in_progress(RedditLane::Direct, 11, 34));
+			assert!(!quota_rotation_in_progress(RedditLane::Direct, 12, 35));
+			assert!(!quota_rotation_in_progress(RedditLane::Tor, 12, 34));
 		}
-		assert!(!quota_rotation_in_progress(12, 34));
+		assert!(!quota_rotation_in_progress(RedditLane::Direct, 12, 34));
 		assert!(!OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst));
 	}
 
@@ -953,7 +1020,7 @@ mod tests {
 
 	#[test]
 	fn test_refresh_reason_selects_stable_or_fresh_identity() {
-		let original_backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		let original_backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
 		let original_device_id = match &original_backend {
 			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
 			OauthBackendImpl::GenericWeb(_) => unreachable!(),
@@ -963,6 +1030,7 @@ mod tests {
 			refresh_at: Instant::now() + Duration::from_secs(3480),
 			backend: original_backend,
 			generation: 4,
+			lane: RedditLane::Direct,
 		};
 		assert_eq!(oauth.clone().refresh_at, oauth.refresh_at);
 
@@ -989,7 +1057,7 @@ mod tests {
 
 	#[test]
 	fn test_alternate_backend_changes_kind() {
-		let mobile = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		let mobile = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
 		let generic = mobile.alternate();
 		assert!(matches!(generic, OauthBackendImpl::GenericWeb(_)));
 		assert!(matches!(generic.alternate(), OauthBackendImpl::MobileSpoof(_)));

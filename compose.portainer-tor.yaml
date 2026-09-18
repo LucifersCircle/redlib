@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+  redlib1:
+    image: docker.io/luciferscircle/redlib:latest
+    container_name: redlib1
+    restart: always
+    networks:
+      - cloudflare_tunnel
+      - tor_private
+    env_file:
+      - stack.env
+    depends_on:
+      - tor
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+  tor:
+    image: docker.io/dockurr/tor:0.4.9.12@sha256:03194e6f7358093873c210704b3b5ca1bf5c09ffb1ae71a4a539fb1464aafa50
+    container_name: redlib-tor
+    restart: always
+    environment:
+      CHECK: "false"
+      DEBUG: "false"
+      PASSWORD: "redlib-tor-healthcheck"
+    networks:
+      # Keep the egress network first so Tor, rather than the internal-only
+      # Redlib link, owns the sidecar's default route.
+      - tor_egress
+      - tor_private
+    volumes:
+      - tor_data:/var/lib/tor
+    tmpfs:
+      - /run/tor:rw,noexec,nosuid,nodev
+      - /tmp:rw,noexec,nosuid,nodev
+    expose:
+      - "9050"
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  cloudflare_tunnel:
+    external: true
+  tor_private:
+    internal: true
+  tor_egress:
+
+volumes:
+  tor_data:
