@@ -400,11 +400,7 @@ impl QuotaGovernor {
 	}
 
 	fn continue_headerless_discovery_after_redirect(&mut self, now: Instant, attempt: &UpstreamAttempt) {
-		if attempt.discovery_probe
-			&& attempt.generation == self.generation
-			&& attempt.quota_epoch == self.epoch
-			&& matches!(self.window, QuotaWindow::Unknown { .. })
-		{
+		if attempt.discovery_probe && attempt.generation == self.generation && attempt.quota_epoch == self.epoch && matches!(self.window, QuotaWindow::Unknown { .. }) {
 			// The redirect response is accounted for, but it is not evidence that
 			// the final JSON endpoint omits quota headers. Keep the discovery chain
 			// exclusive and let its next hop inherit probe ownership immediately.
@@ -1328,12 +1324,7 @@ fn confirm_headerless_quota(attempt: &UpstreamAttempt) {
 	upstream_guard(attempt.lane).quota.confirm_headerless_success(attempt);
 }
 
-fn reserve_redirect_hop(
-	attempt: &mut UpstreamAttempt,
-	generation: u64,
-	remaining: Option<u16>,
-	reset: Option<Duration>,
-) -> Result<(), ApiRequestError> {
+fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remaining: Option<u16>, reset: Option<Duration>) -> Result<(), ApiRequestError> {
 	let now = Instant::now();
 	let mut guard = upstream_guard(attempt.lane);
 	let continue_headerless_discovery = attempt.discovery_probe && remaining.is_none() && reset.is_none();
