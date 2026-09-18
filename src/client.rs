@@ -2452,10 +2452,7 @@ mod tests {
 		guard.quota = quota;
 		guard.quota_rotation_armed = true;
 		assert_eq!(guard.quota_rotation_candidate(now, 3, QuotaRotationMode::Proactive), None);
-		assert_eq!(
-			guard.take_short_reset_notice(now, 3),
-			Some((LOW_RATE_LIMIT_THRESHOLD - 1, Duration::from_secs(5)))
-		);
+		assert_eq!(guard.take_short_reset_notice(now, 3), Some((LOW_RATE_LIMIT_THRESHOLD - 1, Duration::from_secs(5))));
 
 		let after_old_boundary = old_reset + RATE_LIMIT_COOLDOWN_MARGIN;
 		let (quota_epoch, request_id, discovery_probe) = guard.quota.reserve(after_old_boundary, 3).unwrap();
@@ -2471,13 +2468,9 @@ mod tests {
 			quota_reconciled: true,
 			completed: true,
 		};
-		assert!(guard.quota.reconcile(
-			after_old_boundary,
-			&discovery_attempt,
-			Some(81),
-			Some(Duration::from_secs(565)),
-			false,
-		));
+		assert!(guard
+			.quota
+			.reconcile(after_old_boundary, &discovery_attempt, Some(81), Some(Duration::from_secs(565)), false,));
 		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 80, .. }));
 
 		let late_old_attempt = UpstreamAttempt {
