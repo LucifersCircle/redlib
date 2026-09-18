@@ -1,8 +1,5 @@
 use crate::{
-	client::{
-		claim_quota_rotation, install_oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, CLIENT, OAUTH_CLIENT,
-		OAUTH_IS_ROLLING_OVER,
-	},
+	client::{claim_quota_rotation, install_oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	timing::{positive_jitter, proportional_positive_jitter},
 };
