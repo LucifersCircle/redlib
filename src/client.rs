@@ -914,10 +914,7 @@ enum ThrottleKind {
 
 #[derive(Debug)]
 enum ApiRequestError {
-	Deferred {
-		message: String,
-		edge_rejected: bool,
-	},
+	Deferred { message: String, edge_rejected: bool },
 	Upstream(String),
 }
 
@@ -1388,11 +1385,7 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 				));
 			}
 			return Err(ApiRequestError::deferred(
-				format!(
-					"{}. Retry in {} seconds",
-					CooldownReason::RateLimit.message(),
-					retry_after_seconds(delay)
-				),
+				format!("{}. Retry in {} seconds", CooldownReason::RateLimit.message(), retry_after_seconds(delay)),
 				CooldownReason::RateLimit,
 			));
 		}
@@ -3172,18 +3165,9 @@ mod tests {
 	#[test]
 	fn test_only_edge_redirect_deferrals_qualify_for_tor_retry() {
 		let deferred = |reason| ApiRequestError::deferred("deferred".to_string(), reason);
-		assert!(matches!(
-			deferred(CooldownReason::EdgeThrottle),
-			ApiRequestError::Deferred { edge_rejected: true, .. }
-		));
-		assert!(matches!(
-			deferred(CooldownReason::RateLimit),
-			ApiRequestError::Deferred { edge_rejected: false, .. }
-		));
-		assert!(matches!(
-			deferred(CooldownReason::UpstreamFailures),
-			ApiRequestError::Deferred { edge_rejected: false, .. }
-		));
+		assert!(matches!(deferred(CooldownReason::EdgeThrottle), ApiRequestError::Deferred { edge_rejected: true, .. }));
+		assert!(matches!(deferred(CooldownReason::RateLimit), ApiRequestError::Deferred { edge_rejected: false, .. }));
+		assert!(matches!(deferred(CooldownReason::UpstreamFailures), ApiRequestError::Deferred { edge_rejected: false, .. }));
 	}
 
 	#[test]
