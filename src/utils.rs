@@ -1606,8 +1606,8 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::{
-		deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after, url_path_basename, Media,
-		Post, Preferences,
+		deflate_compress, deflate_decompress, format_num, format_url, is_reddit_image_domain, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after,
+		url_path_basename, Media, Post, Preferences,
 	};
 
 	#[test]
