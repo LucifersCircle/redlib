@@ -78,6 +78,12 @@ jobs:
           cargo test --locked --lib test_json_cache_policy_is_narrow
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib temporary_errors_use_service_unavailable_retry_metadata
+          cargo test --locked --lib rewrite_urls_rewrites_reddit_onion_content
+          cargo test --locked --lib rewrite_urls_preserves_distinct_onion_static_paths
+          cargo test --locked --lib rewrite_urls_rewrites_onion_previews_but_not_deceptive_hosts
+          cargo test --locked --lib test_format_url_rewrites_reddit_onion_media
+          cargo test --locked --lib test_format_url_leaves_unknown_onion_hosts_untouched
+          cargo test --locked --lib reddit_onion_image_domain_is_classified_as_an_image
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
           cargo test --locked --lib test_comment_search_parameters_stay_local
           cargo test --locked --lib test_non_comment_query_is_preserved
