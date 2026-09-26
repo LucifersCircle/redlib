@@ -1202,7 +1202,7 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		if formatted_url == reddit_static_url {
 			break;
 		}
-		text1 = REDDIT_EMOJI_REGEX.replace_all(&text1, formatted_url).to_string();
+		text1 = REDDIT_EMOJI_REGEX.replace(&text1, formatted_url.as_str()).to_string();
 	}
 
 	// Remove (html-encoded) "\" from URLs.
@@ -1661,6 +1661,16 @@ mod tests {
 				"<a href=\"https://www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/r/rust/\">Rust</a> <img src=\"https://www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion/icon.png\">"
 			),
 			"<a href=\"/r/rust/\">Rust</a> <img src=\"/static/icon.png\">"
+		);
+	}
+
+	#[test]
+	fn rewrite_urls_preserves_distinct_onion_static_paths() {
+		assert_eq!(
+			rewrite_urls(
+				"<img src=\"https://www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion/one.png\">\n<img src=\"https://www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion/two.png\">"
+			),
+			"<img src=\"/static/one.png\">\n<img src=\"/static/two.png\">"
 		);
 	}
 
