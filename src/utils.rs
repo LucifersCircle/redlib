@@ -267,7 +267,7 @@ impl Media {
 				("gif", &mp4["source"]["url"], None)
 			} else {
 				// Return the picture if the media is an image
-				if data["domain"] == "i.redd.it" {
+				if is_reddit_image_domain(data["domain"].as_str().unwrap_or_default()) {
 					("image", &data["url"], None)
 				} else {
 					("image", &preview["source"]["url"], None)
@@ -289,7 +289,9 @@ impl Media {
 			);
 
 			("gallery", &data["url"], None)
-		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default() && data["domain"] == "i.redd.it" {
+		} else if data["is_reddit_media_domain"].as_bool().unwrap_or_default()
+			&& is_reddit_image_domain(data["domain"].as_str().unwrap_or_default())
+		{
 			// If this post contains a reddit media (image) URL.
 			("image", &data["url"], None)
 		} else {
@@ -1066,6 +1068,37 @@ static REGEX_URL_EXTERNAL_PREVIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new
 static REGEX_URL_STYLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://styles\.redditmedia\.com/(.*)").unwrap());
 static REGEX_URL_STATIC_MEDIA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://www\.redditstatic\.com/(.*)").unwrap());
 
+const REDDIT_ONION_HOST_ALIASES: [(&str, &str); 15] = [
+	("reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "reddit.com"),
+	("www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "www.reddit.com"),
+	("old.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "old.reddit.com"),
+	("np.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "np.reddit.com"),
+	("oauth.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "reddit.com"),
+	("i.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "i.redd.it"),
+	("v.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion", "v.redd.it"),
+	("i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion", "i.redd.it"),
+	("v.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion", "v.redd.it"),
+	("preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion", "preview.redd.it"),
+	("external-preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion", "external-preview.redd.it"),
+	("a.thumbs.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion", "a.thumbs.redditmedia.com"),
+	("b.thumbs.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion", "b.thumbs.redditmedia.com"),
+	("emoji.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion", "emoji.redditmedia.com"),
+	("styles.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion", "styles.redditmedia.com"),
+];
+
+const REDDIT_STATIC_ONION_HOST: &str = "www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion";
+
+fn canonical_reddit_onion_host(domain: &str) -> Option<&'static str> {
+	REDDIT_ONION_HOST_ALIASES
+		.iter()
+		.find_map(|(onion, canonical)| (*onion == domain).then_some(*canonical))
+		.or_else(|| (domain == REDDIT_STATIC_ONION_HOST).then_some("www.redditstatic.com"))
+}
+
+fn is_reddit_image_domain(domain: &str) -> bool {
+	domain == "i.redd.it" || canonical_reddit_onion_host(domain).is_some_and(|canonical| canonical == "i.redd.it")
+}
+
 /// Direct urls to proxy if proxy is enabled
 pub fn format_url(url: &str) -> String {
 	if url.is_empty() || url == "self" || url == "default" || url == "nsfw" || url == "spoiler" {
@@ -1073,6 +1106,13 @@ pub fn format_url(url: &str) -> String {
 	} else {
 		Url::parse(url).map_or(url.to_string(), |parsed| {
 			let domain = parsed.domain().unwrap_or_default();
+			if let Some(canonical_host) = canonical_reddit_onion_host(domain) {
+				let onion_authority = format!("://{domain}");
+				if url.contains(&onion_authority) {
+					let canonical = url.replacen(&onion_authority, &format!("://{canonical_host}"), 1);
+					return format_url(&canonical);
+				}
+			}
 
 			let capture = |regex: &Regex, format: &str, segments: i16| {
 				regex.captures(url).map_or(String::new(), |caps| match segments {
@@ -1136,9 +1176,18 @@ pub fn render_bullet_lists(input_text: &str) -> String {
 }
 
 // These are links we want to replace in-body
-static REDDIT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|)(reddit\.com|redd\.it)/"#).unwrap());
-static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(external-preview|preview|i)\.redd\.it(.*)").unwrap());
-static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://(www|).redditstatic\.com/(.*)").unwrap());
+static REDDIT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(
+		r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|new\.|oauth\.|)(reddit\.com|redd\.it|reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad\.onion)/"#,
+	)
+	.unwrap()
+});
+static REDDIT_PREVIEW_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"https?://(external-preview|preview|i)\.(?:redd\.it|redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd\.onion)(/.*)").unwrap()
+});
+static REDDIT_EMOJI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"https?://www\.(?:redditstatic\.com|reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd\.onion)/(.*)").unwrap()
+});
 static REDLIB_PREVIEW_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/(img|preview/)(pre|external-pre)?/(.*?)>"#).unwrap());
 static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">(.*?)</a>").unwrap());
 
@@ -1149,13 +1198,14 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		REDDIT_REGEX.replace_all(input_text, r#"href="/"#).to_string();
 
 	loop {
-		if REDDIT_EMOJI_REGEX.find(&text1).is_none() {
+		let Some(reddit_static_url) = REDDIT_EMOJI_REGEX.find(&text1).map(|matched| matched.as_str()) else {
 			break;
-		} else {
-			text1 = REDDIT_EMOJI_REGEX
-				.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
-				.to_string()
+		};
+		let formatted_url = format_url(reddit_static_url);
+		if formatted_url == reddit_static_url {
+			break;
 		}
+		text1 = REDDIT_EMOJI_REGEX.replace_all(&text1, formatted_url).to_string();
 	}
 
 	// Remove (html-encoded) "\" from URLs.
@@ -1166,7 +1216,11 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		if REDDIT_PREVIEW_REGEX.find(&text1).is_none() {
 			return text1;
 		} else {
-			let formatted_url = format_url(REDDIT_PREVIEW_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default());
+			let reddit_preview_url = REDDIT_PREVIEW_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default();
+			let formatted_url = format_url(reddit_preview_url);
+			if formatted_url == reddit_preview_url {
+				return text1;
+			}
 
 			let image_url = REDLIB_PREVIEW_LINK_REGEX.find(&formatted_url).map_or("", |m| m.as_str());
 			let mut image_caption = REDLIB_PREVIEW_TEXT_REGEX.find(&formatted_url).map_or("", |m| m.as_str());
@@ -1604,6 +1658,32 @@ mod tests {
 	}
 
 	#[test]
+	fn rewrite_urls_rewrites_reddit_onion_content() {
+		assert_eq!(
+			rewrite_urls(
+				"<a href=\"https://www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/r/rust/\">Rust</a> <img src=\"https://www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion/icon.png\">"
+			),
+			"<a href=\"/r/rust/\">Rust</a> <img src=\"/static/icon.png\">"
+		);
+	}
+
+	#[test]
+	fn rewrite_urls_rewrites_onion_previews_but_not_deceptive_hosts() {
+		let onion_preview =
+			"<p><a href=\"https://preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/foo.jpg?width=640&amp;s=bar\">caption</a></p>";
+		let rewritten = rewrite_urls(onion_preview);
+		assert!(rewritten.contains("/preview/pre/foo.jpg?width=640&amp;s=bar"));
+		assert!(!rewritten.contains(".onion"));
+
+		let deceptive =
+			"<a href=\"https://preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion.example.com/foo.jpg\">example</a>";
+		assert_eq!(rewrite_urls(deceptive), deceptive);
+
+		let bare_static = "<img src=\"https://redditstatic.com/icon.png\">";
+		assert_eq!(rewrite_urls(bare_static), bare_static);
+	}
+
+	#[test]
 	fn test_format_url() {
 		assert_eq!(format_url("https://a.thumbs.redditmedia.com/XYZ.jpg"), "/thumb/a/XYZ.jpg");
 		assert_eq!(format_url("https://emoji.redditmedia.com/a/b"), "/emoji/a/b");
@@ -1635,6 +1715,76 @@ mod tests {
 		assert_eq!(format_url("default"), "");
 		assert_eq!(format_url("nsfw"), "");
 		assert_eq!(format_url("spoiler"), "");
+	}
+
+	#[test]
+	fn test_format_url_rewrites_reddit_onion_media() {
+		let cases = [
+			(
+				"https://i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/foobar.jpg",
+				"/img/foobar.jpg",
+			),
+			(
+				"https://v.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/foo/DASH_360.mp4?source=fallback",
+				"/vid/foo/dash/360.mp4",
+			),
+			(
+				"https://v.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/foo/CMAF_720.mp4?source=fallback",
+				"/vid/foo/cmaf/720.mp4",
+			),
+			(
+				"https://v.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd",
+				"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd",
+			),
+			(
+				"https://preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/qwerty.jpg?auto=webp&s=asdf",
+				"/preview/pre/qwerty.jpg?auto=webp&s=asdf",
+			),
+			(
+				"https://external-preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/foo.jpg?auto=webp&s=bar",
+				"/preview/external-pre/foo.jpg?auto=webp&s=bar",
+			),
+			(
+				"https://a.thumbs.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion/XYZ.jpg",
+				"/thumb/a/XYZ.jpg",
+			),
+			(
+				"https://b.thumbs.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion/XYZ.jpg",
+				"/thumb/b/XYZ.jpg",
+			),
+			(
+				"https://emoji.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion/a/b",
+				"/emoji/a/b",
+			),
+			(
+				"https://styles.reddit4hkhcpcf2mkmuotdlk3gknuzcatsw4f7dx7twdkwmtrt6ax4qd.onion/t5_test/styles/communityIcon.png",
+				"/style/t5_test/styles/communityIcon.png",
+			),
+			(
+				"https://www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion/gold/awards/icon/icon.png",
+				"/static/gold/awards/icon/icon.png",
+			),
+		];
+
+		for (onion, expected) in cases {
+			assert_eq!(format_url(onion), expected);
+		}
+	}
+
+	#[test]
+	fn test_format_url_leaves_unknown_onion_hosts_untouched() {
+		let unknown = "https://i.not-redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/image.jpg";
+		assert_eq!(format_url(unknown), unknown);
+	}
+
+	#[test]
+	fn reddit_onion_image_domain_is_classified_as_an_image() {
+		assert!(is_reddit_image_domain(
+			"i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion"
+		));
+		assert!(!is_reddit_image_domain(
+			"i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion.example.com"
+		));
 	}
 
 	#[test]
