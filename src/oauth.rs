@@ -1,7 +1,7 @@
 use crate::{
 	client::{
-		claim_quota_rotation, client_for_lane, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket, OAUTH_IS_ROLLING_OVER,
-		TOR_OAUTH_IS_ROLLING_OVER,
+		claim_quota_rotation, client_for_new_identity, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket,
+		OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::RedditLane,
@@ -10,7 +10,7 @@ use crate::{
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, trace, warn};
 use serde_json::json;
-use std::{collections::HashMap, fmt, sync::atomic::Ordering, sync::LazyLock, sync::Mutex, time::Duration, time::Instant, time::SystemTime};
+use std::{collections::HashMap, fmt, sync::atomic::Ordering, sync::Arc, sync::LazyLock, sync::Mutex, time::Duration, time::Instant, time::SystemTime};
 use tegen::tegen::TextGenerator;
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -58,7 +58,7 @@ pub struct OauthResponse {
 
 // Trait for OAuth backend implementations
 trait OauthBackend: Send + Sync {
-	fn authenticate(&mut self) -> impl std::future::Future<Output = Result<OauthResponse, AuthError>> + Send;
+	fn authenticate(&mut self, client: &wreq::Client) -> impl std::future::Future<Output = Result<OauthResponse, AuthError>> + Send;
 	fn user_agent(&self) -> &str;
 	fn get_headers(&self) -> HashMap<String, String>;
 }
@@ -71,10 +71,10 @@ pub(crate) enum OauthBackendImpl {
 }
 
 impl OauthBackend for OauthBackendImpl {
-	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
+	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
 		match self {
-			OauthBackendImpl::MobileSpoof(backend) => backend.authenticate().await,
-			OauthBackendImpl::GenericWeb(backend) => backend.authenticate().await,
+			OauthBackendImpl::MobileSpoof(backend) => backend.authenticate(client).await,
+			OauthBackendImpl::GenericWeb(backend) => backend.authenticate(client).await,
 		}
 	}
 
@@ -117,9 +117,10 @@ impl OauthBackendImpl {
 }
 
 // Spoofed client for Android devices
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
+	pub(crate) http_client: Arc<wreq::Client>,
 	refresh_at: Instant,
 	pub(crate) backend: OauthBackendImpl,
 	pub(crate) generation: u64,
@@ -139,11 +140,13 @@ impl Oauth {
 		let mut primary = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
 		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new(lane));
 		let mut failure_count = 0_u32;
+		let primary_http_client = client_for_new_identity(lane).unwrap_or_else(|error| panic!("Could not build {} Reddit client: {error}", lane.label()));
+		let fallback_http_client = client_for_new_identity(lane).unwrap_or_else(|error| panic!("Could not build {} Reddit fallback client: {error}", lane.label()));
 
 		loop {
 			let mut retry_after = None;
-			for backend in [&mut primary, &mut fallback] {
-				match Self::authenticate_with_backend(backend).await {
+			for (backend, http_client) in [(&mut primary, primary_http_client.clone()), (&mut fallback, fallback_http_client.clone())] {
+				match Self::authenticate_with_backend(backend, http_client).await {
 					Ok(oauth) => {
 						info!("[✅] Successfully created OAuth client: lane={} backend={}", lane.label(), backend.name());
 						return oauth;
@@ -162,12 +165,14 @@ impl Oauth {
 		}
 	}
 
-	async fn authenticate_with_backend(backend: &mut OauthBackendImpl) -> Result<Self, AuthError> {
+	async fn authenticate_with_backend(backend: &mut OauthBackendImpl, http_client: Arc<wreq::Client>) -> Result<Self, AuthError> {
 		let oauth_timeout = match backend.lane() {
 			RedditLane::Direct => OAUTH_TIMEOUT,
 			RedditLane::Tor => TOR_OAUTH_TIMEOUT,
 		};
-		let response = timeout(oauth_timeout, backend.authenticate()).await.map_err(|_| AuthError::Timeout(oauth_timeout))??;
+		let response = timeout(oauth_timeout, backend.authenticate(&http_client))
+			.await
+			.map_err(|_| AuthError::Timeout(oauth_timeout))??;
 
 		// Build headers_map from backend headers + Authorization header
 		let mut headers_map = backend.get_headers();
@@ -177,6 +182,7 @@ impl Oauth {
 		let refresh_at = Instant::now() + sampled_token_refresh_delay(response.expires_in);
 		Ok(Self {
 			headers_map,
+			http_client,
 			refresh_at,
 			backend: backend.clone(),
 			generation: 0,
@@ -196,7 +202,10 @@ impl Oauth {
 	async fn refreshed(&self, reason: RefreshReason) -> Result<RefreshedOauth, RefreshError> {
 		let (mut primary, primary_is_fresh) = self.refresh_backend(reason, false);
 		let primary_name = primary.name();
-		match Self::authenticate_with_backend(&mut primary).await {
+		let primary_http_client = self
+			.http_client_for_refresh(primary_is_fresh)
+			.map_err(|error| RefreshError::configuration(primary_name, error))?;
+		match Self::authenticate_with_backend(&mut primary, primary_http_client).await {
 			Ok(oauth) => Ok(RefreshedOauth {
 				oauth,
 				fresh_identity: primary_is_fresh,
@@ -205,7 +214,18 @@ impl Oauth {
 				warn!("OAuth {} refresh with {primary_name} failed: {primary_error}", reason.label());
 				let (mut fallback, fallback_is_fresh) = self.refresh_backend(reason, true);
 				let fallback_name = fallback.name();
-				match Self::authenticate_with_backend(&mut fallback).await {
+				let fallback_http_client = match self.http_client_for_refresh(fallback_is_fresh) {
+					Ok(client) => client,
+					Err(error) => {
+						return Err(RefreshError {
+							primary_name,
+							primary_error,
+							fallback_name,
+							fallback_error: AuthError::Configuration(error),
+						});
+					}
+				};
+				match Self::authenticate_with_backend(&mut fallback, fallback_http_client).await {
 					Ok(oauth) => Ok(RefreshedOauth {
 						oauth,
 						fresh_identity: fallback_is_fresh,
@@ -221,9 +241,21 @@ impl Oauth {
 		}
 	}
 
+	fn http_client_for_refresh(&self, fresh_identity: bool) -> Result<Arc<wreq::Client>, String> {
+		if needs_isolated_transport(self.lane, fresh_identity) {
+			client_for_new_identity(self.lane)
+		} else {
+			Ok(self.http_client.clone())
+		}
+	}
+
 	pub fn user_agent(&self) -> &str {
 		self.backend.user_agent()
 	}
+}
+
+fn needs_isolated_transport(lane: RedditLane, fresh_identity: bool) -> bool {
+	lane == RedditLane::Tor && fresh_identity
 }
 
 #[derive(Debug)]
@@ -270,6 +302,15 @@ struct RefreshError {
 }
 
 impl RefreshError {
+	fn configuration(backend_name: &'static str, error: String) -> Self {
+		Self {
+			primary_name: backend_name,
+			primary_error: AuthError::Configuration(error),
+			fallback_name: "Tor transport",
+			fallback_error: AuthError::Configuration("no isolated client was available".to_string()),
+		}
+	}
+
 	fn retry_after(&self) -> Option<Duration> {
 		max_duration(self.primary_error.retry_after(), self.fallback_error.retry_after())
 	}
@@ -603,12 +644,12 @@ impl MobileSpoofAuth {
 }
 
 impl OauthBackend for MobileSpoofAuth {
-	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
+	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let origin = self.lane.auth_origin();
 		let url = format!("{}/auth/v2/oauth/access-token/loid", origin.base);
 		record_oauth_send(self.lane);
-		let mut builder = client_for_lane(self.lane).map_err(AuthError::Configuration)?.post(&url);
+		let mut builder = client.post(&url);
 		builder = builder.header("Host", origin.host);
 
 		// Add headers from spoofed client
@@ -738,12 +779,12 @@ impl GenericWebAuth {
 }
 
 impl OauthBackend for GenericWebAuth {
-	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
+	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let origin = self.lane.auth_origin();
 		let url = format!("{}/api/v1/access_token", origin.base);
 		record_oauth_send(self.lane);
-		let mut builder = client_for_lane(self.lane).map_err(AuthError::Configuration)?.post(&url);
+		let mut builder = client.post(&url);
 
 		// Add minimal headers
 		builder = builder.header("Host", origin.host);
@@ -897,7 +938,7 @@ mod tests {
 	async fn test_mobile_spoof_backend() {
 		// Test MobileSpoofAuth backend specifically
 		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
-		let response = backend.authenticate().await;
+		let response = backend.authenticate(crate::client::CLIENT.as_ref()).await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
 		assert!(!response.token.is_empty());
@@ -911,7 +952,7 @@ mod tests {
 	async fn test_generic_web_backend() {
 		// Test GenericWebAuth backend specifically
 		let mut backend = GenericWebAuth::new(RedditLane::Direct);
-		let response = backend.authenticate().await;
+		let response = backend.authenticate(crate::client::CLIENT.as_ref()).await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
 		assert!(!response.token.is_empty());
@@ -1019,6 +1060,14 @@ mod tests {
 	}
 
 	#[test]
+	fn only_fresh_tor_identities_require_new_transport_isolation() {
+		assert!(needs_isolated_transport(RedditLane::Tor, true));
+		assert!(!needs_isolated_transport(RedditLane::Tor, false));
+		assert!(!needs_isolated_transport(RedditLane::Direct, true));
+		assert!(!needs_isolated_transport(RedditLane::Direct, false));
+	}
+
+	#[test]
 	fn test_refresh_reason_selects_stable_or_fresh_identity() {
 		let original_backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
 		let original_device_id = match &original_backend {
@@ -1027,6 +1076,7 @@ mod tests {
 		};
 		let oauth = Oauth {
 			headers_map: HashMap::new(),
+			http_client: crate::client::CLIENT.clone(),
 			refresh_at: Instant::now() + Duration::from_secs(3480),
 			backend: original_backend,
 			generation: 4,

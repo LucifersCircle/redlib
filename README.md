@@ -212,6 +212,8 @@ The fallback is disabled by default. For the supplied Portainer stack:
 
 The Tor sidecar has its own outbound network because Tor must reach the public Tor network. Redlib connects to it only over the internal `tor_private` network. Startup of the direct lane does not wait for Tor; the fallback becomes eligible after its separate OAuth identity is ready. If Tor is unavailable, Redlib retains the direct circuit's cooldown rather than sending onion hostnames outside the configured SOCKS proxy. This first version is API failover after normal startup: the process still requires direct OAuth to initialize before it starts serving requests.
 
+Each fresh Tor OAuth identity uses unique SOCKS username/password isolation credentials and keeps that isolated HTTP transport for its lifetime. C Tor enables `IsolateSOCKSAuth` by default; a custom Tor configuration must not disable it with `NoIsolateSOCKSAuth`. This prevents a replacement OAuth identity from silently reusing the previous identity's Tor circuit group while allowing in-flight requests to finish with their original matching token and transport.
+
 ### Docker CLI
 
 Deploy Redlib:
