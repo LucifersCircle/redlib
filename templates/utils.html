@@ -67,7 +67,7 @@
 <div class="gallery feed_gallery adaptive_gallery adaptive_gallery_{{ mode }}" data-gallery data-gallery-mode="{{ mode }}">
 	<div class="feed_gallery_viewport" data-gallery-viewport>
 		<div class="feed_gallery_track" data-gallery-track>
-		{% for image in images -%}
+		{% for image in &images -%}
 			<figure class="feed_gallery_slide" data-gallery-slide data-gallery-width="{{ image.width }}" data-gallery-height="{{ image.height }}">
 				<div class="feed_gallery_stage"{% if image.width > 0 && image.height > 0 %} style="--gallery-aspect-ratio: {{ image.width }} / {{ image.height }}"{% endif %}>
 				{% if image.is_animated && !image.mp4_url.is_empty() %}
@@ -98,7 +98,7 @@
 	</div>
 	<div class="feed_gallery_meta">
 		<div class="feed_gallery_captions" aria-live="polite">
-		{% for image in images -%}
+		{% for image in &images -%}
 			<div data-gallery-caption{% if !loop.first %} hidden{% endif %}>
 				{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
 				{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
