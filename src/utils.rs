@@ -366,10 +366,22 @@ impl GalleryMedia {
 				let preview = media["p"].as_array().and_then(|previews| {
 					previews
 						.iter()
-						.find(|preview| preview["x"].as_i64().unwrap_or_default() >= 640 && preview["u"].as_str().is_some_and(|url| !url.is_empty()))
-						.or_else(|| previews.iter().rev().find(|preview| preview["u"].as_str().is_some_and(|url| !url.is_empty())))
+						.find(|preview| {
+							preview["x"].as_i64().unwrap_or_default() >= 640 && preview["u"].as_str().is_some_and(|url| !url.is_empty())
+						})
+						.or_else(|| {
+							previews
+								.iter()
+								.rev()
+								.find(|preview| preview["u"].as_str().is_some_and(|url| !url.is_empty()))
+						})
 				});
-				let preview_url = preview.map_or_else(|| url.clone(), |preview| format_url(preview["u"].as_str().unwrap_or_default()));
+				let preview_url = preview
+					.map(|preview| format_url(preview["u"].as_str().unwrap_or_default()))
+					.filter(|preview_url| {
+						preview_url.starts_with("/preview/") || preview_url.starts_with("/img/") || preview_url.starts_with("/thumb/")
+					})
+					.unwrap_or_else(|| url.clone());
 
 				// Construct gallery items
 				Some(Self {
@@ -1853,6 +1865,58 @@ mod tests {
 
 		assert_eq!(gallery.len(), 1);
 		assert_eq!(gallery[0].preview_url, gallery[0].url);
+	}
+
+	#[test]
+	fn gallery_rejects_unproxied_preview_candidates() {
+		let items = serde_json::json!([{"media_id": "one"}]);
+		let metadata = serde_json::json!({
+			"one": {
+				"m": "image/jpeg",
+				"s": {
+					"u": "https://i.redd.it/original.jpg",
+					"x": 1280,
+					"y": 720
+				},
+				"p": [{
+					"u": "https://tracking.example/preview.jpg",
+					"x": 640,
+					"y": 360
+				}]
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 1);
+		assert_eq!(gallery[0].url, "/img/original.jpg");
+		assert_eq!(gallery[0].preview_url, gallery[0].url);
+	}
+
+	#[test]
+	fn gallery_rewrites_onion_preview_with_query() {
+		let items = serde_json::json!([{"media_id": "one"}]);
+		let metadata = serde_json::json!({
+			"one": {
+				"m": "image/jpeg",
+				"s": {
+					"u": "https://i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/original.jpg",
+					"x": 1280,
+					"y": 720
+				},
+				"p": [{
+					"u": "https://preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/preview.jpg?width=640&amp;s=token",
+					"x": 640,
+					"y": 360
+				}]
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 1);
+		assert_eq!(gallery[0].url, "/img/original.jpg");
+		assert_eq!(gallery[0].preview_url, "/preview/pre/preview.jpg?width=640&amp;s=token");
 	}
 
 	#[test]

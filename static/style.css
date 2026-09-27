@@ -1270,10 +1270,13 @@ a.search_subreddit:hover {
     overflow-y: hidden;
     overscroll-behavior-x: contain;
     scroll-snap-type: x mandatory;
+}
+
+.gallery-js .feed_gallery_track {
     scrollbar-width: none;
 }
 
-.feed_gallery_track::-webkit-scrollbar {
+.gallery-js .feed_gallery_track::-webkit-scrollbar {
     display: none;
 }
 
@@ -1290,6 +1293,14 @@ a.search_subreddit:hover {
     justify-content: center;
 }
 
+.feed_gallery_slide img[data-src] {
+    visibility: hidden;
+}
+
+body:not(.gallery-js) .feed_gallery_slide img[data-src] {
+    display: none;
+}
+
 .feed_gallery_count {
     position: absolute;
     top: 8px;
@@ -1298,10 +1309,52 @@ a.search_subreddit:hover {
     border-radius: 999px;
     background: rgba(0, 0, 0, 0.75);
     color: white;
+    display: none;
     font-size: 12px;
     font-weight: bold;
     line-height: 1;
     pointer-events: none;
+}
+
+.gallery-js .feed_gallery_count {
+    display: block;
+}
+
+.feed_gallery_control {
+    display: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .gallery-js .feed_gallery_control {
+        position: absolute;
+        top: 50%;
+        z-index: 1;
+        display: grid;
+        width: 34px;
+        height: 44px;
+        padding: 0;
+        border: 0;
+        border-radius: 5px;
+        place-items: center;
+        transform: translateY(-50%);
+        background: rgba(0, 0, 0, 0.72);
+        color: white;
+        font-size: 26px;
+        line-height: 1;
+        cursor: pointer;
+    }
+
+    .gallery-js .feed_gallery_control:disabled {
+        display: none;
+    }
+
+    .gallery-js .feed_gallery_previous {
+        left: 8px;
+    }
+
+    .gallery-js .feed_gallery_next {
+        right: 8px;
+    }
 }
 
 .feed_gallery_single figcaption,
@@ -1344,6 +1397,7 @@ a.search_subreddit:hover {
     min-width: 0;
     width: fit-content;
     max-width: calc(100% - 27px);
+    box-sizing: border-box;
     margin: 5px 15px 5px 12px;
     padding: 6px 9px;
     border: var(--panel-border);
@@ -2256,20 +2310,20 @@ th {
         margin-left: 15px;
     }
 
-    .external_link .post_thumbnail.external_thumbnail {
+    body:not(.compact) .external_link .post_thumbnail.external_thumbnail {
         grid-area: post_media;
         width: calc(100% - 27px);
         max-height: none;
         margin: 8px 15px 5px 12px;
     }
 
-    .external_link .post_thumbnail.external_thumbnail div {
+    body:not(.compact) .external_link .post_thumbnail.external_thumbnail div {
         width: 100%;
         max-width: none !important;
         max-height: none !important;
     }
 
-    .external_link .post_thumbnail.external_thumbnail img {
+    body:not(.compact) .external_link .post_thumbnail.external_thumbnail img {
         display: block;
         width: 100%;
         height: auto;

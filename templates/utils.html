@@ -290,7 +290,12 @@
 		{% for image in post.gallery -%}
 			<figure class="feed_gallery_slide" data-gallery-slide>
 				<a href="{{ image.url }}" draggable="false">
+					{% if loop.first %}
 					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{{ image.preview_url }}"/>
+					{% else %}
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-src="{{ image.preview_url }}"/>
+					<noscript><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{{ image.preview_url }}"/></noscript>
+					{% endif %}
 				</a>
 				{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
 				<figcaption>
@@ -301,6 +306,8 @@
 			</figure>
 		{%- endfor %}
 		</div>
+		<button class="feed_gallery_control feed_gallery_previous" type="button" data-gallery-previous aria-label="Previous gallery image">‹</button>
+		<button class="feed_gallery_control feed_gallery_next" type="button" data-gallery-next aria-label="Next gallery image">›</button>
 		<span class="feed_gallery_count" aria-live="polite"><span data-gallery-current>1</span> / {{ post.gallery.len() }}</span>
 	</div>
 	{% else if post.post_type == "link" && post.thumbnail.url.is_empty() %}

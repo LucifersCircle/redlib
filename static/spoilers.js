@@ -1,33 +1,66 @@
 (function() {
     const touchPointer = window.matchMedia('(hover: none), (pointer: coarse)');
-    let recentTouch = 0;
+    let recentTouch = { time: 0, moved: false, x: 0, y: 0 };
 
     document.addEventListener('pointerdown', function(event) {
         if (event.pointerType === 'touch' || event.pointerType === 'pen') {
-            recentTouch = Date.now();
+            recentTouch = { time: Date.now(), moved: false, x: event.clientX, y: event.clientY };
         }
     }, { passive: true });
 
-    document.addEventListener('touchstart', function() {
-        recentTouch = Date.now();
+    document.addEventListener('pointermove', function(event) {
+        if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return;
+        if (Math.hypot(event.clientX - recentTouch.x, event.clientY - recentTouch.y) > 8) {
+            recentTouch.moved = true;
+        }
+    }, { passive: true });
+
+    document.addEventListener('touchstart', function(event) {
+        const touch = event.touches[0];
+        if (touch) {
+            recentTouch = { time: Date.now(), moved: false, x: touch.clientX, y: touch.clientY };
+        }
+    }, { passive: true });
+
+    document.addEventListener('touchmove', function(event) {
+        const touch = event.touches[0];
+        if (touch && Math.hypot(touch.clientX - recentTouch.x, touch.clientY - recentTouch.y) > 8) {
+            recentTouch.moved = true;
+        }
     }, { passive: true });
 
     document.addEventListener('click', function(event) {
         // Keyboard-generated clicks have detail=0. Keep the existing keyboard
         // behavior unchanged; this enhancement is only for taps.
-        const isTap = event.detail !== 0 && (touchPointer.matches || Date.now() - recentTouch < 1000);
-        if (!isTap) return;
+        const pointerType = 'pointerType' in event ? event.pointerType : '';
+        const isExplicitTap = pointerType === 'touch' || pointerType === 'pen';
+        const isFallbackTap = pointerType === '' && (touchPointer.matches || Date.now() - recentTouch.time < 1000);
+        if (event.detail === 0 || (!isExplicitTap && !isFallbackTap) || recentTouch.moved) return;
 
         const target = event.target;
         if (!(target instanceof Element)) return;
 
-        const spoiler = target.closest('.md-spoiler-text');
-        if (!spoiler || spoiler.classList.contains('spoiler_revealed')) return;
+        let spoiler = target.closest('.md-spoiler-text');
+        if (!spoiler) return;
+
+        const spoilersToReveal = [];
+        while (spoiler) {
+            if (!spoiler.classList.contains('spoiler_revealed')) {
+                spoilersToReveal.push(spoiler);
+            }
+            spoiler = spoiler.parentElement ? spoiler.parentElement.closest('.md-spoiler-text') : null;
+        }
+        if (spoilersToReveal.length === 0) return;
 
         // The first tap reveals the entire spoiler. If the tap was on a link,
         // cancelling it means the second tap can follow the now-visible link.
         event.preventDefault();
         event.stopPropagation();
-        spoiler.classList.add('spoiler_revealed');
+        spoilersToReveal.forEach(function(item) {
+            item.classList.add('spoiler_revealed');
+            item.querySelectorAll('.md-spoiler-text').forEach(function(nested) {
+                nested.classList.add('spoiler_revealed');
+            });
+        });
     }, true);
 })();
