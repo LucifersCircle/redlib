@@ -107,6 +107,8 @@ jobs:
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
           cargo test --locked --lib test_token_refresh_delay_cannot_underflow
+          cargo test --locked --lib oauth_transport_profiles_match_backend_identities
+          cargo test --locked --lib oauth_refresh_reuses_only_stable_matching_transport
           cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
           cargo test --locked --lib test_alternate_backend_changes_kind
           cargo test --locked --lib tor_fallback_requires_explicit_valid_socks5h_proxy

@@ -35,7 +35,30 @@ const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
 pub static CLIENT: LazyLock<Arc<WreqClient>> = LazyLock::new(|| Arc::new(build_client()));
-static TOR_EMULATION_PROFILE: LazyLock<(Emulation, EmulationOS)> = LazyLock::new(random_emulation_profile);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OauthTransportProfile {
+	MobileAndroid,
+	GenericWeb,
+}
+
+impl OauthTransportProfile {
+	pub(crate) fn emulation_profile(self) -> (Emulation, EmulationOS) {
+		match self {
+			Self::MobileAndroid => (Emulation::OkHttp4_12, EmulationOS::Android),
+			Self::GenericWeb => (Emulation::Firefox147, EmulationOS::Windows),
+		}
+	}
+
+	fn label(self) -> &'static str {
+		match self {
+			Self::MobileAndroid => "mobile_android",
+			Self::GenericWeb => "generic_web",
+		}
+	}
+}
+
+pub(crate) const GENERIC_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0";
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new(RedditLane::Direct));
@@ -1458,14 +1481,14 @@ pub fn build_client() -> WreqClient {
 	build_emulated_client(RedditLane::Direct, None).expect("Should always be able to build the direct Reddit client")
 }
 
-fn build_tor_client() -> Result<WreqClient, String> {
+fn build_tor_client(profile: OauthTransportProfile) -> Result<WreqClient, String> {
 	let config = TOR_FALLBACK_CONFIG.as_ref().map_err(|error| error.clone())?;
 	let config = config.as_ref().ok_or_else(|| "Tor fallback is disabled".to_string())?;
 	let isolation_id = format!("redlib-{:016x}", fastrand::u64(..));
 	let proxy_url = tor_isolation_proxy_url(&config.proxy_url, &isolation_id)?;
 	let proxy = Proxy::all(proxy_url.as_str()).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
 	info!("Created an isolated Tor SOCKS transport for a Reddit identity");
-	build_emulated_client(RedditLane::Tor, Some(proxy))
+	build_oauth_client(RedditLane::Tor, Some(proxy), profile)
 }
 
 fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String, String> {
@@ -1479,10 +1502,10 @@ fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String
 	Ok(proxy_url.to_string())
 }
 
-pub(crate) fn client_for_new_identity(lane: RedditLane) -> Result<Arc<WreqClient>, String> {
+pub(crate) fn client_for_new_identity(lane: RedditLane, profile: OauthTransportProfile) -> Result<Arc<WreqClient>, String> {
 	match lane {
-		RedditLane::Direct => Ok(CLIENT.clone()),
-		RedditLane::Tor => build_tor_client().map(Arc::new),
+		RedditLane::Direct => build_oauth_client(RedditLane::Direct, None, profile).map(Arc::new),
+		RedditLane::Tor => build_tor_client(profile).map(Arc::new),
 	}
 }
 
@@ -1498,7 +1521,7 @@ pub fn start_tor_fallback() {
 	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
-	if let Err(error) = client_for_new_identity(RedditLane::Tor) {
+	if let Err(error) = client_for_new_identity(RedditLane::Tor, OauthTransportProfile::MobileAndroid) {
 		warn!("Tor fallback is disabled because its HTTP client could not be built: {error}");
 		return;
 	}
@@ -1513,12 +1536,16 @@ pub fn start_tor_fallback() {
 }
 
 fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqClient, String> {
-	let (selected_emulation, selected_operating_system) = match lane {
-		RedditLane::Direct => random_emulation_profile(),
-		RedditLane::Tor => *TOR_EMULATION_PROFILE,
-	};
+	let (selected_emulation, selected_operating_system) = random_emulation_profile();
 
-	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system)
+	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, false, "general")
+}
+
+fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>, profile: OauthTransportProfile) -> Result<WreqClient, String> {
+	let (selected_emulation, selected_operating_system) = profile.emulation_profile();
+	// OAuth backends supply their own identity headers. Retain the selected
+	// TLS/HTTP2 fingerprint without mixing in OkHttp or browser navigation defaults.
+	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, true, profile.label())
 }
 
 fn random_emulation_profile() -> (Emulation, EmulationOS) {
@@ -1539,16 +1566,20 @@ fn build_emulated_client_with_profile(
 	proxy: Option<Proxy>,
 	selected_emulation: Emulation,
 	selected_operating_system: EmulationOS,
+	skip_emulation_headers: bool,
+	profile_label: &'static str,
 ) -> Result<WreqClient, String> {
 	let emulation = EmulationOption::builder()
 		.emulation(selected_emulation)
 		.emulation_os(selected_operating_system)
+		.skip_headers(skip_emulation_headers)
 		.build()
 		.emulation();
 
 	info!(
-		"Building Wreq client: lane={} browser={selected_emulation:?} os={selected_operating_system:?}",
-		lane.label()
+		"Building Wreq client: lane={} profile={profile_label} emulation={selected_emulation:?} os={selected_operating_system:?} emulation_headers={}",
+		lane.label(),
+		if skip_emulation_headers { "disabled" } else { "enabled" }
 	);
 	let mut builder = WreqClient::builder().emulation(emulation).redirect(Policy::none());
 	if let Some(proxy) = proxy {
