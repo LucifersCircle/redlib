@@ -128,7 +128,16 @@
 	<div class="gallery gallery_detail">
 	{% for image in post.gallery -%}
 		<figure>
-			<a href="{{ image.url }}" draggable="false"><img loading="lazy" draggable="false" alt="Gallery image" src="{{ image.url }}"/></a>
+			{% if image.is_animated && !image.mp4_url.is_empty() %}
+			<div class="gallery_detail_animation" data-gallery-standalone>
+				<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" controls data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" aria-label="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}"></video>
+				<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-gallery-fallback hidden/>
+				<a class="gallery_original_link" data-gallery-original href="{{ image.url }}" draggable="false" aria-label="Open original gallery animation" title="Open original">↗</a>
+			</div>
+			<noscript><a data-gallery-original href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
+			{% else %}
+			<a data-gallery-original href="{{ image.url }}" draggable="false"><img loading="lazy" draggable="false" alt="Gallery image" src="{{ image.url }}"/></a>
+			{% endif %}
 			<figcaption>
 				<p>{{ image.caption }}</p>
 				{% if image.outbound_url.len() > 0 %}
@@ -140,7 +149,16 @@
 	</div>
 	</div>
 	{% else if post.post_type == "link" %}
+	{% if !post.thumbnail.url.is_empty() && post.thumbnail.width > 0 && post.thumbnail.height > 0 && (post.thumbnail.url.starts_with("/preview/") || post.thumbnail.url.starts_with("/img/") || post.thumbnail.url.starts_with("/thumb/")) %}
+	<div class="post_media_content article_preview{% if post.flags.nsfw && prefs.blur_nsfw == "on" %} article_preview_blurred{% endif %}">
+		<a class="article_preview_link" href="{{ post.media.url }}" rel="nofollow" draggable="false" title="{{ post.media.url }}">
+			<img width="{{ post.thumbnail.width }}" height="{{ post.thumbnail.height }}" loading="lazy" draggable="false" alt="Article preview" src="{{ post.thumbnail.url }}"/>
+			<span class="article_preview_domain"><span aria-hidden="true">↗</span> {% if post.domain.is_empty() %}External link{% else %}{{ post.domain }}{% endif %}</span>
+		</a>
+	</div>
+	{% else %}
 	<a id="post_url" href="{{ post.media.url }}" rel="nofollow">{{ post.media.url }}</a>
+	{% endif %}
 	{% endif %}
 
 	<!-- POST BODY -->
@@ -272,9 +290,18 @@
 	<div class="post_media_content gallery_media_wrapper feed_gallery_single">
 	{% for image in post.gallery -%}
 		<figure>
+			{% if image.is_animated && !image.mp4_url.is_empty() %}
+			<div class="feed_gallery_single_animation" data-gallery-standalone>
+				<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" {% if prefs.autoplay_videos != "on" %}controls{% endif %} aria-label="Animated gallery image 1 of 1"></video>
+				<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image 1 of 1" data-gallery-fallback hidden/>
+				<a class="gallery_original_link" href="{{ image.url }}" draggable="false" aria-label="Open original gallery animation" title="Open original">↗</a>
+			</div>
+			<noscript><a href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image 1 of 1" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
+			{% else %}
 			<a href="{{ image.url }}" class="post_media_image short" draggable="false">
-				<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image 1 of 1" src="{{ image.preview_url }}"/>
+				<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image 1 of 1" src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
 			</a>
+			{% endif %}
 			{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
 			<figcaption>
 				{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
@@ -289,14 +316,23 @@
 		<div class="feed_gallery_track" data-gallery-track>
 		{% for image in post.gallery -%}
 			<figure class="feed_gallery_slide" data-gallery-slide>
+				<div class="feed_gallery_stage">
+				{% if image.is_animated && !image.mp4_url.is_empty() %}
+					<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" {% if prefs.autoplay_videos != "on" %}controls{% endif %} aria-label="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}"></video>
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-gallery-fallback hidden/>
+					<a class="gallery_original_link" href="{{ image.url }}" draggable="false" aria-label="Open original gallery animation" title="Open original">↗</a>
+					<noscript><a href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
+				{% else %}
 				<a href="{{ image.url }}" draggable="false">
 					{% if loop.first %}
-					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{{ image.preview_url }}"/>
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
 					{% else %}
-					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-src="{{ image.preview_url }}"/>
-					<noscript><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{{ image.preview_url }}"/></noscript>
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
+					<noscript><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/></noscript>
 					{% endif %}
 				</a>
+				{% endif %}
+				</div>
 				{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
 				<figcaption>
 					{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}

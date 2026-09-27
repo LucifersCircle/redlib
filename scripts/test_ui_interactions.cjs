@@ -39,7 +39,17 @@ class Element extends Events {
         this.children = [];
         this.parentElement = null;
         this.textContent = '';
-        this.src = attributes.src || '';
+        this.loading = attributes.loading || '';
+        this._src = attributes.src || '';
+        this.srcAssignments = [];
+        Object.defineProperty(this, 'src', {
+            get: () => this._src,
+            set: value => {
+                this.srcAssignments.push({ value, loading: this.loading });
+                this._src = value;
+            },
+        });
+        this.hidden = 'hidden' in attributes;
         const classes = new Set((attributes.class || '').split(/\s+/).filter(Boolean));
         this.classList = {
             add: (...names) => names.forEach(name => classes.add(name)),
@@ -91,7 +101,7 @@ class Element extends Events {
     }
 }
 
-function browser({ coarse = false, readyState = 'complete' } = {}) {
+function browser({ coarse = false, readyState = 'complete', intersection = false } = {}) {
     let now = 10_000;
     let frameId = 0;
     const frames = new Map();
@@ -101,6 +111,16 @@ function browser({ coarse = false, readyState = 'complete' } = {}) {
     document.readyState = readyState;
     document.querySelectorAll = selector => document.body.querySelectorAll(selector);
     window.matchMedia = () => ({ matches: coarse });
+    const observers = [];
+    if (intersection) {
+        window.IntersectionObserver = class {
+            constructor(callback) {
+                this.callback = callback;
+                observers.push(this);
+            }
+            observe(target) { this.target = target; }
+        };
+    }
     window.requestAnimationFrame = callback => {
         frames.set(++frameId, callback);
         return frameId;
@@ -110,6 +130,11 @@ function browser({ coarse = false, readyState = 'complete' } = {}) {
         window,
         document,
         advance: milliseconds => { now += milliseconds; },
+        intersect(target, isIntersecting) {
+            observers.filter(observer => observer.target === target).forEach(observer => {
+                observer.callback([{ target, isIntersecting }]);
+            });
+        },
         run(name) {
             const filename = path.join(__dirname, '..', 'static', name);
             vm.runInContext(fs.readFileSync(filename, 'utf8'), context, { filename });
@@ -148,7 +173,7 @@ function galleryFixture(options) {
     gallery.append(track, previous, next, current);
     env.document.body.append(gallery);
     env.run('gallery.js');
-    return { ...env, track, current, previous, next, images, slides };
+    return { ...env, gallery, track, current, previous, next, images, slides };
 }
 
 const pointer = (properties = {}) => ({
@@ -163,6 +188,170 @@ test('gallery initializes only the first and adjacent previews', () => {
     assert.equal(env.previous.disabled, true);
     assert.equal(env.next.disabled, false);
     assert.equal('src' in env.images[1].dataset, false);
+    assert.deepEqual(env.images[1].srcAssignments, [{ value: '/preview/1.jpg', loading: 'eager' }]);
+});
+
+test('gallery defers JavaScript-managed loading until it approaches the viewport', () => {
+    const env = galleryFixture({ intersection: true });
+    assert.equal(env.images[1].src, '');
+    env.intersect(env.gallery, true);
+    assert.equal(env.images[1].src, '/preview/1.jpg');
+    assert.equal(env.current.textContent, '1');
+});
+
+test('gallery animation uses MP4, pauses off-slide, and falls back to GIF once', () => {
+    const env = browser();
+    const gallery = new Element('div', { 'data-gallery': '' });
+    const track = new Element('div', { 'data-gallery-track': '' });
+    const current = new Element('span', { 'data-gallery-current': '' });
+    const previous = new Element('button', { 'data-gallery-previous': '' });
+    const next = new Element('button', { 'data-gallery-next': '' });
+    const animated = new Element('figure', { 'data-gallery-slide': '' });
+    const stage = new Element('div', { class: 'feed_gallery_stage' });
+    const video = new Element('video', {
+        'data-gallery-video': '',
+        'data-src': '/preview/animation.mp4',
+        'data-poster': '/preview/poster.jpg',
+        'data-gif-fallback': '/img/animation.gif',
+        'data-autoplay': 'true',
+    });
+    const fallback = new Element('img', { 'data-gallery-fallback': '', hidden: '' });
+    video.loadCount = 0;
+    video.playCount = 0;
+    video.pauseCount = 0;
+    video.paused = true;
+    video.load = () => { video.loadCount += 1; };
+    video.play = () => {
+        video.playCount += 1;
+        video.paused = false;
+        video.emit('play');
+        return Promise.resolve();
+    };
+    video.pause = () => {
+        video.pauseCount += 1;
+        video.paused = true;
+        video.emit('pause');
+    };
+    animated.offsetLeft = 0;
+    animated.append(stage.append(video, fallback));
+    const still = new Element('figure', { 'data-gallery-slide': '' });
+    still.offsetLeft = 300;
+    still.append(new Element('img', { 'data-src': '/preview/still.jpg' }));
+    track.scrollLeft = 0;
+    track.scrollTo = options => {
+        track.scrollLeft = options.left;
+        track.emit('scroll');
+    };
+    track.append(animated, still);
+    gallery.append(track, previous, next, current);
+    env.document.body.append(gallery);
+    env.run('gallery.js');
+
+    assert.equal(video.poster, '/preview/poster.jpg');
+    assert.equal(video.src, '/preview/animation.mp4');
+    assert.equal(video.loadCount, 1);
+    assert.equal(video.playCount, 1);
+    next.emit('click');
+    env.flushFrames();
+    assert.ok(video.pauseCount > 0);
+
+    previous.emit('click');
+    env.flushFrames();
+    assert.equal(video.playCount, 2);
+
+    video.emit('pointerdown');
+    next.emit('click');
+    env.flushFrames();
+    previous.emit('click');
+    env.flushFrames();
+    assert.equal(video.playCount, 3, 'swiping away does not count as a manual pause');
+
+    video.emit('pointerdown');
+    video.paused = true;
+    video.emit('pause');
+    env.window.emit('resize');
+    env.flushFrames();
+    assert.equal(video.playCount, 3, 'a user-paused animation stays paused');
+
+    video.emit('error');
+    assert.equal(video.hidden, true);
+    assert.equal(fallback.hidden, false);
+    assert.deepEqual(fallback.srcAssignments, [{ value: '/img/animation.gif', loading: 'eager' }]);
+    video.emit('error');
+    assert.equal(fallback.srcAssignments.length, 1, 'fallback is activated only once');
+});
+
+test('gallery animation loads without playing when autoplay is disabled', () => {
+    const env = browser();
+    const container = new Element('div', { 'data-gallery-standalone': '' });
+    const video = new Element('video', {
+        'data-gallery-video': '',
+        'data-src': '/preview/animation.mp4',
+        'data-autoplay': 'false',
+    });
+    video.paused = true;
+    video.loadCount = 0;
+    video.playCount = 0;
+    video.load = () => { video.loadCount += 1; };
+    video.play = () => { video.playCount += 1; return Promise.resolve(); };
+    video.pause = () => {};
+    container.append(video);
+    env.document.body.append(container);
+    env.run('gallery.js');
+
+    assert.equal(video.src, '/preview/animation.mp4');
+    assert.equal(video.loadCount, 1);
+    assert.equal(video.playCount, 0);
+});
+
+test('gallery animation playback follows the media stage visibility', () => {
+    const env = browser({ intersection: true });
+    const gallery = new Element('div', { 'data-gallery': '' });
+    const track = new Element('div', { 'data-gallery-track': '' });
+    const current = new Element('span', { 'data-gallery-current': '' });
+    const previous = new Element('button', { 'data-gallery-previous': '' });
+    const next = new Element('button', { 'data-gallery-next': '' });
+    const animated = new Element('figure', { 'data-gallery-slide': '' });
+    const stage = new Element('div', { class: 'feed_gallery_stage' });
+    const video = new Element('video', {
+        'data-gallery-video': '',
+        'data-src': '/preview/animation.mp4',
+        'data-autoplay': 'true',
+    });
+    video.paused = true;
+    video.playCount = 0;
+    video.pauseCount = 0;
+    video.load = () => {};
+    video.play = () => {
+        video.playCount += 1;
+        video.paused = false;
+        video.emit('play');
+        return Promise.resolve();
+    };
+    video.pause = () => {
+        video.pauseCount += 1;
+        video.paused = true;
+        video.emit('pause');
+    };
+    animated.offsetLeft = 0;
+    animated.append(stage.append(video));
+    const still = new Element('figure', { 'data-gallery-slide': '' });
+    still.offsetLeft = 300;
+    still.append(new Element('img', { 'data-src': '/preview/still.jpg' }));
+    track.scrollLeft = 0;
+    track.append(animated, still);
+    gallery.append(track, previous, next, current);
+    env.document.body.append(gallery);
+    env.run('gallery.js');
+
+    env.intersect(gallery, true);
+    assert.equal(video.playCount, 0, 'gallery visibility alone does not start playback');
+    env.intersect(stage, true);
+    env.flushFrames();
+    assert.equal(video.playCount, 1);
+    env.intersect(stage, false);
+    env.flushFrames();
+    assert.ok(video.pauseCount > 0);
 });
 
 test('gallery navigation updates loading, counter and boundary buttons', () => {
