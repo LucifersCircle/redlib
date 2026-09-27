@@ -366,21 +366,12 @@ impl GalleryMedia {
 				let preview = media["p"].as_array().and_then(|previews| {
 					previews
 						.iter()
-						.find(|preview| {
-							preview["x"].as_i64().unwrap_or_default() >= 640 && preview["u"].as_str().is_some_and(|url| !url.is_empty())
-						})
-						.or_else(|| {
-							previews
-								.iter()
-								.rev()
-								.find(|preview| preview["u"].as_str().is_some_and(|url| !url.is_empty()))
-						})
+						.find(|preview| preview["x"].as_i64().unwrap_or_default() >= 640 && preview["u"].as_str().is_some_and(|url| !url.is_empty()))
+						.or_else(|| previews.iter().rev().find(|preview| preview["u"].as_str().is_some_and(|url| !url.is_empty())))
 				});
 				let preview_url = preview
 					.map(|preview| format_url(preview["u"].as_str().unwrap_or_default()))
-					.filter(|preview_url| {
-						preview_url.starts_with("/preview/") || preview_url.starts_with("/img/") || preview_url.starts_with("/thumb/")
-					})
+					.filter(|preview_url| preview_url.starts_with("/preview/") || preview_url.starts_with("/img/") || preview_url.starts_with("/thumb/"))
 					.unwrap_or_else(|| url.clone());
 
 				// Construct gallery items
