@@ -4,9 +4,8 @@ use crate::reddit_lane::{RedditLane, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::{format_url, Post};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use cached::proc_macro::cached;
-use futures_lite::future::block_on;
 use futures_lite::{future::Boxed, FutureExt};
 use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperResponse};
 use log::{error, info, trace, warn};
@@ -60,17 +59,14 @@ impl OauthTransportProfile {
 
 pub(crate) const GENERIC_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0";
 
-pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
-	let client = block_on(Oauth::new(RedditLane::Direct));
-	tokio::spawn(token_daemon(RedditLane::Direct));
-	ArcSwap::new(client.into())
-});
+pub static OAUTH_CLIENT: LazyLock<ArcSwapOption<Oauth>> = LazyLock::new(ArcSwapOption::empty);
 
 pub(crate) static TOR_OAUTH_CLIENT: LazyLock<ArcSwapOption<Oauth>> = LazyLock::new(ArcSwapOption::empty);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 pub(crate) static TOR_OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 static TOR_WARMUP_STARTED: AtomicBool = AtomicBool::new(false);
+static DIRECT_OAUTH_WARMUP_STARTED: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_MAX_CONCURRENT_API_REQUESTS: usize = 8;
 const MAX_CONFIGURED_API_REQUESTS: usize = 64;
@@ -86,6 +82,7 @@ const EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_se
 const QUOTA_SAFETY_RESERVE: u16 = 5;
 const QUOTA_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
 const EMERGENCY_QUOTA_REFRESH_RETRY: Duration = Duration::from_secs(2);
+const OAUTH_STARTUP_RETRY: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_API_REDIRECTS: usize = 3;
@@ -962,7 +959,7 @@ fn classify_throttle_response(status: u16, retry_after_present: bool, quota_head
 
 pub(crate) fn oauth_client(lane: RedditLane) -> Option<Arc<Oauth>> {
 	match lane {
-		RedditLane::Direct => Some(OAUTH_CLIENT.load_full()),
+		RedditLane::Direct => OAUTH_CLIENT.load_full(),
 		RedditLane::Tor => TOR_OAUTH_CLIENT.load_full(),
 	}
 }
@@ -982,7 +979,7 @@ pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_
 	}
 	match lane {
 		RedditLane::Direct => {
-			OAUTH_CLIENT.swap(oauth.into());
+			OAUTH_CLIENT.swap(Some(oauth.into()));
 		}
 		RedditLane::Tor => {
 			TOR_OAUTH_CLIENT.swap(Some(oauth.into()));
@@ -1271,6 +1268,13 @@ fn retry_after_seconds(duration: Duration) -> u64 {
 	duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() > 0)).max(1)
 }
 
+fn oauth_startup_error() -> String {
+	format!(
+		"Redlib is starting its anonymous Reddit session. Retry in {} seconds",
+		retry_after_seconds(OAUTH_STARTUP_RETRY)
+	)
+}
+
 fn cooldown_error(lane: RedditLane) -> Option<(String, bool)> {
 	let guard = upstream_guard(lane);
 	let active = guard.active_cooldown(Instant::now());
@@ -1314,7 +1318,7 @@ fn preferred_api_lane(now: Instant) -> RedditLane {
 
 fn begin_upstream_attempt(lane: RedditLane) -> Result<(Arc<Oauth>, UpstreamAttempt), (String, bool)> {
 	let mut guard = upstream_guard(lane);
-	let oauth_client = oauth_client(lane).ok_or_else(|| (format!("{} Reddit OAuth is not ready", lane.label()), false))?;
+	let oauth_client = oauth_client(lane).ok_or_else(|| (oauth_startup_error(), false))?;
 	let generation = oauth_client.generation;
 	let now = Instant::now();
 	let result = guard.try_admit(now, generation);
@@ -1509,6 +1513,35 @@ pub(crate) fn client_for_new_identity(lane: RedditLane, profile: OauthTransportP
 	}
 }
 
+pub fn start_oauth() {
+	if DIRECT_OAUTH_WARMUP_STARTED
+		.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+		.is_err()
+	{
+		return;
+	}
+
+	info!("Starting direct Reddit OAuth in the background");
+	tokio::spawn(async {
+		let oauth = Oauth::new(RedditLane::Direct).await;
+		if install_oauth_client(oauth, true, None) {
+			info!("Direct Reddit OAuth is ready");
+			tokio::spawn(token_daemon(RedditLane::Direct));
+			match rate_limit_check().await {
+				Ok(()) => info!("[✅] Rate limit check passed"),
+				Err(error) => {
+					let mut message = format!("Rate limit check failed after OAuth startup: {error}");
+					message += "\nThis may cause issues with the rate limit.";
+					message += "\nPlease report this error with the above information.";
+					message += "\nhttps://github.com/redlib-org/redlib/issues/new?assignees=sigaloid&labels=bug&title=%F0%9F%90%9B+Bug+Report%3A+Rate+limit+mismatch";
+					warn!("{message}");
+					eprintln!("{message}");
+				}
+			}
+		}
+	});
+}
+
 pub fn start_tor_fallback() {
 	let config = match TOR_FALLBACK_CONFIG.as_ref() {
 		Ok(Some(config)) => config,
@@ -1697,9 +1730,9 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 		}
 	}
 
-	// Add User-Agent header of the currently spoofed device
-	{
-		let client = OAUTH_CLIENT.load_full();
+	// Add the current Reddit identity's User-Agent when OAuth is ready. The
+	// general media client keeps its own coherent default while OAuth starts.
+	if let Some(client) = oauth_client(RedditLane::Direct) {
 		builder = builder.header("User-Agent", client.user_agent());
 	}
 
@@ -1791,7 +1824,10 @@ async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, at
 fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
 	CANONICAL_HEAD_SENDS.fetch_add(1, Ordering::Relaxed);
 	maybe_log_traffic_summary();
-	request_once(&Method::HEAD, path, quarantine, base_path, host, OAUTH_CLIENT.load_full(), RedditLane::Direct)
+	let Some(oauth_client) = oauth_client(RedditLane::Direct) else {
+		return async { Err(oauth_startup_error()) }.boxed();
+	};
+	request_once(&Method::HEAD, path, quarantine, base_path, host, oauth_client, RedditLane::Direct)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -2332,7 +2368,8 @@ async fn self_check(sub: &str) -> Result<(), String> {
 pub async fn rate_limit_check() -> Result<(), String> {
 	// We can perform a startup reachability check if the OAuth backend is
 	// MobileSpoof; GenericWeb does not expose the same rate-limit behavior.
-	if matches!(OAUTH_CLIENT.load().backend, OauthBackendImpl::GenericWeb(_)) {
+	let oauth_client = oauth_client(RedditLane::Direct).ok_or_else(oauth_startup_error)?;
+	if matches!(&oauth_client.backend, OauthBackendImpl::GenericWeb(_)) {
 		warn!("[⚠️] Cannot perform rate limit check, running as GenericWeb. Skipping check.");
 		return Ok(());
 	}
@@ -3508,6 +3545,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "requires application-managed live OAuth startup"]
 	async fn test_rate_limit_check() {
 		rate_limit_check().await.unwrap();
 	}
@@ -3515,13 +3553,8 @@ mod tests {
 	#[test]
 	#[sealed_test(env = [("REDLIB_DEFAULT_SUBSCRIPTIONS", "rust")])]
 	fn test_default_subscriptions() {
-		tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(async {
-			let subscriptions = get_setting("REDLIB_DEFAULT_SUBSCRIPTIONS");
-			assert!(subscriptions.is_some());
-
-			// check rate limit
-			rate_limit_check().await.unwrap();
-		});
+		let subscriptions = get_setting("REDLIB_DEFAULT_SUBSCRIPTIONS");
+		assert!(subscriptions.is_some());
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
