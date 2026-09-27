@@ -12,8 +12,9 @@ use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperR
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -96,6 +97,7 @@ static MEDIA_RESULT_COUNTS: LazyLock<[AtomicU64; 6]> = LazyLock::new(|| std::arr
 static OAUTH_LANE_SENDS: LazyLock<[AtomicU64; 2]> = LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static TOR_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static LAST_TRAFFIC_SUMMARY: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
+static COMMENT_JSON_KEYS: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CooldownReason {
@@ -1038,7 +1040,13 @@ fn endpoint_class(path: &str) -> &'static str {
 }
 
 fn record_logical_json(path: &str) {
-	LOGICAL_JSON_COUNTS[endpoint_class_index(path)].fetch_add(1, Ordering::Relaxed);
+	let endpoint = endpoint_class_index(path);
+	LOGICAL_JSON_COUNTS[endpoint].fetch_add(1, Ordering::Relaxed);
+	if endpoint == endpoint_class_index("/comments/example.json") {
+		let mut hasher = DefaultHasher::new();
+		path.hash(&mut hasher);
+		COMMENT_JSON_KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(hasher.finish());
+	}
 	maybe_log_traffic_summary();
 }
 
@@ -1184,7 +1192,7 @@ fn maybe_log_traffic_summary() {
 	drop(last);
 
 	info!(
-		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} admitted_json={} api_sends={} api_lanes={} tor_fallbacks={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_lanes={} local_denials={}",
+		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} comment_keys={} admitted_json={} api_sends={} api_lanes={} tor_fallbacks={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_lanes={} local_denials={}",
 		elapsed.as_secs().max(1),
 		take_counter_summary(
 			["home", "subreddit", "comments", "user", "search", "rss", "media", "health", "other"],
@@ -1196,6 +1204,12 @@ fn maybe_log_traffic_summary() {
 			["subreddit", "user", "api", "search", "comments", "other", "community_search"],
 			&LOGICAL_JSON_COUNTS,
 		),
+		{
+			let mut keys = COMMENT_JSON_KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+			let count = keys.len();
+			keys.clear();
+			count
+		},
 		take_counter_summary(
 			["subreddit", "user", "api", "search", "comments", "other", "community_search"],
 			&ADMITTED_JSON_COUNTS,
@@ -1856,19 +1870,88 @@ async fn json_metadata_cached(path: String, quarantine: bool) -> Result<Value, S
 
 fn normalize_reddit_api_path(path: &str) -> String {
 	let (base, query) = path.split_once('?').unwrap_or((path, ""));
-	let mut pairs = url::form_urlencoded::parse(query.as_bytes())
-		.filter(|(key, _)| {
-			let key = key.as_ref();
-			key != "raw_json" && key != "share_id" && !key.starts_with("utm_")
-		})
-		.map(|(key, value)| (key.into_owned(), value.into_owned()))
-		.collect::<Vec<_>>();
-	pairs.push(("raw_json".to_string(), "1".to_string()));
-	pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
-
+	let canonical_comments_base = canonical_comments_base(base);
 	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-	serializer.extend_pairs(pairs);
-	format!("{base}?{}", serializer.finish())
+	if canonical_comments_base.is_some() {
+		serializer.extend_pairs(normalize_comments_query(query));
+	} else {
+		let mut pairs = url::form_urlencoded::parse(query.as_bytes())
+			.filter(|(key, _)| {
+				let key = key.as_ref();
+				key != "raw_json" && key != "share_id" && !key.starts_with("utm_")
+			})
+			.map(|(key, value)| (key.into_owned(), value.into_owned()))
+			.collect::<Vec<_>>();
+		pairs.push(("raw_json".to_string(), "1".to_string()));
+		pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+		serializer.extend_pairs(pairs);
+	}
+	// Title slugs are cosmetic. Within each route scope, Reddit only needs the
+	// post ID and optional highlighted comment ID, so use those as the comments
+	// cache identity.
+	format!("{}?{}", canonical_comments_base.as_deref().unwrap_or(base), serializer.finish())
+}
+
+fn normalize_comments_query(query: &str) -> BTreeMap<String, String> {
+	let mut raw = BTreeMap::new();
+	for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+		if matches!(
+			key.as_ref(),
+			"comment" | "context" | "depth" | "limit" | "sort" | "showedits" | "showmedia" | "showmore" | "showtitle" | "sr_detail" | "theme" | "threaded" | "truncate"
+		) {
+			raw.insert(key.into_owned(), value.into_owned());
+		}
+	}
+
+	let mut normalized = BTreeMap::new();
+	for (key, value) in raw {
+		let value = match key.as_str() {
+			"sort" if matches!(value.as_str(), "confidence" | "top" | "new" | "controversial" | "old" | "random" | "qa" | "live") => value,
+			"context" => match value.parse::<u16>() {
+				Ok(context) if context <= 9999 => context.to_string(),
+				_ => continue,
+			},
+			"depth" => match value.parse::<u8>() {
+				Ok(depth) if depth <= 10 => depth.to_string(),
+				_ => continue,
+			},
+			"limit" => match value.parse::<u16>() {
+				Ok(limit) if limit <= 500 => limit.to_string(),
+				_ => continue,
+			},
+			"comment" if !value.is_empty() && value.len() <= 20 && value.bytes().all(|byte| byte.is_ascii_alphanumeric()) => value,
+			"showedits" | "showmedia" | "showmore" | "showtitle" | "sr_detail" | "threaded" if matches!(value.as_str(), "true" | "false") => value,
+			"theme" if matches!(value.as_str(), "default" | "dark") => value,
+			"truncate" => match value.parse::<u16>() {
+				Ok(truncate) if truncate <= 50 => truncate.to_string(),
+				_ => continue,
+			},
+			_ => continue,
+		};
+		normalized.insert(key, value);
+	}
+	normalized.insert("raw_json".to_string(), "1".to_string());
+	normalized
+}
+
+fn canonical_comments_base(path: &str) -> Option<String> {
+	let base = path.strip_suffix(".json").unwrap_or(path).trim_end_matches('/');
+	let segments = base.trim_start_matches('/').split('/').collect::<Vec<_>>();
+	let (prefix, post_id, comment_id) = match segments.as_slice() {
+		["comments", post_id] | ["comments", post_id, _] => (String::new(), *post_id, None),
+		["comments", post_id, _, comment_id] => (String::new(), *post_id, Some(*comment_id)),
+		[prefix @ ("r" | "u" | "user"), scope, "comments", post_id]
+		| [prefix @ ("r" | "u" | "user"), scope, "comments", post_id, _] => (format!("/{prefix}/{scope}"), *post_id, None),
+		[prefix @ ("r" | "u" | "user"), scope, "comments", post_id, _, comment_id] => (format!("/{prefix}/{scope}"), *post_id, Some(*comment_id)),
+		_ => return None,
+	};
+	if post_id.is_empty() || comment_id.is_some_and(str::is_empty) {
+		return None;
+	}
+	Some(match comment_id {
+		Some(comment_id) => format!("{prefix}/comments/{post_id}/_/{comment_id}.json"),
+		None => format!("{prefix}/comments/{post_id}.json"),
+	})
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3281,13 +3364,51 @@ mod tests {
 			normalize_reddit_api_path("/r/rust/hot.json?sort=new&after=t3_abc"),
 			normalize_reddit_api_path("/r/rust/hot.json?after=t3_abc&sort=new")
 		);
-		let preserved = normalize_reddit_api_path("/comments/abc.json?context=3&q=a%2Bb");
+		let preserved = normalize_reddit_api_path("/comments/abc.json?context=3&q=a%2Bb&cache_bust=unique");
 		assert!(preserved.contains("context=3"));
-		assert!(preserved.contains("q=a%2Bb"));
+		assert!(!preserved.contains("q="));
+		assert!(!preserved.contains("cache_bust"));
 		assert_ne!(
 			normalize_reddit_api_path("/comments/abc/title.json?sort=top"),
 			normalize_reddit_api_path("/comments/abc/title.json?sort=new")
 		);
+		assert_eq!(
+			normalize_reddit_api_path("/r/rust/comments/abc/a-title.json?sort=top&nonce=one"),
+			normalize_reddit_api_path("/r/rust/comments/abc/different-title.json?nonce=two&sort=top")
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/user/example/comments/abc/a-title/def.json?context=03&context=3"),
+			"/user/example/comments/abc/_/def.json?context=3&raw_json=1"
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/comments/abc/title.json?sort=invalid&context=10000"),
+			"/comments/abc.json?raw_json=1"
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/comments/abc/title.json?limit=025&depth=03&sort=new&sort=top"),
+			"/comments/abc.json?depth=3&limit=25&raw_json=1&sort=top"
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/comments/abc/title.json?sort=top&sort=invalid&showmedia=nonce&theme=light&truncate=51"),
+			"/comments/abc.json?raw_json=1"
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/r/rust/comments/abc/title/def/.json?context=3"),
+			"/r/rust/comments/abc/_/def.json?context=3&raw_json=1"
+		);
+		assert_ne!(
+			normalize_reddit_api_path("/r/rust/comments/abc/title/def.json"),
+			normalize_reddit_api_path("/r/rust/comments/abc/title/ghi.json")
+		);
+		assert_ne!(
+			normalize_reddit_api_path("/r/rust/comments/abc/title.json"),
+			normalize_reddit_api_path("/user/rust/comments/abc/title.json")
+		);
+		assert_eq!(
+			normalize_reddit_api_path("/comments/abc/title/def/extra.json?nonce=one"),
+			"/comments/abc/title/def/extra.json?nonce=one&raw_json=1"
+		);
+		assert!(normalize_reddit_api_path("/search.json?q=rust&sort=new").contains("q=rust"));
 	}
 
 	#[test]
