@@ -1247,20 +1247,38 @@ a.search_subreddit:hover {
     overflow: visible;
 }
 
+.gallery_detail {
+    display: grid;
+    gap: 15px;
+}
+
+.gallery_detail > figure {
+    min-width: 0;
+    margin: 0;
+}
+
+.gallery_detail > figure > a:not(.gallery_original_link) {
+    display: flex;
+    justify-content: center;
+}
+
 .gallery_detail_animation {
     position: relative;
-    display: flex;
+    display: grid;
+    width: 100%;
     max-width: 100%;
-    justify-content: center;
+    place-items: center;
 }
 
 .gallery_detail_animation > video,
 .gallery_detail_animation > img[data-gallery-fallback] {
+    grid-area: 1 / 1;
     display: block;
     width: auto;
     height: auto;
     max-width: 100%;
-    max-height: 512px;
+    max-height: min(78vh, 720px);
+    max-height: min(78svh, 720px);
     object-fit: contain;
 }
 
@@ -1314,9 +1332,16 @@ a.search_subreddit:hover {
     position: relative;
     display: grid;
     width: 100%;
-    height: clamp(240px, 70vw, 420px);
+    height: auto;
+    max-height: min(76vh, 640px);
+    max-height: min(76svh, 640px);
+    aspect-ratio: var(--gallery-aspect-ratio, 16 / 9);
     place-items: center;
-    background: var(--background);
+    background: transparent;
+}
+
+.gallery-js .feed_gallery_stage {
+    aspect-ratio: var(--gallery-active-aspect-ratio, var(--gallery-aspect-ratio, 16 / 9));
 }
 
 .feed_gallery_stage > a:not(.gallery_original_link) {
@@ -1399,7 +1424,7 @@ body:not(.gallery-js) .gallery_detail_animation .gallery_original_link {
 .feed_gallery_stage > [hidden],
 .feed_gallery_single_animation > [hidden],
 .gallery_detail_animation > [hidden] {
-    display: none;
+    display: none !important;
 }
 
 .gallery_original_link {

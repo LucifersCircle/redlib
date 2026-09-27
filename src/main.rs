@@ -8,13 +8,11 @@ use std::sync::LazyLock;
 
 use futures_lite::FutureExt;
 use hyper::{header::HeaderValue, Body, Request, Response};
-use log::{info, warn};
-use redlib::client::{canonical_path, proxy, rate_limit_check, start_tor_fallback, CLIENT};
+use log::info;
+use redlib::client::{canonical_path, proxy, start_oauth, start_tor_fallback, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
-
-use redlib::client::OAUTH_CLIENT;
 
 // Create Services
 
@@ -168,20 +166,6 @@ async fn main() {
 		)
 		.get_matches();
 
-	match rate_limit_check().await {
-		Ok(()) => {
-			info!("[✅] Rate limit check passed");
-		}
-		Err(e) => {
-			let mut message = format!("Rate limit check failed: {e}");
-			message += "\nThis may cause issues with the rate limit.";
-			message += "\nPlease report this error with the above information.";
-			message += "\nhttps://github.com/redlib-org/redlib/issues/new?assignees=sigaloid&labels=bug&title=%F0%9F%90%9B+Bug+Report%3A+Rate+limit+mismatch";
-			warn!("{}", message);
-			eprintln!("{message}");
-		}
-	}
-
 	let address = matches.get_one::<String>("address").unwrap();
 	let port = matches.get_one::<String>("port").unwrap();
 	let hsts = matches.get_one("hsts").map(|m: &String| m.as_str());
@@ -202,19 +186,13 @@ async fn main() {
 	// Begin constructing a server
 	let mut app = server::Server::new();
 
-	// Force evaluation of statics. In instance_info case, we need to evaluate
-	// the timestamp so deploy date is accurate - in config case, we need to
-	// evaluate the configuration to avoid paying penalty at first request -
-	// in OAUTH case, we need to retrieve the token to avoid paying penalty
-	// at first request
+	// Evaluate local statics before binding: this keeps the deploy timestamp
+	// accurate and avoids configuration work on the first request.
 
 	info!("Evaluating config.");
 	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
 	LazyLock::force(&instance_info::INSTANCE_INFO);
-	info!("Creating OAUTH client.");
-	LazyLock::force(&OAUTH_CLIENT);
-	start_tor_fallback();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -446,6 +424,10 @@ async fn main() {
 	println!("Running Redlib v{} on {listener}!", env!("CARGO_PKG_VERSION"));
 
 	let server = app.listen(&listener);
+	// Bind the public listener before beginning network-dependent OAuth startup.
+	// Reddit-backed pages return a retryable 503 until the direct client is ready.
+	start_oauth();
+	start_tor_fallback();
 
 	// Run this server for... forever!
 	if let Err(e) = server.await {

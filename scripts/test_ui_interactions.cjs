@@ -39,6 +39,11 @@ class Element extends Events {
         this.children = [];
         this.parentElement = null;
         this.textContent = '';
+        const styles = new Map();
+        this.style = {
+            setProperty: (name, value) => styles.set(name, value),
+            getPropertyValue: name => styles.get(name) || '',
+        };
         this.loading = attributes.loading || '';
         this._src = attributes.src || '';
         this.srcAssignments = [];
@@ -157,7 +162,11 @@ function galleryFixture(options) {
     const next = new Element('button', { 'data-gallery-next': '' });
     const images = [];
     const slides = Array.from({ length: 5 }, (_, index) => {
-        const slide = new Element('figure', { 'data-gallery-slide': '' });
+        const slide = new Element('figure', {
+            'data-gallery-slide': '',
+            'data-gallery-width': String(index === 1 ? 900 : 1600),
+            'data-gallery-height': String(index === 1 ? 1600 : 900),
+        });
         const image = new Element('img', { [index === 0 ? 'src' : 'data-src']: `/preview/${index}.jpg` });
         images.push(image);
         slide.offsetLeft = index * 300;
@@ -187,6 +196,7 @@ test('gallery initializes only the first and adjacent previews', () => {
     assert.equal(env.current.textContent, '1');
     assert.equal(env.previous.disabled, true);
     assert.equal(env.next.disabled, false);
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-active-aspect-ratio'), '1600 / 900');
     assert.equal('src' in env.images[1].dataset, false);
     assert.deepEqual(env.images[1].srcAssignments, [{ value: '/preview/1.jpg', loading: 'eager' }]);
 });
@@ -274,11 +284,53 @@ test('gallery animation uses MP4, pauses off-slide, and falls back to GIF once',
     assert.equal(video.playCount, 3, 'a user-paused animation stays paused');
 
     video.emit('error');
-    assert.equal(video.hidden, true);
-    assert.equal(fallback.hidden, false);
+    assert.equal(video.hidden, false, 'video remains in place while the GIF fallback loads');
+    assert.equal(fallback.hidden, true, 'fallback alt text is not exposed while loading');
     assert.deepEqual(fallback.srcAssignments, [{ value: '/img/animation.gif', loading: 'eager' }]);
     video.emit('error');
     assert.equal(fallback.srcAssignments.length, 1, 'fallback is activated only once');
+    fallback.emit('load');
+    assert.equal(video.hidden, true);
+    assert.equal(fallback.hidden, false);
+    assert.ok(video.pauseCount > 0);
+});
+
+test('gallery keeps the video visible if its GIF fallback also fails', () => {
+    const env = browser();
+    const container = new Element('div', { 'data-gallery-standalone': '' });
+    const video = new Element('video', {
+        'data-gallery-video': '',
+        'data-src': '/preview/animation.mp4',
+        'data-gif-fallback': '/img/animation.gif',
+        'data-autoplay': 'false',
+    });
+    const fallback = new Element('img', { 'data-gallery-fallback': '', hidden: '' });
+    video.paused = true;
+    video.load = () => {};
+    video.pause = () => {};
+    container.append(video, fallback);
+    env.document.body.append(container);
+    env.run('gallery.js');
+
+    video.emit('error');
+    fallback.emit('error');
+    assert.equal(video.hidden, false);
+    assert.equal(video.controls, true);
+    assert.equal(fallback.hidden, true);
+    video.emit('error');
+    assert.equal(fallback.srcAssignments.length, 1, 'a failed fallback is not retried in a loop');
+});
+
+test('gallery stages use each item aspect ratio without a fixed black frame', () => {
+    const template = fs.readFileSync(path.join(__dirname, '..', 'templates', 'utils.html'), 'utf8');
+    const stylesheet = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
+
+    assert.ok(template.includes('style="--gallery-aspect-ratio: {{ image.width }} / {{ image.height }}"'));
+    assert.ok(template.includes('data-gallery-width="{{ image.width }}" data-gallery-height="{{ image.height }}"'));
+    assert.match(stylesheet, /\.feed_gallery_stage \{[^}]+aspect-ratio: var\(--gallery-aspect-ratio, 16 \/ 9\);[^}]+background: transparent;/s);
+    assert.match(stylesheet, /\.gallery-js \.feed_gallery_stage \{[^}]+--gallery-active-aspect-ratio/s);
+    assert.doesNotMatch(stylesheet, /\.feed_gallery_stage \{[^}]+height: clamp\(/s);
+    assert.match(stylesheet, /\.gallery_detail_animation > video,[^}]+grid-area: 1 \/ 1;/s);
 });
 
 test('gallery animation loads without playing when autoplay is disabled', () => {
@@ -357,6 +409,7 @@ test('gallery animation playback follows the media stage visibility', () => {
 test('gallery navigation updates loading, counter and boundary buttons', () => {
     const env = galleryFixture();
     env.next.emit('click');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-active-aspect-ratio'), '900 / 1600');
     assert.deepEqual(env.track.lastScroll, { left: 300, behavior: 'smooth' });
     assert.equal(env.images[2].src, '/preview/2.jpg');
     assert.equal(env.images[3].src, '');
