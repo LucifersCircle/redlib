@@ -217,7 +217,7 @@
 
 {% macro post_in_list(post) -%}
 {% set post_should_be_blurred = (post.flags.nsfw && prefs.blur_nsfw=="on") || (post.flags.spoiler && prefs.blur_spoiler=="on") -%}
-<div class="post{% if post.flags.stickied %} stickied{% endif %}{% if post_should_be_blurred %} post_blurred{% endif %}" id="{{ post.id }}">
+<div class="post{% if post.flags.stickied %} stickied{% endif %}{% if post_should_be_blurred %} post_blurred{% endif %}{% if post.post_type == "link" %} external_link{% endif %}" id="{{ post.id }}">
 	<p class="post_header">
 		{% let community -%}
 		{% if post.community.starts_with("u_") -%}
@@ -303,8 +303,13 @@
 		</div>
 		<span class="feed_gallery_count" aria-live="polite"><span data-gallery-current>1</span> / {{ post.gallery.len() }}</span>
 	</div>
+	{% else if post.post_type == "link" && post.thumbnail.url.is_empty() %}
+	<a class="external_link_row" href="{{ post.media.url }}" rel="nofollow">
+		<span class="external_link_icon" aria-hidden="true">↗</span>
+		<span class="external_link_domain">{% if post.domain.is_empty() %}External link{% else %}{{ post.domain }}{% endif %}</span>
+	</a>
 	{% else if post.post_type != "self" %}
-	<a class="post_thumbnail{% if post.thumbnail.url.is_empty() %} no_thumbnail{% endif %}" href="{% if post.post_type == "link" %}{{ post.media.url }}{% else %}{{ post.permalink }}{% endif %}" rel="nofollow" draggable="false">
+	<a class="post_thumbnail{% if post.post_type == "link" %} external_thumbnail{% endif %}{% if post.thumbnail.url.is_empty() %} no_thumbnail{% endif %}" href="{% if post.post_type == "link" %}{{ post.media.url }}{% else %}{{ post.permalink }}{% endif %}" rel="nofollow" draggable="false">
 		{% if post.thumbnail.url.is_empty() %}
 		<svg viewBox="0 0 100 106" width="140" height="53" xmlns="http://www.w3.org/2000/svg">
 			<title>Thumbnail</title>
