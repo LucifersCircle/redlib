@@ -117,7 +117,7 @@ impl OauthBackendImpl {
 }
 
 // Spoofed client for Android devices
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
 	pub(crate) http_client: Arc<wreq::Client>,
