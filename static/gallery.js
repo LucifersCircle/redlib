@@ -43,6 +43,25 @@
     function initializeVideoFallback(video) {
         if (video.dataset.fallbackReady === 'true') return;
         video.dataset.fallbackReady = 'true';
+        const fallback = video.parentElement && video.parentElement.querySelector('img[data-gallery-fallback]');
+        if (fallback) {
+            fallback.addEventListener('load', function() {
+                if (video.dataset.fallbackLoading !== 'true') return;
+                video.dataset.fallbackLoading = 'false';
+                video.dataset.fallbackShown = 'true';
+                fallback.hidden = false;
+                video.hidden = true;
+                pauseVideo(video);
+            });
+            fallback.addEventListener('error', function() {
+                if (video.dataset.fallbackLoading !== 'true') return;
+                video.dataset.fallbackLoading = 'false';
+                video.dataset.fallbackFailed = 'true';
+                fallback.hidden = true;
+                video.hidden = false;
+                video.controls = true;
+            });
+        }
         function noteUserGesture() {
             video.dataset.userGestureAt = String(Date.now());
             if (typeof window.setTimeout === 'function') {
@@ -73,20 +92,19 @@
             }
         });
         video.addEventListener('error', function() {
-            if (video.dataset.fallbackShown === 'true') return;
+            if (video.dataset.fallbackShown === 'true' || video.dataset.fallbackLoading === 'true' || video.dataset.fallbackFailed === 'true') return;
             const fallbackUrl = video.dataset.gifFallback;
-            const fallback = video.parentElement && video.parentElement.querySelector('img[data-gallery-fallback]');
             if (!fallbackUrl || !fallback) {
                 video.controls = true;
                 return;
             }
 
-            video.dataset.fallbackShown = 'true';
+            // Keep the poster/video in place while the GIF loads. Revealing the
+            // fallback first exposes its alt text as a second media column on
+            // slower connections, especially in iOS Safari.
+            video.dataset.fallbackLoading = 'true';
             fallback.loading = 'eager';
             fallback.src = fallbackUrl;
-            fallback.hidden = false;
-            video.hidden = true;
-            pauseVideo(video);
         });
     }
 
@@ -176,6 +194,14 @@
             loadSlide(index + 1);
         }
 
+        function useSlideAspectRatio(slide) {
+            const width = Number(slide && slide.dataset.galleryWidth);
+            const height = Number(slide && slide.dataset.galleryHeight);
+            if (width > 0 && height > 0) {
+                gallery.style.setProperty('--gallery-active-aspect-ratio', `${width} / ${height}`);
+            }
+        }
+
         function updateCurrentSlide() {
             scrollFrame = 0;
             if (!initialized) return;
@@ -190,6 +216,7 @@
                 }
             });
 
+            useSlideAspectRatio(slides[closestIndex]);
             current.textContent = String(closestIndex + 1);
             loadAdjacentSlides(closestIndex);
             slides.forEach(function(slide, index) {
@@ -227,6 +254,7 @@
         function showSlide(index) {
             const slide = slides[index];
             if (!slide) return;
+            useSlideAspectRatio(slide);
             loadAdjacentSlides(index);
             track.scrollTo({ left: slide.offsetLeft, behavior: 'smooth' });
         }
