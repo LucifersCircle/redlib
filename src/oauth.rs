@@ -1,8 +1,7 @@
 use crate::{
 	client::{
 		claim_quota_rotation, client_for_new_identity, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket,
-		OAUTH_IS_ROLLING_OVER,
-		TOR_OAUTH_IS_ROLLING_OVER,
+		OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::RedditLane,
@@ -171,7 +170,9 @@ impl Oauth {
 			RedditLane::Direct => OAUTH_TIMEOUT,
 			RedditLane::Tor => TOR_OAUTH_TIMEOUT,
 		};
-		let response = timeout(oauth_timeout, backend.authenticate(&http_client)).await.map_err(|_| AuthError::Timeout(oauth_timeout))??;
+		let response = timeout(oauth_timeout, backend.authenticate(&http_client))
+			.await
+			.map_err(|_| AuthError::Timeout(oauth_timeout))??;
 
 		// Build headers_map from backend headers + Authorization header
 		let mut headers_map = backend.get_headers();
@@ -201,7 +202,9 @@ impl Oauth {
 	async fn refreshed(&self, reason: RefreshReason) -> Result<RefreshedOauth, RefreshError> {
 		let (mut primary, primary_is_fresh) = self.refresh_backend(reason, false);
 		let primary_name = primary.name();
-		let primary_http_client = self.http_client_for_refresh(primary_is_fresh).map_err(|error| RefreshError::configuration(primary_name, error))?;
+		let primary_http_client = self
+			.http_client_for_refresh(primary_is_fresh)
+			.map_err(|error| RefreshError::configuration(primary_name, error))?;
 		match Self::authenticate_with_backend(&mut primary, primary_http_client).await {
 			Ok(oauth) => Ok(RefreshedOauth {
 				oauth,
