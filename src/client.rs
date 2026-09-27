@@ -1308,12 +1308,19 @@ fn direct_edge_fallback_active(now: Instant) -> bool {
 	edge_fallback_active(&upstream_guard(RedditLane::Direct), now)
 }
 
-fn preferred_api_lane(now: Instant) -> RedditLane {
-	if tor_fallback_ready() && direct_edge_fallback_active(now) {
+fn select_preferred_api_lane(direct_ready: bool, tor_ready: bool, direct_edge_active: bool) -> RedditLane {
+	if tor_ready && (!direct_ready || direct_edge_active) {
 		RedditLane::Tor
 	} else {
 		RedditLane::Direct
 	}
+}
+
+fn preferred_api_lane(now: Instant) -> RedditLane {
+	let direct_ready = OAUTH_CLIENT.load().is_some();
+	let tor_ready = tor_fallback_ready();
+	let direct_edge_active = direct_ready && direct_edge_fallback_active(now);
+	select_preferred_api_lane(direct_ready, tor_ready, direct_edge_active)
 }
 
 fn begin_upstream_attempt(lane: RedditLane) -> Result<(Arc<Oauth>, UpstreamAttempt), (String, bool)> {
@@ -3348,6 +3355,15 @@ mod tests {
 		assert!(!should_retry_on_tor(RedditLane::Direct, true, false, true));
 		assert!(!should_retry_on_tor(RedditLane::Direct, true, true, false));
 		assert!(!should_retry_on_tor(RedditLane::Tor, true, true, true));
+	}
+
+	#[test]
+	fn test_tor_serves_requests_while_direct_oauth_is_starting() {
+		assert_eq!(select_preferred_api_lane(false, true, false), RedditLane::Tor);
+		assert_eq!(select_preferred_api_lane(false, false, false), RedditLane::Direct);
+		assert_eq!(select_preferred_api_lane(true, true, false), RedditLane::Direct);
+		assert_eq!(select_preferred_api_lane(true, true, true), RedditLane::Tor);
+		assert_eq!(select_preferred_api_lane(true, false, true), RedditLane::Direct);
 	}
 
 	#[test]
