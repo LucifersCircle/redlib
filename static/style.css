@@ -1959,18 +1959,27 @@ input[type="submit"] {
 }
 
 .md .md-spoiler-text,
-.md-spoiler-text a {
+.md .md-spoiler-text * {
     background: var(--highlighted);
     color: transparent;
 }
 
-.md-spoiler-text:hover {
+.md-spoiler-text:hover,
+.md-spoiler-text.spoiler_revealed {
     background: var(--foreground);
     color: var(--text);
 }
 
-.md-spoiler-text:hover a {
-    background: var(--foreground);
+.md-spoiler-text:hover *,
+.md-spoiler-text.spoiler_revealed * {
+    background: transparent;
+    color: inherit;
+}
+
+.md-spoiler-text:hover a,
+.md-spoiler-text:hover a *,
+.md-spoiler-text.spoiler_revealed a,
+.md-spoiler-text.spoiler_revealed a * {
     color: var(--accent);
 }
 
