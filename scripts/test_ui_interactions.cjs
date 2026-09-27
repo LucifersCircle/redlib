@@ -281,13 +281,44 @@ test('spoilers preserve keyboard and explicit mouse behavior on hybrid devices',
     const env = spoilerFixture({ coarse: true });
     env.document.emit('pointerdown', pointer());
     assert.equal(env.document.emit('click', { target: env.link, detail: 0, pointerType: 'touch' }).defaultPrevented, false);
-    assert.equal(env.tap(env.link, 'mouse').defaultPrevented, false);
     assert.equal(env.spoiler.classList.contains('spoiler_revealed'), false);
-    assert.equal(env.tap(env.link, 'touch').defaultPrevented, true);
+    assert.equal(env.tap(env.link, 'mouse').defaultPrevented, false);
+    assert.equal(env.spoiler.classList.contains('spoiler_revealed'), true);
+    assert.equal(env.tap(env.link, 'touch').defaultPrevented, false);
 
     const desktop = spoilerFixture({ coarse: false });
     assert.equal(desktop.document.emit('click', { target: desktop.link, detail: 1 }).defaultPrevented, false);
-    assert.equal(desktop.tap(desktop.link, 'pen').defaultPrevented, true);
+    assert.equal(desktop.spoiler.classList.contains('spoiler_revealed'), true);
+    const pen = spoilerFixture();
+    assert.equal(pen.tap(pen.link, 'pen').defaultPrevented, true);
+});
+
+test('revealing a second spoiler keeps both revealed for touch, pen and mouse clicks', () => {
+    for (const pointerType of ['touch', 'pen', 'mouse', '']) {
+        const env = spoilerFixture({ coarse: false });
+        const second = new Element('span', { class: 'md-spoiler-text' });
+        env.document.body.append(second);
+        const activate = target => pointerType
+            ? env.tap(target, pointerType)
+            : env.document.emit('click', { target, detail: 1 });
+        activate(env.spoiler);
+        assert.equal(env.spoiler.classList.contains('spoiler_revealed'), true, pointerType);
+        activate(second);
+        assert.equal(env.spoiler.classList.contains('spoiler_revealed'), true, pointerType);
+        assert.equal(second.classList.contains('spoiler_revealed'), true, pointerType);
+        activate(env.spoiler);
+        assert.equal(env.spoiler.classList.contains('spoiler_revealed'), true, pointerType);
+        assert.equal(second.classList.contains('spoiler_revealed'), true, pointerType);
+    }
+});
+
+test('keyboard and non-primary mouse activation do not reveal spoilers', () => {
+    const env = spoilerFixture();
+    for (const properties of [{ detail: 0 }, { detail: 1, button: 1 }, { detail: 1, button: 2 }]) {
+        const event = env.document.emit('click', { target: env.link, pointerType: 'mouse', ...properties });
+        assert.equal(event.defaultPrevented, false);
+        assert.equal(env.spoiler.classList.contains('spoiler_revealed'), false);
+    }
 });
 
 test('spoiler fallback supports touch-only browsers and recent touch on hybrids', () => {
