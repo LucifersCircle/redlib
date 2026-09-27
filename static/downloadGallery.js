@@ -56,8 +56,8 @@
                 if (!gallery) return;
 
                 const images = [];
-                gallery.querySelectorAll('figure img').forEach(function(img) {
-                    images.push(img.src);
+                gallery.querySelectorAll('figure > a').forEach(function(imageLink) {
+                    images.push(imageLink.href);
                 });
 
                 if (images.length === 0) return;

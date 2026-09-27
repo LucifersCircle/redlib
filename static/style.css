@@ -1130,6 +1130,10 @@ a.search_subreddit:hover {
 .post_thumbnail img,
 .gallery > figure > a,
 .gallery > figure > a img,
+.feed_gallery_slide > a,
+.feed_gallery_slide > a img,
+.feed_gallery_single figure > a,
+.feed_gallery_single figure > a img,
 .post_body figure > a,
 .post_body figure > a img,
 .comment_body figure > a,
@@ -1140,6 +1144,8 @@ a.search_subreddit:hover {
 .post_media_image,
 .post_thumbnail,
 .gallery > figure > a,
+.feed_gallery_slide > a,
+.feed_gallery_single figure > a,
 .post_body figure > a,
 .comment_body figure > a {
     -webkit-user-drag: none;
@@ -1148,6 +1154,8 @@ a.search_subreddit:hover {
 .post_media_image img,
 .post_thumbnail img,
 .gallery > figure > a img,
+.feed_gallery_slide > a img,
+.feed_gallery_single figure > a img,
 .post_body figure > a img,
 .comment_body figure > a img {
     -webkit-user-drag: none;
@@ -1158,6 +1166,8 @@ a.search_subreddit:hover {
 .post_media_image img::selection,
 .post_thumbnail img::selection,
 .gallery > figure > a img::selection,
+.feed_gallery_slide > a img::selection,
+.feed_gallery_single figure > a img::selection,
 .post_body figure > a img::selection,
 .comment_body figure > a img::selection {
     background: transparent;
@@ -1225,6 +1235,139 @@ a.search_subreddit:hover {
     vertical-align: bottom;
 }
 
+.gallery_media_wrapper > .gallery {
+    grid-area: auto;
+    max-width: 100%;
+    margin: 0;
+    overflow: visible;
+}
+
+.feed_gallery_single figure,
+.feed_gallery_slide {
+    margin: 0;
+}
+
+.feed_gallery_single img,
+.feed_gallery_slide img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 512px;
+    margin: auto;
+    object-fit: contain;
+}
+
+.feed_gallery {
+    position: relative;
+    width: calc(100% - 40px);
+}
+
+.feed_gallery_track {
+    display: flex;
+    width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x mandatory;
+}
+
+.gallery-js .feed_gallery_track {
+    scrollbar-width: none;
+}
+
+.gallery-js .feed_gallery_track::-webkit-scrollbar {
+    display: none;
+}
+
+.feed_gallery_slide {
+    flex: 0 0 100%;
+    min-width: 0;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+}
+
+.feed_gallery_slide > a {
+    display: flex;
+    min-height: 1px;
+    justify-content: center;
+}
+
+.feed_gallery_slide img[data-src] {
+    visibility: hidden;
+}
+
+body:not(.gallery-js) .feed_gallery_slide img[data-src] {
+    display: none;
+}
+
+.feed_gallery_count {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.75);
+    color: white;
+    display: none;
+    font-size: 12px;
+    font-weight: bold;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.gallery-js .feed_gallery_count {
+    display: block;
+}
+
+.feed_gallery_control {
+    display: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .gallery-js .feed_gallery_control {
+        position: absolute;
+        top: 50%;
+        z-index: 1;
+        display: grid;
+        width: 34px;
+        height: 44px;
+        padding: 0;
+        border: 0;
+        border-radius: 5px;
+        place-items: center;
+        transform: translateY(-50%);
+        background: rgba(0, 0, 0, 0.72);
+        color: white;
+        font-size: 26px;
+        line-height: 1;
+        cursor: pointer;
+    }
+
+    .gallery-js .feed_gallery_control:disabled {
+        display: none;
+    }
+
+    .gallery-js .feed_gallery_previous {
+        left: 8px;
+    }
+
+    .gallery-js .feed_gallery_next {
+        right: 8px;
+    }
+}
+
+.feed_gallery_single figcaption,
+.feed_gallery_slide figcaption {
+    padding: 8px 10px 0;
+    overflow-wrap: anywhere;
+}
+
+.feed_gallery_single figcaption p,
+.feed_gallery_slide figcaption p {
+    margin: 0 0 5px;
+}
+
 .gallery .outbound_url {
     color: var(--accent);
     text-overflow: ellipsis;
@@ -1234,11 +1377,47 @@ a.search_subreddit:hover {
     padding-top: 5px;
 }
 
+.feed_gallery_single .outbound_url,
+.feed_gallery_slide .outbound_url {
+    color: var(--accent);
+}
+
 #post_url {
     color: var(--accent);
     margin: 5px 12px;
     grid-area: post_media;
     overflow-wrap: anywhere;
+}
+
+.external_link_row {
+    grid-area: post_media;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    width: fit-content;
+    max-width: calc(100% - 27px);
+    box-sizing: border-box;
+    margin: 5px 15px 5px 12px;
+    padding: 6px 9px;
+    border: var(--panel-border);
+    border-radius: 5px;
+    background: var(--background);
+    color: var(--accent);
+    font-size: 13px;
+}
+
+.external_link_icon {
+    flex: 0 0 auto;
+    font-size: 16px;
+    line-height: 1;
+}
+
+.external_link_domain {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .post_body {
@@ -1864,18 +2043,27 @@ input[type="submit"] {
 }
 
 .md .md-spoiler-text,
-.md-spoiler-text a {
+.md .md-spoiler-text * {
     background: var(--highlighted);
     color: transparent;
 }
 
-.md-spoiler-text:hover {
+.md-spoiler-text:hover,
+.md-spoiler-text.spoiler_revealed {
     background: var(--foreground);
     color: var(--text);
 }
 
-.md-spoiler-text:hover a {
-    background: var(--foreground);
+.md-spoiler-text:hover *,
+.md-spoiler-text.spoiler_revealed * {
+    background: transparent;
+    color: inherit;
+}
+
+.md-spoiler-text:hover a,
+.md-spoiler-text:hover a *,
+.md-spoiler-text.spoiler_revealed a,
+.md-spoiler-text.spoiler_revealed a * {
     color: var(--accent);
 }
 
@@ -2120,6 +2308,27 @@ th {
     }
     .post_footer {
         margin-left: 15px;
+    }
+
+    body:not(.compact) .external_link .post_thumbnail.external_thumbnail {
+        grid-area: post_media;
+        width: calc(100% - 27px);
+        max-height: none;
+        margin: 8px 15px 5px 12px;
+    }
+
+    body:not(.compact) .external_link .post_thumbnail.external_thumbnail div {
+        width: 100%;
+        max-width: none !important;
+        max-height: none !important;
+    }
+
+    body:not(.compact) .external_link .post_thumbnail.external_thumbnail img {
+        display: block;
+        width: 100%;
+        height: auto;
+        max-height: 360px;
+        object-fit: cover;
     }
 
     .replies > .comment {

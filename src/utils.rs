@@ -330,6 +330,7 @@ impl Media {
 #[derive(Serialize)]
 pub struct GalleryMedia {
 	pub url: String,
+	pub preview_url: String,
 	pub width: i64,
 	pub height: i64,
 	pub caption: String,
@@ -342,10 +343,11 @@ impl GalleryMedia {
 			.as_array()
 			.unwrap_or(&Vec::new())
 			.iter()
-			.map(|item| {
+			.filter_map(|item| {
 				// For each image in gallery
 				let media_id = item["media_id"].as_str().unwrap_or_default();
-				let image = &metadata[media_id]["s"];
+				let media = &metadata[media_id];
+				let image = &media["s"];
 				let image_type = &metadata[media_id]["m"];
 
 				let url = if image_type == "image/gif" {
@@ -353,15 +355,34 @@ impl GalleryMedia {
 				} else {
 					image["u"].as_str().unwrap_or_default()
 				};
+				let url = format_url(url);
+				if url.is_empty() {
+					return None;
+				}
+
+				// Reddit includes already-sized gallery previews in the listing
+				// payload. Prefer a feed-sized image rather than loading every
+				// original gallery asset on listing pages.
+				let preview = media["p"].as_array().and_then(|previews| {
+					previews
+						.iter()
+						.find(|preview| preview["x"].as_i64().unwrap_or_default() >= 640 && preview["u"].as_str().is_some_and(|url| !url.is_empty()))
+						.or_else(|| previews.iter().rev().find(|preview| preview["u"].as_str().is_some_and(|url| !url.is_empty())))
+				});
+				let preview_url = preview
+					.map(|preview| format_url(preview["u"].as_str().unwrap_or_default()))
+					.filter(|preview_url| preview_url.starts_with("/preview/") || preview_url.starts_with("/img/") || preview_url.starts_with("/thumb/"))
+					.unwrap_or_else(|| url.clone());
 
 				// Construct gallery items
-				Self {
-					url: format_url(url),
+				Some(Self {
+					url,
+					preview_url,
 					width: image["x"].as_i64().unwrap_or_default(),
 					height: image["y"].as_i64().unwrap_or_default(),
 					caption: item["caption"].as_str().unwrap_or_default().to_string(),
 					outbound_url: item["outbound_url"].as_str().unwrap_or_default().to_string(),
-				}
+				})
 			})
 			.collect::<Vec<Self>>()
 	}
@@ -1607,7 +1628,7 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 mod tests {
 	use super::{
 		deflate_compress, deflate_decompress, format_num, format_url, is_reddit_image_domain, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after,
-		url_path_basename, Media, Post, Preferences,
+		url_path_basename, GalleryMedia, Media, Post, Preferences,
 	};
 
 	#[test]
@@ -1780,6 +1801,113 @@ mod tests {
 	fn reddit_onion_image_domain_is_classified_as_an_image() {
 		assert!(is_reddit_image_domain("i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion"));
 		assert!(!is_reddit_image_domain("i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion.example.com"));
+	}
+
+	#[test]
+	fn gallery_uses_feed_sized_preview_and_keeps_original() {
+		let items = serde_json::json!([{
+			"media_id": "one",
+			"caption": "Caption",
+			"outbound_url": "https://example.com/story"
+		}]);
+		let metadata = serde_json::json!({
+			"one": {
+				"m": "image/jpeg",
+				"s": {
+					"u": "https://i.redd.it/original.jpg",
+					"x": 2048,
+					"y": 1365
+				},
+				"p": [
+					{"u": "https://preview.redd.it/preview.jpg?width=320", "x": 320, "y": 213},
+					{"u": "https://preview.redd.it/preview.jpg?width=640", "x": 640, "y": 426},
+					{"u": "https://preview.redd.it/preview.jpg?width=960", "x": 960, "y": 639}
+				]
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 1);
+		assert_eq!(gallery[0].url, "/img/original.jpg");
+		assert_eq!(gallery[0].preview_url, "/preview/pre/preview.jpg?width=640");
+		assert_eq!(gallery[0].caption, "Caption");
+		assert_eq!(gallery[0].outbound_url, "https://example.com/story");
+	}
+
+	#[test]
+	fn gallery_falls_back_to_original_and_skips_missing_media() {
+		let items = serde_json::json!([
+			{"media_id": "valid"},
+			{"media_id": "missing"}
+		]);
+		let metadata = serde_json::json!({
+			"valid": {
+				"m": "image/jpeg",
+				"s": {
+					"u": "https://i.redd.it/original.jpg",
+					"x": 800,
+					"y": 600
+				}
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 1);
+		assert_eq!(gallery[0].preview_url, gallery[0].url);
+	}
+
+	#[test]
+	fn gallery_rejects_unproxied_preview_candidates() {
+		let items = serde_json::json!([{"media_id": "one"}]);
+		let metadata = serde_json::json!({
+			"one": {
+				"m": "image/jpeg",
+				"s": {
+					"u": "https://i.redd.it/original.jpg",
+					"x": 1280,
+					"y": 720
+				},
+				"p": [{
+					"u": "https://tracking.example/preview.jpg",
+					"x": 640,
+					"y": 360
+				}]
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 1);
+		assert_eq!(gallery[0].url, "/img/original.jpg");
+		assert_eq!(gallery[0].preview_url, gallery[0].url);
+	}
+
+	#[test]
+	fn gallery_rewrites_onion_preview_with_query() {
+		let items = serde_json::json!([{"media_id": "one"}]);
+		let metadata = serde_json::json!({
+			"one": {
+				"m": "image/jpeg",
+				"s": {
+					"u": "https://i.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/original.jpg",
+					"x": 1280,
+					"y": 720
+				},
+				"p": [{
+					"u": "https://preview.redditdotzhmh3mao6r5i2j7speppwqkizwo7vksy3mbz5iz7rlhocyd.onion/preview.jpg?width=640&amp;s=token",
+					"x": 640,
+					"y": 360
+				}]
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 1);
+		assert_eq!(gallery[0].url, "/img/original.jpg");
+		assert_eq!(gallery[0].preview_url, "/preview/pre/preview.jpg?width=640&amp;s=token");
 	}
 
 	#[test]
