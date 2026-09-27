@@ -1940,8 +1940,9 @@ fn canonical_comments_base(path: &str) -> Option<String> {
 	let (prefix, post_id, comment_id) = match segments.as_slice() {
 		["comments", post_id] | ["comments", post_id, _] => (String::new(), *post_id, None),
 		["comments", post_id, _, comment_id] => (String::new(), *post_id, Some(*comment_id)),
-		[prefix @ ("r" | "u" | "user"), scope, "comments", post_id]
-		| [prefix @ ("r" | "u" | "user"), scope, "comments", post_id, _] => (format!("/{prefix}/{scope}"), *post_id, None),
+		[prefix @ ("r" | "u" | "user"), scope, "comments", post_id] | [prefix @ ("r" | "u" | "user"), scope, "comments", post_id, _] => {
+			(format!("/{prefix}/{scope}"), *post_id, None)
+		}
 		[prefix @ ("r" | "u" | "user"), scope, "comments", post_id, _, comment_id] => (format!("/{prefix}/{scope}"), *post_id, Some(*comment_id)),
 		_ => return None,
 	};
