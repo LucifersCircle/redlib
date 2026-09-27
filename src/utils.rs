@@ -1674,7 +1674,10 @@ mod tests {
 			Some(Some(42))
 		);
 		assert_eq!(temporary_error_retry_after("Refreshing the anonymous Reddit session. Retry in 2 seconds"), Some(Some(2)));
-		assert_eq!(temporary_error_retry_after("Redlib is starting its anonymous Reddit session. Retry in 5 seconds"), Some(Some(5)));
+		assert_eq!(
+			temporary_error_retry_after("Redlib is starting its anonymous Reddit session. Retry in 5 seconds"),
+			Some(Some(5))
+		);
 		assert_eq!(temporary_error_retry_after("Reddit is having issues, check if there's an outage"), Some(None));
 		assert_eq!(temporary_error_retry_after("r/example is a private community"), None);
 	}

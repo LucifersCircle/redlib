@@ -976,7 +976,11 @@ mod tests {
 	#[ignore = "requires application-managed live OAuth startup"]
 	async fn test_oauth_client() {
 		// Integration test - tests the overall Oauth client
-		assert!(OAUTH_CLIENT.load_full().expect("OAuth client should be initialized").headers_map.contains_key("Authorization"));
+		assert!(OAUTH_CLIENT
+			.load_full()
+			.expect("OAuth client should be initialized")
+			.headers_map
+			.contains_key("Authorization"));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

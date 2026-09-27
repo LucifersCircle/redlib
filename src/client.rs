@@ -1514,10 +1514,7 @@ pub(crate) fn client_for_new_identity(lane: RedditLane, profile: OauthTransportP
 }
 
 pub fn start_oauth() {
-	if DIRECT_OAUTH_WARMUP_STARTED
-		.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-		.is_err()
-	{
+	if DIRECT_OAUTH_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
 
