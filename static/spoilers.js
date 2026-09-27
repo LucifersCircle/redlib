@@ -31,11 +31,13 @@
 
     document.addEventListener('click', function(event) {
         // Keyboard-generated clicks have detail=0. Keep the existing keyboard
-        // behavior unchanged; this enhancement is only for taps.
+        // behavior unchanged. Pointer clicks, including mouse clicks, make
+        // the reveal persistent instead of relying only on transient :hover.
         const pointerType = 'pointerType' in event ? event.pointerType : '';
         const isExplicitTap = pointerType === 'touch' || pointerType === 'pen';
         const isFallbackTap = pointerType === '' && (touchPointer.matches || Date.now() - recentTouch.time < 1000);
-        if (event.detail === 0 || (!isExplicitTap && !isFallbackTap) || recentTouch.moved) return;
+        const isTap = isExplicitTap || isFallbackTap;
+        if (event.detail === 0 || event.button > 0 || (isTap && recentTouch.moved)) return;
 
         const target = event.target;
         if (!(target instanceof Element)) return;
@@ -52,10 +54,13 @@
         }
         if (spoilersToReveal.length === 0) return;
 
-        // The first tap reveals the entire spoiler. If the tap was on a link,
-        // cancelling it means the second tap can follow the now-visible link.
-        event.preventDefault();
-        event.stopPropagation();
+        // Touch has no reliable hover preview: its first tap reveals and the
+        // second can navigate. Mouse users already see links on hover, so keep
+        // their normal link activation while remembering the revealed state.
+        if (isTap) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
         spoilersToReveal.forEach(function(item) {
             item.classList.add('spoiler_revealed');
             item.querySelectorAll('.md-spoiler-text').forEach(function(nested) {
