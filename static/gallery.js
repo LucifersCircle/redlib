@@ -187,15 +187,13 @@
             return Math.max(1, Math.round(Math.min(naturalHeight, viewportHeightLimit())));
         }
 
-        function resizeToSlide(index) {
-            const slide = slides[index];
-            if (!slide) return;
-            const height = mediaHeightForSlide(slide);
+        function resizeToLargestSlide() {
+            const height = Math.max(...slides.map(mediaHeightForSlide));
             gallery.style.setProperty('--gallery-media-height', `${height}px`);
             gallery.style.setProperty('--gallery-control-top', `${Math.round(height / 2)}px`);
         }
 
-        function canResizeSettledSlide() {
+        function canResizeGallery() {
             return initialized && activePointerId === null && settleTimer === 0 && !gallery.classList.contains('gallery_dragging');
         }
 
@@ -234,7 +232,7 @@
                     if (image.naturalWidth > 0 && image.naturalHeight > 0) {
                         slide.dataset.galleryWidth = String(image.naturalWidth);
                         slide.dataset.galleryHeight = String(image.naturalHeight);
-                        if (canResizeSettledSlide() && slides[settledIndex] === slide) resizeToSlide(settledIndex);
+                        if (canResizeGallery()) resizeToLargestSlide();
                     }
                 });
             });
@@ -245,7 +243,7 @@
                     if (video.videoWidth > 0 && video.videoHeight > 0) {
                         slide.dataset.galleryWidth = String(video.videoWidth);
                         slide.dataset.galleryHeight = String(video.videoHeight);
-                        if (canResizeSettledSlide() && slides[settledIndex] === slide) resizeToSlide(settledIndex);
+                        if (canResizeGallery()) resizeToLargestSlide();
                     }
                 });
                 observeVisibility(stage, function(visible) {
@@ -318,7 +316,7 @@
             updateCurrentSlide();
             settledIndex = activeIndex;
             gallery.classList.remove('gallery_dragging');
-            resizeToSlide(settledIndex);
+            resizeToLargestSlide();
             showActiveMetadata(settledIndex);
             updatePlayback();
         }
@@ -423,7 +421,7 @@
                 initialized = true;
                 updateCurrentSlide();
                 settledIndex = activeIndex;
-                resizeToSlide(settledIndex);
+                resizeToLargestSlide();
                 showActiveMetadata(settledIndex);
                 updatePlayback();
             } else if (initialized) {
@@ -439,12 +437,12 @@
                 const width = entries[0] && entries[0].contentRect.width;
                 if (!width || Math.abs(width - observedWidth) < 1) return;
                 observedWidth = width;
-                if (canResizeSettledSlide()) resizeToSlide(settledIndex);
+                if (canResizeGallery()) resizeToLargestSlide();
             });
             resizeObserver.observe(gallery);
         } else {
             window.addEventListener('resize', function() {
-                if (canResizeSettledSlide()) resizeToSlide(settledIndex);
+                if (canResizeGallery()) resizeToLargestSlide();
             }, { passive: true });
         }
     }

@@ -54,6 +54,8 @@ jobs:
           cargo test --locked --lib test_edge_throttle_delay_escalates_and_caps
           cargo test --locked --lib test_media_diagnostics_group_destinations_and_results
           cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
+          cargo test --locked --lib test_quota_admission_uses_remaining_allowance_near_reset
+          cargo test --locked --lib test_local_quota_retries_are_attempt_and_time_bounded
           cargo test --locked --lib test_quota_rotation_requires_known_exhausted_current_generation
           cargo test --locked --lib test_emergency_quota_rotation_requires_reserve_exhaustion_and_long_wait
           cargo test --locked --lib test_emergency_quota_rotation_claim_survives_stable_refresh_but_not_new_epoch
