@@ -143,25 +143,111 @@
 
     function initializeGallery(gallery) {
         const track = gallery.querySelector('[data-gallery-track]');
+        const viewport = gallery.querySelector('[data-gallery-viewport]');
         const slides = Array.from(gallery.querySelectorAll('[data-gallery-slide]'));
+        const captions = Array.from(gallery.querySelectorAll('[data-gallery-caption]'));
+        const originalControls = Array.from(gallery.querySelectorAll('[data-gallery-original-control]'));
         const current = gallery.querySelector('[data-gallery-current]');
         const previous = gallery.querySelector('[data-gallery-previous]');
         const next = gallery.querySelector('[data-gallery-next]');
-        if (!track || slides.length < 2 || !current) return;
+        if (!track || !viewport || slides.length < 2 || !current) return;
 
         let scrollFrame = 0;
+        let settleTimer = 0;
         let pointerStart = null;
         let activePointerId = null;
         let pointerMoved = false;
         let suppressClickUntil = 0;
         let initialized = false;
         let galleryVisible = false;
+        let activeIndex = 0;
+        let settledIndex = 0;
+
+        function viewportWidth() {
+            return viewport.clientWidth || gallery.clientWidth || track.clientWidth || slides[0].clientWidth || 1;
+        }
+
+        function viewportHeightLimit() {
+            const visualHeight = Number(window.visualViewport && window.visualViewport.height);
+            const windowHeight = Number(window.innerHeight);
+            const availableHeight = visualHeight > 0 ? visualHeight : (windowHeight > 0 ? windowHeight : 800);
+            const detail = gallery.dataset.galleryMode === 'detail';
+            return Math.min(availableHeight * (detail ? 0.76 : 0.68), detail ? 720 : 560);
+        }
+
+        function dimensionsForSlide(slide) {
+            const width = Number(slide && slide.dataset.galleryWidth);
+            const height = Number(slide && slide.dataset.galleryHeight);
+            return width > 0 && height > 0 ? { width, height } : { width: 4, height: 3 };
+        }
+
+        function mediaHeightForSlide(slide) {
+            const dimensions = dimensionsForSlide(slide);
+            const naturalHeight = viewportWidth() * dimensions.height / dimensions.width;
+            return Math.max(1, Math.round(Math.min(naturalHeight, viewportHeightLimit())));
+        }
+
+        function resizeToSlide(index) {
+            const slide = slides[index];
+            if (!slide) return;
+            const height = mediaHeightForSlide(slide);
+            gallery.style.setProperty('--gallery-media-height', `${height}px`);
+            gallery.style.setProperty('--gallery-control-top', `${Math.round(height / 2)}px`);
+        }
+
+        function canResizeSettledSlide() {
+            return initialized && activePointerId === null && settleTimer === 0 && !gallery.classList.contains('gallery_dragging');
+        }
+
+        function freezeViewportHeight() {
+            if (typeof viewport.getBoundingClientRect !== 'function') return;
+            const height = viewport.getBoundingClientRect().height;
+            if (height > 0) gallery.style.setProperty('--gallery-media-height', `${Math.round(height)}px`);
+        }
+
+        function closestSlideIndex() {
+            let closestIndex = 0;
+            let closestDistance = Infinity;
+            slides.forEach(function(slide, index) {
+                const distance = Math.abs(slide.offsetLeft - track.scrollLeft);
+                if (distance < closestDistance) {
+                    closestDistance = distance;
+                    closestIndex = index;
+                }
+            });
+            return closestIndex;
+        }
+
+        function showActiveMetadata(index) {
+            captions.forEach(function(caption, captionIndex) {
+                caption.hidden = captionIndex !== index;
+            });
+            originalControls.forEach(function(link, linkIndex) {
+                link.hidden = linkIndex !== index;
+            });
+        }
 
         slides.forEach(function(slide) {
             const stage = slide.querySelector('.feed_gallery_stage') || slide;
+            slide.querySelectorAll('img').forEach(function(image) {
+                image.addEventListener('load', function() {
+                    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+                        slide.dataset.galleryWidth = String(image.naturalWidth);
+                        slide.dataset.galleryHeight = String(image.naturalHeight);
+                        if (canResizeSettledSlide() && slides[settledIndex] === slide) resizeToSlide(settledIndex);
+                    }
+                });
+            });
             slide.querySelectorAll('video[data-gallery-video]').forEach(function(video) {
                 initializeVideoFallback(video);
                 video.dataset.mediaVisible = 'false';
+                video.addEventListener('loadedmetadata', function() {
+                    if (video.videoWidth > 0 && video.videoHeight > 0) {
+                        slide.dataset.galleryWidth = String(video.videoWidth);
+                        slide.dataset.galleryHeight = String(video.videoHeight);
+                        if (canResizeSettledSlide() && slides[settledIndex] === slide) resizeToSlide(settledIndex);
+                    }
+                });
                 observeVisibility(stage, function(visible) {
                     video.dataset.mediaVisible = visible ? 'true' : 'false';
                     if (initialized) scheduleCurrentSlideUpdate();
@@ -194,42 +280,27 @@
             loadSlide(index + 1);
         }
 
-        function useSlideAspectRatio(slide) {
-            const width = Number(slide && slide.dataset.galleryWidth);
-            const height = Number(slide && slide.dataset.galleryHeight);
-            if (width > 0 && height > 0) {
-                gallery.style.setProperty('--gallery-active-aspect-ratio', `${width} / ${height}`);
-            }
-        }
-
-        function updateCurrentSlide() {
-            scrollFrame = 0;
-            if (!initialized) return;
-            let closestIndex = 0;
-            let closestDistance = Infinity;
-
-            slides.forEach(function(slide, index) {
-                const distance = Math.abs(slide.offsetLeft - track.scrollLeft);
-                if (distance < closestDistance) {
-                    closestDistance = distance;
-                    closestIndex = index;
-                }
-            });
-
-            useSlideAspectRatio(slides[closestIndex]);
-            current.textContent = String(closestIndex + 1);
-            loadAdjacentSlides(closestIndex);
-            slides.forEach(function(slide, index) {
+        function updatePlayback() {
+            slides.forEach(function(slide, slideIndex) {
                 slide.querySelectorAll('video[data-gallery-video]').forEach(function(video) {
-                    if (index === closestIndex && galleryVisible && video.dataset.mediaVisible === 'true' && !document.hidden) {
+                    if (slideIndex === settledIndex && galleryVisible && video.dataset.mediaVisible === 'true' && !document.hidden) {
                         playVideo(video);
                     } else {
                         pauseVideo(video);
                     }
                 });
             });
-            if (previous) previous.disabled = closestIndex === 0;
-            if (next) next.disabled = closestIndex === slides.length - 1;
+        }
+
+        function updateCurrentSlide() {
+            scrollFrame = 0;
+            if (!initialized) return;
+            activeIndex = closestSlideIndex();
+            current.textContent = String(activeIndex + 1);
+            loadAdjacentSlides(activeIndex);
+            updatePlayback();
+            if (previous) previous.disabled = activeIndex === 0;
+            if (next) next.disabled = activeIndex === slides.length - 1;
         }
 
         function scheduleCurrentSlideUpdate() {
@@ -238,9 +309,38 @@
             }
         }
 
-        track.addEventListener('scroll', scheduleCurrentSlideUpdate, { passive: true });
-        window.addEventListener('resize', scheduleCurrentSlideUpdate, { passive: true });
-        window.addEventListener('pageshow', scheduleCurrentSlideUpdate);
+        function settleCurrentSlide() {
+            if (!initialized || activePointerId !== null) return;
+            if (settleTimer) {
+                window.clearTimeout(settleTimer);
+                settleTimer = 0;
+            }
+            updateCurrentSlide();
+            settledIndex = activeIndex;
+            gallery.classList.remove('gallery_dragging');
+            resizeToSlide(settledIndex);
+            showActiveMetadata(settledIndex);
+            updatePlayback();
+        }
+
+        function scheduleSettle() {
+            if (settleTimer) window.clearTimeout(settleTimer);
+            settleTimer = window.setTimeout(function() {
+                settleTimer = 0;
+                settleCurrentSlide();
+            }, 140);
+        }
+
+        track.addEventListener('scroll', function() {
+            scheduleCurrentSlideUpdate();
+            scheduleSettle();
+        }, { passive: true });
+        track.addEventListener('scrollend', settleCurrentSlide);
+        window.addEventListener('pageshow', function() {
+            scheduleCurrentSlideUpdate();
+            settleCurrentSlide();
+        });
+        window.addEventListener('orientationchange', scheduleSettle, { passive: true });
         document.addEventListener('visibilitychange', function() {
             if (document.hidden) {
                 slides.forEach(function(slide) {
@@ -254,9 +354,9 @@
         function showSlide(index) {
             const slide = slides[index];
             if (!slide) return;
-            useSlideAspectRatio(slide);
             loadAdjacentSlides(index);
             track.scrollTo({ left: slide.offsetLeft, behavior: 'smooth' });
+            scheduleSettle();
         }
 
         if (previous) {
@@ -273,6 +373,12 @@
 
         track.addEventListener('pointerdown', function(event) {
             if (!event.isPrimary) return;
+            if (settleTimer) {
+                window.clearTimeout(settleTimer);
+                settleTimer = 0;
+            }
+            freezeViewportHeight();
+            gallery.classList.add('gallery_dragging');
             pointerStart = { x: event.clientX, y: event.clientY };
             activePointerId = event.pointerId;
             pointerMoved = false;
@@ -292,6 +398,7 @@
             pointerStart = null;
             activePointerId = null;
             pointerMoved = false;
+            scheduleSettle();
         });
 
         window.addEventListener('pointercancel', function(event) {
@@ -300,6 +407,7 @@
             activePointerId = null;
             pointerMoved = false;
             suppressClickUntil = 0;
+            scheduleSettle();
         });
 
         track.addEventListener('click', function(event) {
@@ -314,12 +422,31 @@
             if (visible) {
                 initialized = true;
                 updateCurrentSlide();
+                settledIndex = activeIndex;
+                resizeToSlide(settledIndex);
+                showActiveMetadata(settledIndex);
+                updatePlayback();
             } else if (initialized) {
                 slides.forEach(function(slide) {
                     slide.querySelectorAll('video[data-gallery-video]').forEach(pauseVideo);
                 });
             }
         });
+
+        if (typeof window.ResizeObserver === 'function') {
+            let observedWidth = gallery.clientWidth;
+            const resizeObserver = new window.ResizeObserver(function(entries) {
+                const width = entries[0] && entries[0].contentRect.width;
+                if (!width || Math.abs(width - observedWidth) < 1) return;
+                observedWidth = width;
+                if (canResizeSettledSlide()) resizeToSlide(settledIndex);
+            });
+            resizeObserver.observe(gallery);
+        } else {
+            window.addEventListener('resize', function() {
+                if (canResizeSettledSlide()) resizeToSlide(settledIndex);
+            }, { passive: true });
+        }
     }
 
     function initializeGalleries() {

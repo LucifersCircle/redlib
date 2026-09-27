@@ -63,6 +63,64 @@
 {% endif %}
 {%- endmacro %}
 
+{% macro render_gallery_carousel(images, mode) -%}
+<div class="gallery feed_gallery adaptive_gallery adaptive_gallery_{{ mode }}" data-gallery data-gallery-mode="{{ mode }}">
+	<div class="feed_gallery_viewport" data-gallery-viewport>
+		<div class="feed_gallery_track" data-gallery-track>
+		{% for image in images -%}
+			<figure class="feed_gallery_slide" data-gallery-slide data-gallery-width="{{ image.width }}" data-gallery-height="{{ image.height }}">
+				<div class="feed_gallery_stage"{% if image.width > 0 && image.height > 0 %} style="--gallery-aspect-ratio: {{ image.width }} / {{ image.height }}"{% endif %}>
+				{% if image.is_animated && !image.mp4_url.is_empty() %}
+					<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" {% if prefs.autoplay_videos != "on" %}controls{% endif %} aria-label="Animated gallery image {{ loop.index }} of {{ images.len() }}"></video>
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ images.len() }}" data-gallery-fallback hidden/>
+					<a class="gallery_original_link" data-gallery-original href="{{ image.url }}" draggable="false" aria-label="Open original gallery animation" title="Open original">↗</a>
+					<noscript><a href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ images.len() }}" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
+				{% else %}
+				<a data-gallery-original href="{{ image.url }}" draggable="false">
+					{% if loop.first %}
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ images.len() }}" src="{% if mode == "detail" %}{{ image.url }}{% else if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
+					{% else %}
+					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ images.len() }}" data-src="{% if mode == "detail" %}{{ image.url }}{% else if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
+					<noscript><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ images.len() }}" src="{% if mode == "detail" %}{{ image.url }}{% else if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/></noscript>
+					{% endif %}
+				</a>
+				{% endif %}
+				</div>
+				{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
+				<figcaption class="feed_gallery_nojs_caption">
+					{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
+					{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
+				</figcaption>
+				{% endif %}
+			</figure>
+		{%- endfor %}
+		</div>
+	</div>
+	<div class="feed_gallery_meta">
+		<div class="feed_gallery_captions" aria-live="polite">
+		{% for image in images -%}
+			<div data-gallery-caption{% if !loop.first %} hidden{% endif %}>
+				{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
+				{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
+			</div>
+		{%- endfor %}
+		</div>
+		<div class="feed_gallery_toolbar">
+			<div class="feed_gallery_navigation">
+				<button class="feed_gallery_control feed_gallery_previous" type="button" data-gallery-previous aria-label="Previous gallery image">‹</button>
+				<button class="feed_gallery_control feed_gallery_next" type="button" data-gallery-next aria-label="Next gallery image">›</button>
+			</div>
+			<div class="feed_gallery_actions">
+			{% for image in images -%}
+				<a data-gallery-original-control href="{{ image.url }}" draggable="false" aria-label="Open original gallery item {{ loop.index }} of {{ images.len() }}"{% if !loop.first %} hidden{% endif %}>original ↗</a>
+			{%- endfor %}
+				<span class="feed_gallery_count" aria-live="polite"><span data-gallery-current>1</span> / {{ images.len() }}</span>
+			</div>
+		</div>
+	</div>
+</div>
+{%- endmacro %}
+
 {% macro post(post) -%}
 {% set post_should_be_blurred = post.flags.spoiler && prefs.blur_spoiler=="on" -%}
 <!-- POST CONTENT -->
@@ -123,6 +181,10 @@
 	</div>
 	{% call render_hls_notification(post.permalink[1..]) %}
 	{% endif %}
+	{% else if post.post_type == "gallery" && post.gallery.len() > 1 %}
+	<div class="post_media_content gallery_media_wrapper">
+		{% call render_gallery_carousel(post.gallery, "detail") %}
+	</div>
 	{% else if post.post_type == "gallery" %}
 	<div class="post_media_content gallery_media_wrapper">
 	<div class="gallery gallery_detail">
@@ -130,20 +192,20 @@
 		<figure>
 			{% if image.is_animated && !image.mp4_url.is_empty() %}
 			<div class="gallery_detail_animation" data-gallery-standalone>
-				<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" controls data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" aria-label="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}"></video>
-				<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-gallery-fallback hidden/>
+				<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" controls data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" aria-label="Animated gallery image 1 of 1"></video>
+				<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image 1 of 1" data-gallery-fallback hidden/>
 				<a class="gallery_original_link" data-gallery-original href="{{ image.url }}" draggable="false" aria-label="Open original gallery animation" title="Open original">↗</a>
 			</div>
-			<noscript><a data-gallery-original href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
+			<noscript><a data-gallery-original href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image 1 of 1" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
 			{% else %}
-			<a data-gallery-original href="{{ image.url }}" draggable="false"><img loading="lazy" draggable="false" alt="Gallery image" src="{{ image.url }}"/></a>
+			<a data-gallery-original href="{{ image.url }}" draggable="false"><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image 1 of 1" src="{{ image.url }}"/></a>
 			{% endif %}
+			{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
 			<figcaption>
-				<p>{{ image.caption }}</p>
-				{% if image.outbound_url.len() > 0 %}
-				<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a>
-				{% endif %}
+				{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
+				{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
 			</figcaption>
+			{% endif %}
 		</figure>
 	{%- endfor %}
 	</div>
@@ -312,39 +374,8 @@
 	{%- endfor %}
 	</div>
 	{% else if (prefs.layout.is_empty() || prefs.layout == "card") && post.post_type == "gallery" && post.gallery.len() > 1 %}
-	<div class="post_media_content gallery_media_wrapper feed_gallery" data-gallery>
-		<div class="feed_gallery_track" data-gallery-track>
-		{% for image in post.gallery -%}
-			<figure class="feed_gallery_slide" data-gallery-slide data-gallery-width="{{ image.width }}" data-gallery-height="{{ image.height }}">
-				<div class="feed_gallery_stage"{% if image.width > 0 && image.height > 0 %} style="--gallery-aspect-ratio: {{ image.width }} / {{ image.height }}"{% endif %}>
-				{% if image.is_animated && !image.mp4_url.is_empty() %}
-					<video width="{{ image.width }}" height="{{ image.height }}" muted loop playsinline preload="none" data-gallery-video data-src="{{ image.mp4_url }}" data-poster="{{ image.preview_url }}" data-gif-fallback="{{ image.gif_url }}" data-autoplay="{% if prefs.autoplay_videos == "on" %}true{% else %}false{% endif %}" {% if prefs.autoplay_videos != "on" %}controls{% endif %} aria-label="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}"></video>
-					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-gallery-fallback hidden/>
-					<a class="gallery_original_link" href="{{ image.url }}" draggable="false" aria-label="Open original gallery animation" title="Open original">↗</a>
-					<noscript><a href="{{ image.url }}" draggable="false">{% if !image.gif_url.is_empty() || !image.preview_url.is_empty() %}<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Animated gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.gif_url.is_empty() %}{{ image.preview_url }}{% else %}{{ image.gif_url }}{% endif %}"/>{% else %}Open animated gallery media{% endif %}</a></noscript>
-				{% else %}
-				<a href="{{ image.url }}" draggable="false">
-					{% if loop.first %}
-					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
-					{% else %}
-					<img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" data-src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/>
-					<noscript><img width="{{ image.width }}" height="{{ image.height }}" loading="lazy" draggable="false" alt="Gallery image {{ loop.index }} of {{ post.gallery.len() }}" src="{% if image.is_animated && !image.gif_url.is_empty() %}{{ image.gif_url }}{% else %}{{ image.preview_url }}{% endif %}"/></noscript>
-					{% endif %}
-				</a>
-				{% endif %}
-				</div>
-				{% if !image.caption.is_empty() || !image.outbound_url.is_empty() %}
-				<figcaption>
-					{% if !image.caption.is_empty() %}<p>{{ image.caption }}</p>{% endif %}
-					{% if !image.outbound_url.is_empty() %}<p><a class="outbound_url" href="{{ image.outbound_url }}" rel="nofollow">{{ image.outbound_url }}</a></p>{% endif %}
-				</figcaption>
-				{% endif %}
-			</figure>
-		{%- endfor %}
-		</div>
-		<button class="feed_gallery_control feed_gallery_previous" type="button" data-gallery-previous aria-label="Previous gallery image">‹</button>
-		<button class="feed_gallery_control feed_gallery_next" type="button" data-gallery-next aria-label="Next gallery image">›</button>
-		<span class="feed_gallery_count" aria-live="polite"><span data-gallery-current>1</span> / {{ post.gallery.len() }}</span>
+	<div class="post_media_content gallery_media_wrapper">
+		{% call render_gallery_carousel(post.gallery, "feed") %}
 	</div>
 	{% else if post.post_type == "link" && post.thumbnail.url.is_empty() %}
 	<a class="external_link_row" href="{{ post.media.url }}" rel="nofollow">

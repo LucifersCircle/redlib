@@ -58,8 +58,11 @@ class Element extends Events {
         const classes = new Set((attributes.class || '').split(/\s+/).filter(Boolean));
         this.classList = {
             add: (...names) => names.forEach(name => classes.add(name)),
+            remove: (...names) => names.forEach(name => classes.delete(name)),
             contains: name => classes.has(name),
         };
+        this.clientWidth = 0;
+        this.getBoundingClientRect = () => ({ width: this.clientWidth, height: 0 });
         for (const [name, value] of Object.entries(attributes)) {
             if (name.startsWith('data-')) this.dataset[this.dataKey(name)] = value;
         }
@@ -109,13 +112,16 @@ class Element extends Events {
 function browser({ coarse = false, readyState = 'complete', intersection = false } = {}) {
     let now = 10_000;
     let frameId = 0;
+    let timerId = 0;
     const frames = new Map();
+    const timers = new Map();
     const window = new Events();
     const document = new Events();
     document.body = new Element('body');
     document.readyState = readyState;
     document.querySelectorAll = selector => document.body.querySelectorAll(selector);
     window.matchMedia = () => ({ matches: coarse });
+    window.innerHeight = 1000;
     const observers = [];
     if (intersection) {
         window.IntersectionObserver = class {
@@ -130,6 +136,11 @@ function browser({ coarse = false, readyState = 'complete', intersection = false
         frames.set(++frameId, callback);
         return frameId;
     };
+    window.setTimeout = callback => {
+        timers.set(++timerId, callback);
+        return timerId;
+    };
+    window.clearTimeout = id => timers.delete(id);
     const context = vm.createContext({ window, document, Element, Date: { now: () => now } });
     return {
         window,
@@ -150,17 +161,26 @@ function browser({ coarse = false, readyState = 'complete', intersection = false
             pending.forEach(callback => callback());
             return pending.length;
         },
+        flushTimers() {
+            const pending = [...timers.values()];
+            timers.clear();
+            pending.forEach(callback => callback());
+            return pending.length;
+        },
     };
 }
 
 function galleryFixture(options) {
     const env = browser(options);
-    const gallery = new Element('div', { 'data-gallery': '' });
+    const gallery = new Element('div', { 'data-gallery': '', 'data-gallery-mode': options?.mode || 'feed' });
+    const viewport = new Element('div', { 'data-gallery-viewport': '' });
     const track = new Element('div', { 'data-gallery-track': '' });
     const current = new Element('span', { 'data-gallery-current': '' });
     const previous = new Element('button', { 'data-gallery-previous': '' });
     const next = new Element('button', { 'data-gallery-next': '' });
     const images = [];
+    const captions = [];
+    const originals = [];
     const slides = Array.from({ length: 5 }, (_, index) => {
         const slide = new Element('figure', {
             'data-gallery-slide': '',
@@ -172,6 +192,16 @@ function galleryFixture(options) {
         slide.offsetLeft = index * 300;
         return slide.append(image);
     });
+    for (let index = 0; index < slides.length; index += 1) {
+        captions.push(new Element('div', { 'data-gallery-caption': '', ...(index === 0 ? {} : { hidden: '' }) }));
+        originals.push(new Element('a', { 'data-gallery-original-control': '', ...(index === 0 ? {} : { hidden: '' }) }));
+    }
+    gallery.clientWidth = options?.viewportWidth || 300;
+    viewport.clientWidth = options?.viewportWidth || 300;
+    viewport.getBoundingClientRect = () => ({
+        width: viewport.clientWidth,
+        height: Number.parseFloat(gallery.style.getPropertyValue('--gallery-media-height')) || 0,
+    });
     track.scrollLeft = 0;
     track.scrollTo = options => {
         track.lastScroll = { ...options };
@@ -179,10 +209,11 @@ function galleryFixture(options) {
         track.emit('scroll');
     };
     track.append(...slides);
-    gallery.append(track, previous, next, current);
+    viewport.append(track, previous, next);
+    gallery.append(viewport, ...captions, ...originals, current);
     env.document.body.append(gallery);
     env.run('gallery.js');
-    return { ...env, gallery, track, current, previous, next, images, slides };
+    return { ...env, gallery, viewport, track, current, previous, next, images, slides, captions, originals };
 }
 
 const pointer = (properties = {}) => ({
@@ -196,7 +227,7 @@ test('gallery initializes only the first and adjacent previews', () => {
     assert.equal(env.current.textContent, '1');
     assert.equal(env.previous.disabled, true);
     assert.equal(env.next.disabled, false);
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-active-aspect-ratio'), '1600 / 900');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px');
     assert.equal('src' in env.images[1].dataset, false);
     assert.deepEqual(env.images[1].srcAssignments, [{ value: '/preview/1.jpg', loading: 'eager' }]);
 });
@@ -211,7 +242,9 @@ test('gallery defers JavaScript-managed loading until it approaches the viewport
 
 test('gallery animation uses MP4, pauses off-slide, and falls back to GIF once', () => {
     const env = browser();
-    const gallery = new Element('div', { 'data-gallery': '' });
+    const gallery = new Element('div', { 'data-gallery': '', 'data-gallery-mode': 'feed' });
+    const viewport = new Element('div', { 'data-gallery-viewport': '' });
+    viewport.clientWidth = 300;
     const track = new Element('div', { 'data-gallery-track': '' });
     const current = new Element('span', { 'data-gallery-current': '' });
     const previous = new Element('button', { 'data-gallery-previous': '' });
@@ -253,7 +286,8 @@ test('gallery animation uses MP4, pauses off-slide, and falls back to GIF once',
         track.emit('scroll');
     };
     track.append(animated, still);
-    gallery.append(track, previous, next, current);
+    viewport.append(track, previous, next);
+    gallery.append(viewport, current);
     env.document.body.append(gallery);
     env.run('gallery.js');
 
@@ -263,17 +297,21 @@ test('gallery animation uses MP4, pauses off-slide, and falls back to GIF once',
     assert.equal(video.playCount, 1);
     next.emit('click');
     env.flushFrames();
+    env.flushTimers();
     assert.ok(video.pauseCount > 0);
 
     previous.emit('click');
     env.flushFrames();
+    env.flushTimers();
     assert.equal(video.playCount, 2);
 
     video.emit('pointerdown');
     next.emit('click');
     env.flushFrames();
+    env.flushTimers();
     previous.emit('click');
     env.flushFrames();
+    env.flushTimers();
     assert.equal(video.playCount, 3, 'swiping away does not count as a manual pause');
 
     video.emit('pointerdown');
@@ -328,7 +366,14 @@ test('gallery stages use each item aspect ratio without a fixed black frame', ()
     assert.ok(template.includes('style="--gallery-aspect-ratio: {{ image.width }} / {{ image.height }}"'));
     assert.ok(template.includes('data-gallery-width="{{ image.width }}" data-gallery-height="{{ image.height }}"'));
     assert.match(stylesheet, /\.feed_gallery_stage \{[^}]+aspect-ratio: var\(--gallery-aspect-ratio, 16 \/ 9\);[^}]+background: transparent;/s);
-    assert.match(stylesheet, /\.gallery-js \.feed_gallery_stage \{[^}]+--gallery-active-aspect-ratio/s);
+    assert.ok(template.includes('{% call render_gallery_carousel(post.gallery, "detail") %}'));
+    assert.ok(template.includes('{% call render_gallery_carousel(post.gallery, "feed") %}'));
+    assert.ok(template.includes('data-gallery-viewport'));
+    assert.ok(template.includes('class="gallery gallery_detail"'), 'single-item detail galleries keep responsive gallery styles');
+    assert.match(stylesheet, /\.gallery-js \.adaptive_gallery \.feed_gallery_viewport \{[^}]+height: var\(--gallery-media-height, auto\);/s);
+    assert.match(stylesheet, /\.gallery-js \.feed_gallery_control \{[^}]+width: 44px;[^}]+height: 44px;/s);
+    assert.match(stylesheet, /\.gallery_detail > figure > a:not\(\.gallery_original_link\) > img,[^{]+\{[^}]+height: auto;/s);
+    assert.doesNotMatch(stylesheet, /--gallery-active-aspect-ratio/);
     assert.doesNotMatch(stylesheet, /\.feed_gallery_stage \{[^}]+height: clamp\(/s);
     assert.match(stylesheet, /\.gallery_detail_animation > video,[^}]+grid-area: 1 \/ 1;/s);
 });
@@ -358,7 +403,9 @@ test('gallery animation loads without playing when autoplay is disabled', () => 
 
 test('gallery animation playback follows the media stage visibility', () => {
     const env = browser({ intersection: true });
-    const gallery = new Element('div', { 'data-gallery': '' });
+    const gallery = new Element('div', { 'data-gallery': '', 'data-gallery-mode': 'feed' });
+    const viewport = new Element('div', { 'data-gallery-viewport': '' });
+    viewport.clientWidth = 300;
     const track = new Element('div', { 'data-gallery-track': '' });
     const current = new Element('span', { 'data-gallery-current': '' });
     const previous = new Element('button', { 'data-gallery-previous': '' });
@@ -392,7 +439,8 @@ test('gallery animation playback follows the media stage visibility', () => {
     still.append(new Element('img', { 'data-src': '/preview/still.jpg' }));
     track.scrollLeft = 0;
     track.append(animated, still);
-    gallery.append(track, previous, next, current);
+    viewport.append(track, previous, next);
+    gallery.append(viewport, current);
     env.document.body.append(gallery);
     env.run('gallery.js');
 
@@ -409,13 +457,22 @@ test('gallery animation playback follows the media stage visibility', () => {
 test('gallery navigation updates loading, counter and boundary buttons', () => {
     const env = galleryFixture();
     env.next.emit('click');
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-active-aspect-ratio'), '900 / 1600');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px', 'height is frozen during navigation');
     assert.deepEqual(env.track.lastScroll, { left: 300, behavior: 'smooth' });
     assert.equal(env.images[2].src, '/preview/2.jpg');
     assert.equal(env.images[3].src, '');
     env.flushFrames();
     assert.equal(env.current.textContent, '2');
     assert.equal(env.previous.disabled, false);
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px');
+    assert.equal(env.captions[0].hidden, false, 'caption remains stable until the slide settles');
+    assert.equal(env.captions[1].hidden, true);
+    env.flushTimers();
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px');
+    assert.equal(env.captions[0].hidden, true);
+    assert.equal(env.captions[1].hidden, false);
+    assert.equal(env.originals[0].hidden, true);
+    assert.equal(env.originals[1].hidden, false);
 
     env.track.scrollLeft = 1190;
     env.track.emit('scroll');
@@ -425,17 +482,47 @@ test('gallery navigation updates loading, counter and boundary buttons', () => {
     assert.equal(env.next.disabled, true);
     assert.equal(env.images[3].src, '/preview/3.jpg');
     assert.equal(env.images[4].src, '/preview/4.jpg');
+    env.flushTimers();
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px', 'landscape slide sheds the portrait height');
 
     env.previous.emit('click');
     env.flushFrames();
+    env.flushTimers();
     assert.equal(env.current.textContent, '4');
     assert.equal(env.next.disabled, false);
 
-    env.slides.forEach((slide, index) => { slide.offsetLeft = index * 400; });
-    env.track.scrollLeft = 400;
+    env.viewport.clientWidth = 400;
     env.window.emit('resize');
-    env.flushFrames();
-    assert.equal(env.current.textContent, '2');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '225px');
+});
+
+test('late media dimensions cannot resize a gallery while touch scrolling settles', () => {
+    const env = galleryFixture();
+    env.track.emit('pointerdown', pointer());
+    env.window.emit('pointercancel', pointer());
+    env.images[0].naturalWidth = 100;
+    env.images[0].naturalHeight = 1000;
+    env.images[0].emit('load');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px');
+    assert.equal(env.gallery.classList.contains('gallery_dragging'), true);
+
+    env.flushTimers();
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
+    assert.equal(env.gallery.classList.contains('gallery_dragging'), false);
+});
+
+test('detail galleries use the larger viewport cap without oversized portrait slides', () => {
+    const feed = galleryFixture({ viewportWidth: 1000 });
+    feed.next.emit('click');
+    feed.flushFrames();
+    feed.flushTimers();
+    assert.equal(feed.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
+
+    const detail = galleryFixture({ mode: 'detail', viewportWidth: 1000 });
+    detail.next.emit('click');
+    detail.flushFrames();
+    detail.flushTimers();
+    assert.equal(detail.gallery.style.getPropertyValue('--gallery-media-height'), '720px');
 });
 
 test('gallery waits for DOMContentLoaded when needed', () => {
