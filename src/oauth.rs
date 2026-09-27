@@ -1,7 +1,7 @@
 use crate::{
 	client::{
 		claim_quota_rotation, client_for_new_identity, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket,
-		OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
+		OauthTransportProfile, GENERIC_WEB_USER_AGENT, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::RedditLane,
@@ -94,6 +94,13 @@ impl OauthBackend for OauthBackendImpl {
 }
 
 impl OauthBackendImpl {
+	fn transport_profile(&self) -> OauthTransportProfile {
+		match self {
+			Self::MobileSpoof(_) => OauthTransportProfile::MobileAndroid,
+			Self::GenericWeb(_) => OauthTransportProfile::GenericWeb,
+		}
+	}
+
 	fn lane(&self) -> RedditLane {
 		match self {
 			Self::MobileSpoof(backend) => backend.lane,
@@ -140,8 +147,10 @@ impl Oauth {
 		let mut primary = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
 		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new(lane));
 		let mut failure_count = 0_u32;
-		let primary_http_client = client_for_new_identity(lane).unwrap_or_else(|error| panic!("Could not build {} Reddit client: {error}", lane.label()));
-		let fallback_http_client = client_for_new_identity(lane).unwrap_or_else(|error| panic!("Could not build {} Reddit fallback client: {error}", lane.label()));
+		let primary_http_client = client_for_new_identity(lane, primary.transport_profile())
+			.unwrap_or_else(|error| panic!("Could not build {} Reddit client: {error}", lane.label()));
+		let fallback_http_client = client_for_new_identity(lane, fallback.transport_profile())
+			.unwrap_or_else(|error| panic!("Could not build {} Reddit fallback client: {error}", lane.label()));
 
 		loop {
 			let mut retry_after = None;
@@ -203,7 +212,7 @@ impl Oauth {
 		let (mut primary, primary_is_fresh) = self.refresh_backend(reason, false);
 		let primary_name = primary.name();
 		let primary_http_client = self
-			.http_client_for_refresh(primary_is_fresh)
+			.http_client_for_refresh(&primary, primary_is_fresh)
 			.map_err(|error| RefreshError::configuration(primary_name, error))?;
 		match Self::authenticate_with_backend(&mut primary, primary_http_client).await {
 			Ok(oauth) => Ok(RefreshedOauth {
@@ -214,7 +223,7 @@ impl Oauth {
 				warn!("OAuth {} refresh with {primary_name} failed: {primary_error}", reason.label());
 				let (mut fallback, fallback_is_fresh) = self.refresh_backend(reason, true);
 				let fallback_name = fallback.name();
-				let fallback_http_client = match self.http_client_for_refresh(fallback_is_fresh) {
+				let fallback_http_client = match self.http_client_for_refresh(&fallback, fallback_is_fresh) {
 					Ok(client) => client,
 					Err(error) => {
 						return Err(RefreshError {
@@ -241,11 +250,12 @@ impl Oauth {
 		}
 	}
 
-	fn http_client_for_refresh(&self, fresh_identity: bool) -> Result<Arc<wreq::Client>, String> {
-		if needs_isolated_transport(self.lane, fresh_identity) {
-			client_for_new_identity(self.lane)
-		} else {
+	fn http_client_for_refresh(&self, backend: &OauthBackendImpl, fresh_identity: bool) -> Result<Arc<wreq::Client>, String> {
+		let target_profile = backend.transport_profile();
+		if can_reuse_transport(self.backend.transport_profile(), target_profile, fresh_identity) {
 			Ok(self.http_client.clone())
+		} else {
+			client_for_new_identity(self.lane, target_profile)
 		}
 	}
 
@@ -254,8 +264,8 @@ impl Oauth {
 	}
 }
 
-fn needs_isolated_transport(lane: RedditLane, fresh_identity: bool) -> bool {
-	lane == RedditLane::Tor && fresh_identity
+fn can_reuse_transport(current: OauthTransportProfile, target: OauthTransportProfile, fresh_identity: bool) -> bool {
+	!fresh_identity && current == target
 }
 
 #[derive(Debug)]
@@ -772,7 +782,7 @@ impl GenericWebAuth {
 		Self {
 			lane,
 			device_id,
-			user_agent: fake_user_agent::get_rua().to_owned(),
+			user_agent: GENERIC_WEB_USER_AGENT.to_owned(),
 			additional_headers: HashMap::new(),
 		}
 	}
@@ -795,7 +805,6 @@ impl OauthBackend for GenericWebAuth {
 		builder = builder.header("Authorization", "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=");
 		builder = builder.header("Content-Type", "application/x-www-form-urlencoded");
 		builder = builder.header("Sec-GPC", "1");
-		builder = builder.header("Connection", "keep-alive");
 		for (key, value) in &self.additional_headers {
 			if key == "x-reddit-loid" || key == "x-reddit-session" {
 				builder = builder.header(key, value);
@@ -938,7 +947,8 @@ mod tests {
 	async fn test_mobile_spoof_backend() {
 		// Test MobileSpoofAuth backend specifically
 		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
-		let response = backend.authenticate(crate::client::CLIENT.as_ref()).await;
+		let client = client_for_new_identity(RedditLane::Direct, OauthTransportProfile::MobileAndroid).unwrap();
+		let response = backend.authenticate(client.as_ref()).await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
 		assert!(!response.token.is_empty());
@@ -952,7 +962,8 @@ mod tests {
 	async fn test_generic_web_backend() {
 		// Test GenericWebAuth backend specifically
 		let mut backend = GenericWebAuth::new(RedditLane::Direct);
-		let response = backend.authenticate(crate::client::CLIENT.as_ref()).await;
+		let client = client_for_new_identity(RedditLane::Direct, OauthTransportProfile::GenericWeb).unwrap();
+		let response = backend.authenticate(client.as_ref()).await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
 		assert!(!response.token.is_empty());
@@ -1060,11 +1071,44 @@ mod tests {
 	}
 
 	#[test]
-	fn only_fresh_tor_identities_require_new_transport_isolation() {
-		assert!(needs_isolated_transport(RedditLane::Tor, true));
-		assert!(!needs_isolated_transport(RedditLane::Tor, false));
-		assert!(!needs_isolated_transport(RedditLane::Direct, true));
-		assert!(!needs_isolated_transport(RedditLane::Direct, false));
+	fn oauth_transport_profiles_match_backend_identities() {
+		let mobile = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
+		let generic = OauthBackendImpl::GenericWeb(GenericWebAuth::new(RedditLane::Direct));
+
+		assert_eq!(mobile.transport_profile(), OauthTransportProfile::MobileAndroid);
+		assert_eq!(mobile.transport_profile().emulation_profile(), (wreq_util::Emulation::OkHttp4_12, wreq_util::EmulationOS::Android));
+		assert!(mobile.user_agent().contains("Android"));
+		assert_eq!(generic.transport_profile(), OauthTransportProfile::GenericWeb);
+		assert_eq!(generic.transport_profile().emulation_profile(), (wreq_util::Emulation::Firefox147, wreq_util::EmulationOS::Windows));
+		assert_eq!(generic.user_agent(), GENERIC_WEB_USER_AGENT);
+	}
+
+	#[test]
+	fn oauth_refresh_reuses_only_stable_matching_transport() {
+		let backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
+		let http_client = client_for_new_identity(RedditLane::Direct, backend.transport_profile()).unwrap();
+		let oauth = Oauth {
+			headers_map: HashMap::new(),
+			http_client: http_client.clone(),
+			refresh_at: Instant::now() + Duration::from_secs(3480),
+			backend: backend.clone(),
+			generation: 4,
+			lane: RedditLane::Direct,
+		};
+
+		let stable = oauth.http_client_for_refresh(&backend, false).unwrap();
+		assert!(Arc::ptr_eq(&stable, &http_client));
+
+		let fresh = oauth.http_client_for_refresh(&backend, true).unwrap();
+		assert!(!Arc::ptr_eq(&fresh, &http_client));
+
+		let alternate = backend.alternate();
+		let alternate_client = oauth.http_client_for_refresh(&alternate, false).unwrap();
+		assert!(!Arc::ptr_eq(&alternate_client, &http_client));
+
+		assert!(can_reuse_transport(OauthTransportProfile::MobileAndroid, OauthTransportProfile::MobileAndroid, false));
+		assert!(!can_reuse_transport(OauthTransportProfile::MobileAndroid, OauthTransportProfile::MobileAndroid, true));
+		assert!(!can_reuse_transport(OauthTransportProfile::MobileAndroid, OauthTransportProfile::GenericWeb, false));
 	}
 
 	#[test]
