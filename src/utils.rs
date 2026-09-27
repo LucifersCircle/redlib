@@ -225,7 +225,12 @@ impl Media {
 				if width <= 0 || height <= 0 || !(url.starts_with("/preview/") || url.starts_with("/img/") || url.starts_with("/thumb/")) {
 					return None;
 				}
-				Some(Self { url, width, height, ..Self::default() })
+				Some(Self {
+					url,
+					width,
+					height,
+					..Self::default()
+				})
 			})
 			.min_by_key(|image| if image.width >= 960 { (0, image.width) } else { (1, -image.width) });
 
