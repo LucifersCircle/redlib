@@ -1130,10 +1130,12 @@ a.search_subreddit:hover {
 .post_thumbnail img,
 .gallery > figure > a,
 .gallery > figure > a img,
-.feed_gallery_slide > a,
-.feed_gallery_slide > a img,
+.feed_gallery_stage > a,
+.feed_gallery_stage > a img,
 .feed_gallery_single figure > a,
 .feed_gallery_single figure > a img,
+.article_preview_link,
+.article_preview_link img,
 .post_body figure > a,
 .post_body figure > a img,
 .comment_body figure > a,
@@ -1144,8 +1146,9 @@ a.search_subreddit:hover {
 .post_media_image,
 .post_thumbnail,
 .gallery > figure > a,
-.feed_gallery_slide > a,
+.feed_gallery_stage > a,
 .feed_gallery_single figure > a,
+.article_preview_link,
 .post_body figure > a,
 .comment_body figure > a {
     -webkit-user-drag: none;
@@ -1154,8 +1157,9 @@ a.search_subreddit:hover {
 .post_media_image img,
 .post_thumbnail img,
 .gallery > figure > a img,
-.feed_gallery_slide > a img,
+.feed_gallery_stage > a img,
 .feed_gallery_single figure > a img,
+.article_preview_link img,
 .post_body figure > a img,
 .comment_body figure > a img {
     -webkit-user-drag: none;
@@ -1166,8 +1170,9 @@ a.search_subreddit:hover {
 .post_media_image img::selection,
 .post_thumbnail img::selection,
 .gallery > figure > a img::selection,
-.feed_gallery_slide > a img::selection,
+.feed_gallery_stage > a img::selection,
 .feed_gallery_single figure > a img::selection,
+.article_preview_link img::selection,
 .post_body figure > a img::selection,
 .comment_body figure > a img::selection {
     background: transparent;
@@ -1242,13 +1247,31 @@ a.search_subreddit:hover {
     overflow: visible;
 }
 
+.gallery_detail_animation {
+    position: relative;
+    display: flex;
+    max-width: 100%;
+    justify-content: center;
+}
+
+.gallery_detail_animation > video,
+.gallery_detail_animation > img[data-gallery-fallback] {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 512px;
+    object-fit: contain;
+}
+
 .feed_gallery_single figure,
 .feed_gallery_slide {
     margin: 0;
 }
 
 .feed_gallery_single img,
-.feed_gallery_slide img {
+.feed_gallery_slide img,
+.feed_gallery_slide video {
     display: block;
     width: auto;
     height: auto;
@@ -1287,10 +1310,36 @@ a.search_subreddit:hover {
     scroll-snap-stop: always;
 }
 
-.feed_gallery_slide > a {
+.feed_gallery_stage {
+    position: relative;
+    display: grid;
+    width: 100%;
+    height: clamp(240px, 70vw, 420px);
+    place-items: center;
+    background: var(--background);
+}
+
+.feed_gallery_stage > a:not(.gallery_original_link) {
     display: flex;
+    width: 100%;
+    height: 100%;
     min-height: 1px;
+    align-items: center;
     justify-content: center;
+}
+
+.feed_gallery_stage > a:not(.gallery_original_link) img,
+.feed_gallery_stage > video,
+.feed_gallery_stage > img[data-gallery-fallback] {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+
+.feed_gallery_stage > video,
+.feed_gallery_stage > img[data-gallery-fallback] {
+    width: 100%;
+    height: 100%;
 }
 
 .feed_gallery_slide img[data-src] {
@@ -1299,6 +1348,75 @@ a.search_subreddit:hover {
 
 body:not(.gallery-js) .feed_gallery_slide img[data-src] {
     display: none;
+}
+
+body:not(.gallery-js) .feed_gallery [data-gallery-video],
+body:not(.gallery-js) .feed_gallery [data-gallery-fallback],
+body:not(.gallery-js) .feed_gallery .gallery_original_link,
+body:not(.gallery-js) .feed_gallery_single_animation [data-gallery-video],
+body:not(.gallery-js) .feed_gallery_single_animation [data-gallery-fallback],
+body:not(.gallery-js) .feed_gallery_single_animation .gallery_original_link,
+body:not(.gallery-js) .gallery_detail_animation [data-gallery-video],
+body:not(.gallery-js) .gallery_detail_animation [data-gallery-fallback],
+body:not(.gallery-js) .gallery_detail_animation .gallery_original_link {
+    display: none;
+}
+
+.feed_gallery_stage > noscript,
+.feed_gallery_stage > noscript > a {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    align-items: center;
+    justify-content: center;
+}
+
+.feed_gallery_stage > noscript img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+
+.feed_gallery_single_animation {
+    position: relative;
+    display: grid;
+    max-width: 100%;
+    place-items: center;
+    background: var(--background);
+}
+
+.feed_gallery_single_animation > video,
+.feed_gallery_single_animation > img[data-gallery-fallback] {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 512px;
+    object-fit: contain;
+}
+
+.feed_gallery_stage > [hidden],
+.feed_gallery_single_animation > [hidden],
+.gallery_detail_animation > [hidden] {
+    display: none;
+}
+
+.gallery_original_link {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 1;
+    display: grid;
+    width: 30px;
+    height: 30px;
+    border: 0;
+    border-radius: 999px;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.75);
+    color: white;
+    font-size: 18px;
+    line-height: 1;
 }
 
 .feed_gallery_count {
@@ -1387,6 +1505,49 @@ body:not(.gallery-js) .feed_gallery_slide img[data-src] {
     margin: 5px 12px;
     grid-area: post_media;
     overflow-wrap: anywhere;
+}
+
+.article_preview_link {
+    position: relative;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    margin: auto;
+    overflow: hidden;
+    border-radius: 5px;
+}
+
+.article_preview_link img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 512px;
+    object-fit: contain;
+}
+
+.article_preview_blurred img {
+    filter: blur(0.3rem);
+}
+
+.article_preview_blurred:hover img,
+.article_preview_blurred:focus-within img {
+    filter: none;
+}
+
+.article_preview_domain {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.78);
+    color: white;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .external_link_row {
@@ -2196,6 +2357,10 @@ th {
         padding: 10px;
         margin: 0 0 10px 0;
         max-width: 100%;
+    }
+
+    main > #column_one > footer {
+        padding-bottom: calc(3rem + env(safe-area-inset-bottom, 0px));
     }
 
     nav {

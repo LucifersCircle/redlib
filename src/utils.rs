@@ -341,6 +341,9 @@ impl Media {
 pub struct GalleryMedia {
 	pub url: String,
 	pub preview_url: String,
+	pub mp4_url: String,
+	pub gif_url: String,
+	pub is_animated: bool,
 	pub width: i64,
 	pub height: i64,
 	pub caption: String,
@@ -358,14 +361,22 @@ impl GalleryMedia {
 				let media_id = item["media_id"].as_str().unwrap_or_default();
 				let media = &metadata[media_id];
 				let image = &media["s"];
-				let image_type = &metadata[media_id]["m"];
-
-				let url = if image_type == "image/gif" {
-					image["gif"].as_str().unwrap_or_default()
-				} else {
-					image["u"].as_str().unwrap_or_default()
+				let is_animated = media["e"].as_str() == Some("AnimatedImage")
+					|| media["m"].as_str() == Some("image/gif")
+					|| image["gif"].as_str().is_some_and(|url| !url.is_empty())
+					|| image["mp4"].as_str().is_some_and(|url| !url.is_empty());
+				let proxied_url = |value: &Value| {
+					let url = format_url(value.as_str().unwrap_or_default());
+					(url.starts_with("/preview/") || url.starts_with("/img/") || url.starts_with("/vid/")).then_some(url).unwrap_or_default()
 				};
-				let url = format_url(url);
+				let gif_url = is_animated.then(|| proxied_url(&image["gif"])).unwrap_or_default();
+				let mp4_url = is_animated.then(|| proxied_url(&image["mp4"])).unwrap_or_default();
+				let still_url = proxied_url(&image["u"]);
+				let url = if is_animated {
+					[&gif_url, &mp4_url, &still_url].into_iter().find(|url| !url.is_empty()).cloned().unwrap_or_default()
+				} else {
+					still_url.clone()
+				};
 				if url.is_empty() {
 					return None;
 				}
@@ -380,14 +391,26 @@ impl GalleryMedia {
 						.or_else(|| previews.iter().rev().find(|preview| preview["u"].as_str().is_some_and(|url| !url.is_empty())))
 				});
 				let preview_url = preview
-					.map(|preview| format_url(preview["u"].as_str().unwrap_or_default()))
+					.map(|preview| proxied_url(&preview["u"]))
 					.filter(|preview_url| preview_url.starts_with("/preview/") || preview_url.starts_with("/img/") || preview_url.starts_with("/thumb/"))
-					.unwrap_or_else(|| url.clone());
+					.filter(|preview_url| !preview_url.is_empty())
+					.unwrap_or_else(|| {
+						if !still_url.is_empty() {
+							still_url
+						} else if is_animated {
+							String::new()
+						} else {
+							url.clone()
+						}
+					});
 
 				// Construct gallery items
 				Some(Self {
 					url,
 					preview_url,
+					mp4_url,
+					gif_url,
+					is_animated,
 					width: image["x"].as_i64().unwrap_or_default(),
 					height: image["y"].as_i64().unwrap_or_default(),
 					caption: item["caption"].as_str().unwrap_or_default().to_string(),
@@ -1841,8 +1864,68 @@ mod tests {
 		assert_eq!(gallery.len(), 1);
 		assert_eq!(gallery[0].url, "/img/original.jpg");
 		assert_eq!(gallery[0].preview_url, "/preview/pre/preview.jpg?width=640");
+		assert!(gallery[0].mp4_url.is_empty());
+		assert!(gallery[0].gif_url.is_empty());
+		assert!(!gallery[0].is_animated);
 		assert_eq!(gallery[0].caption, "Caption");
 		assert_eq!(gallery[0].outbound_url, "https://example.com/story");
+	}
+
+	#[test]
+	fn gallery_keeps_animation_renditions_separate_with_safe_fallbacks() {
+		let items = serde_json::json!([
+			{"media_id": "both"},
+			{"media_id": "mp4_only"},
+			{"media_id": "bad_mp4"}
+		]);
+		let metadata = serde_json::json!({
+			"both": {
+				"e": "AnimatedImage",
+				"m": "image/gif",
+				"s": {
+					"gif": "https://i.redd.it/animated.gif",
+					"mp4": "https://preview.redd.it/animated.gif?format=mp4&v=enabled",
+					"x": 640,
+					"y": 360
+				},
+				"p": [{"u": "https://preview.redd.it/poster.jpg?width=640", "x": 640, "y": 360}]
+			},
+			"mp4_only": {
+				"e": "AnimatedImage",
+				"s": {
+					"mp4": "https://preview.redd.it/only.mp4",
+					"x": 320,
+					"y": 240
+				}
+			},
+			"bad_mp4": {
+				"m": "image/gif",
+				"s": {
+					"gif": "https://i.redd.it/fallback.gif",
+					"mp4": "https://tracking.example/animation.mp4",
+					"x": 480,
+					"y": 270
+				}
+			}
+		});
+
+		let gallery = GalleryMedia::parse(&items, &metadata);
+
+		assert_eq!(gallery.len(), 3);
+		assert_eq!(gallery[0].url, "/img/animated.gif");
+		assert_eq!(gallery[0].gif_url, "/img/animated.gif");
+		assert_eq!(gallery[0].mp4_url, "/preview/pre/animated.gif?format=mp4&v=enabled");
+		assert_eq!(gallery[0].preview_url, "/preview/pre/poster.jpg?width=640");
+		assert!(gallery[0].is_animated);
+
+		assert_eq!(gallery[1].url, "/preview/pre/only.mp4");
+		assert!(gallery[1].gif_url.is_empty());
+		assert_eq!(gallery[1].mp4_url, gallery[1].url);
+		assert!(gallery[1].preview_url.is_empty());
+
+		assert_eq!(gallery[2].url, "/img/fallback.gif");
+		assert_eq!(gallery[2].gif_url, gallery[2].url);
+		assert!(gallery[2].mp4_url.is_empty());
 	}
 
 	#[test]
