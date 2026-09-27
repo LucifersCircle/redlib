@@ -22,6 +22,10 @@ const TOR_OAUTH_TIMEOUT: Duration = Duration::from_secs(45);
 const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
+const STARTUP_MOBILE_ROTATION_THRESHOLD: u32 = 3;
+const MAX_STARTUP_MOBILE_IDENTITY_ROTATIONS: u8 = 1;
+const GENERIC_WEB_QUARANTINE_THRESHOLD: u32 = 2;
+const GENERIC_WEB_QUARANTINE_DURATION: Duration = Duration::from_secs(60 * 60);
 const TOKEN_REFRESH_MIN_EARLY_BY: u64 = 120;
 const TOKEN_REFRESH_MAX_EARLY_BY: u64 = 240;
 static DIRECT_REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
@@ -139,37 +143,216 @@ struct RefreshedOauth {
 	fresh_identity: bool,
 }
 
+#[derive(Debug, Default)]
+struct StartupRecovery {
+	consecutive_mobile_forbidden: u32,
+	mobile_identity_generation: u8,
+	consecutive_generic_unauthorized: u32,
+	generic_retry_not_before: Option<Instant>,
+}
+
+impl StartupRecovery {
+	fn record_mobile_failure(&mut self, error: &AuthError) -> bool {
+		if error.is_identity_policy_forbidden() {
+			self.consecutive_mobile_forbidden = self.consecutive_mobile_forbidden.saturating_add(1);
+		} else {
+			self.consecutive_mobile_forbidden = 0;
+		}
+
+		self.consecutive_mobile_forbidden >= STARTUP_MOBILE_ROTATION_THRESHOLD && self.mobile_identity_generation < MAX_STARTUP_MOBILE_IDENTITY_ROTATIONS
+	}
+
+	fn should_try_generic(&self, now: Instant) -> bool {
+		match self.generic_retry_not_before {
+			Some(deadline) => now >= deadline,
+			None => true,
+		}
+	}
+
+	fn generic_web_quarantined(&self, now: Instant) -> bool {
+		!self.should_try_generic(now)
+	}
+
+	fn record_generic_failure(&mut self, error: &AuthError, now: Instant) -> bool {
+		if error.is_credential_or_grant_rejected() {
+			self.consecutive_generic_unauthorized = self.consecutive_generic_unauthorized.saturating_add(1);
+		} else {
+			self.consecutive_generic_unauthorized = 0;
+			self.generic_retry_not_before = None;
+		}
+
+		if self.consecutive_generic_unauthorized >= GENERIC_WEB_QUARANTINE_THRESHOLD {
+			self.generic_retry_not_before = Some(now + GENERIC_WEB_QUARANTINE_DURATION);
+			true
+		} else {
+			false
+		}
+	}
+
+	fn defer_generic(&mut self, now: Instant) {
+		self.generic_retry_not_before = Some(now + GENERIC_WEB_QUARANTINE_DURATION);
+	}
+
+	fn generic_transport_ready(&mut self) {
+		self.generic_retry_not_before = None;
+	}
+
+	fn complete_mobile_rotation(&mut self) {
+		self.consecutive_mobile_forbidden = 0;
+		self.mobile_identity_generation += 1;
+	}
+}
+
+fn new_startup_mobile_identity(lane: RedditLane) -> Result<(OauthBackendImpl, Arc<wreq::Client>), String> {
+	let http_client = client_for_new_identity(lane, OauthTransportProfile::MobileAndroid)?;
+	let backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
+	Ok((backend, http_client))
+}
+
+async fn wait_for_startup_mobile_identity(lane: RedditLane) -> (OauthBackendImpl, Arc<wreq::Client>) {
+	let mut failure_count = 0_u32;
+	loop {
+		match new_startup_mobile_identity(lane) {
+			Ok(identity) => return identity,
+			Err(error) => {
+				failure_count = failure_count.saturating_add(1);
+				let delay = refresh_retry_delay(failure_count, None);
+				error!(
+					"[⛔] OAuth startup transport construction failed: lane={} backend=MobileSpoofAuth profile={} attempt={failure_count} class=configuration error={error}; retrying_in={delay:?}",
+					lane.label(),
+					OauthTransportProfile::MobileAndroid.label(),
+				);
+				tokio::time::sleep(delay).await;
+			}
+		}
+	}
+}
+
 impl Oauth {
 	/// Create a new OAuth client
 	pub(crate) async fn new(lane: RedditLane) -> Self {
-		// Keep both identities stable across startup retries. Startup cannot serve
-		// requests without a token, so retry indefinitely with bounded backoff.
-		let mut primary = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
+		// Keep identities stable across ordinary startup retries. A single bounded
+		// Mobile identity/client replacement probes whether the randomized identity
+		// was rejected without turning every retry into identity churn.
+		let (mut primary, mut primary_http_client) = wait_for_startup_mobile_identity(lane).await;
 		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new(lane));
 		let mut failure_count = 0_u32;
-		let primary_http_client =
-			client_for_new_identity(lane, primary.transport_profile()).unwrap_or_else(|error| panic!("Could not build {} Reddit client: {error}", lane.label()));
-		let fallback_http_client =
-			client_for_new_identity(lane, fallback.transport_profile()).unwrap_or_else(|error| panic!("Could not build {} Reddit fallback client: {error}", lane.label()));
+		let mut recovery = StartupRecovery::default();
+		let mut fallback_http_client = match client_for_new_identity(lane, fallback.transport_profile()) {
+			Ok(client) => Some(client),
+			Err(error) => {
+				warn!(
+					"GenericWebAuth is unavailable because its transport could not be built; MobileSpoofAuth startup will continue: lane={} class=configuration error={error}",
+					lane.label(),
+				);
+				recovery.defer_generic(Instant::now());
+				None
+			}
+		};
 
 		loop {
+			let attempt = failure_count.saturating_add(1);
 			let mut retry_after = None;
-			for (backend, http_client) in [(&mut primary, primary_http_client.clone()), (&mut fallback, fallback_http_client.clone())] {
-				match Self::authenticate_with_backend(backend, http_client).await {
-					Ok(oauth) => {
-						info!("[✅] Successfully created OAuth client: lane={} backend={}", lane.label(), backend.name());
-						return oauth;
+			let rotate_primary = match Self::authenticate_with_backend(&mut primary, primary_http_client.clone()).await {
+				Ok(oauth) => {
+					info!(
+						"[✅] Successfully created OAuth client: lane={} backend={} profile={} identity_generation={}",
+						lane.label(),
+						primary.name(),
+						primary.transport_profile().label(),
+						recovery.mobile_identity_generation,
+					);
+					return oauth;
+				}
+				Err(error) => {
+					retry_after = max_duration(retry_after, error.retry_after());
+					error!(
+						"[⛔] OAuth startup authentication failed: lane={} backend={} profile={} attempt={attempt} identity_generation={} class={} error={error}",
+						lane.label(),
+						primary.name(),
+						primary.transport_profile().label(),
+						recovery.mobile_identity_generation,
+						error.failure_class(),
+					);
+					recovery.record_mobile_failure(&error)
+				}
+			};
+
+			if recovery.should_try_generic(Instant::now()) {
+				if fallback_http_client.is_none() {
+					match client_for_new_identity(lane, fallback.transport_profile()) {
+						Ok(client) => {
+							fallback_http_client = Some(client);
+							recovery.generic_transport_ready();
+							info!("GenericWebAuth transport recovered: lane={}", lane.label());
+						}
+						Err(error) => {
+							recovery.defer_generic(Instant::now());
+							warn!(
+								"GenericWebAuth transport remains unavailable; retrying it in one hour: lane={} class=configuration error={error}",
+								lane.label(),
+							);
+						}
 					}
-					Err(error) => {
-						retry_after = max_duration(retry_after, error.retry_after());
-						error!("[⛔] Failed to create OAuth client with {}: {error}", backend.name());
+				}
+				if let Some(fallback_http_client) = &fallback_http_client {
+					match Self::authenticate_with_backend(&mut fallback, fallback_http_client.clone()).await {
+						Ok(oauth) => {
+							info!(
+								"[✅] Successfully created OAuth client: lane={} backend={} profile={} identity_generation=0",
+								lane.label(),
+								fallback.name(),
+								fallback.transport_profile().label(),
+							);
+							return oauth;
+						}
+						Err(error) => {
+							retry_after = max_duration(retry_after, error.retry_after());
+							error!(
+								"[⛔] OAuth startup authentication failed: lane={} backend={} profile={} attempt={attempt} identity_generation=0 class={} error={error}",
+								lane.label(),
+								fallback.name(),
+								fallback.transport_profile().label(),
+								error.failure_class(),
+							);
+							if recovery.record_generic_failure(&error, Instant::now()) {
+								warn!(
+									"Quarantining GenericWebAuth for one hour after repeated credential or grant rejections: lane={}; MobileSpoofAuth startup retries will continue",
+									lane.label(),
+								);
+							}
+						}
 					}
+				}
+			}
+
+			if rotate_primary {
+				match new_startup_mobile_identity(lane) {
+					Ok((replacement, replacement_http_client)) => {
+						primary = replacement;
+						primary_http_client = replacement_http_client;
+						recovery.complete_mobile_rotation();
+						warn!(
+							"[🔄] Rotated OAuth identity and transport after {STARTUP_MOBILE_ROTATION_THRESHOLD} consecutive MobileSpoofAuth 403 responses: lane={} identity_generation={}; startup backoff is unchanged",
+							lane.label(),
+							recovery.mobile_identity_generation,
+						);
+					}
+					Err(error) => warn!(
+						"Could not rotate OAuth identity and transport; retaining the current identity: lane={} class=configuration error={error}",
+						lane.label(),
+					),
 				}
 			}
 
 			failure_count = failure_count.saturating_add(1);
 			let delay = refresh_retry_delay(failure_count, retry_after);
-			warn!("[⏳] Both OAuth backends failed; retrying startup authentication in {delay:?}");
+			warn!(
+				"[⏳] OAuth startup attempt failed: lane={} attempt={attempt} generic_web_available={} generic_web_quarantined={} retrying_in={delay:?}",
+				lane.label(),
+				fallback_http_client.is_some(),
+				recovery.generic_web_quarantined(Instant::now()),
+			);
 			tokio::time::sleep(delay).await;
 		}
 	}
@@ -274,7 +457,13 @@ enum AuthError {
 	Wreq(wreq::Error),
 	SerdeDeserialize(serde_json::Error),
 	Field(&'static str),
-	HttpStatus { status: u16, retry_after: Option<Duration> },
+	HttpStatus {
+		status: u16,
+		retry_after: Option<Duration>,
+		retry_after_present: bool,
+		quota_headers_present: bool,
+		www_authenticate_present: bool,
+	},
 	Timeout(Duration),
 }
 
@@ -283,6 +472,59 @@ impl AuthError {
 		match self {
 			Self::HttpStatus { retry_after, .. } => *retry_after,
 			_ => None,
+		}
+	}
+
+	fn is_http_status(&self, expected: u16) -> bool {
+		matches!(self, Self::HttpStatus { status, .. } if *status == expected)
+	}
+
+	fn is_identity_policy_forbidden(&self) -> bool {
+		matches!(
+			self,
+			Self::HttpStatus {
+				status: 403,
+				quota_headers_present: false,
+				www_authenticate_present: false,
+				..
+			}
+		)
+	}
+
+	fn is_credential_or_grant_rejected(&self) -> bool {
+		matches!(
+			self,
+			Self::HttpStatus { status: 401, .. }
+				| Self::HttpStatus {
+					status: 403,
+					www_authenticate_present: true,
+					..
+				}
+		)
+	}
+
+	fn failure_class(&self) -> &'static str {
+		match self {
+			Self::Configuration(_) => "configuration",
+			Self::Wreq(_) => "transport",
+			Self::SerdeDeserialize(_) | Self::Field(_) => "invalid_response",
+			Self::HttpStatus { status: 400, .. } => "request_rejected",
+			Self::HttpStatus { status: 401, .. }
+			| Self::HttpStatus {
+				status: 403,
+				www_authenticate_present: true,
+				..
+			} => "credential_or_grant_rejected",
+			Self::HttpStatus {
+				status: 403,
+				quota_headers_present: true,
+				..
+			}
+			| Self::HttpStatus { status: 429, .. } => "rate_limited",
+			Self::HttpStatus { status: 403, .. } => "edge_egress_or_identity_policy",
+			Self::HttpStatus { status, .. } if (500..=599).contains(status) => "upstream",
+			Self::HttpStatus { .. } => "http_status",
+			Self::Timeout(_) => "timeout",
 		}
 	}
 }
@@ -294,10 +536,19 @@ impl fmt::Display for AuthError {
 			Self::Wreq(error) => write!(formatter, "request failed: {error}"),
 			Self::SerdeDeserialize(error) => write!(formatter, "invalid response body: {error}"),
 			Self::Field(field) => write!(formatter, "OAuth response is missing or has an invalid {field} field"),
-			Self::HttpStatus { status, retry_after } => match retry_after {
-				Some(delay) => write!(formatter, "HTTP {status} (Retry-After {delay:?})"),
-				None => write!(formatter, "HTTP {status}"),
-			},
+			Self::HttpStatus {
+				status,
+				retry_after,
+				retry_after_present,
+				quota_headers_present,
+				www_authenticate_present,
+			} => {
+				write!(
+					formatter,
+					"HTTP {status} (retry_after_present={retry_after_present} retry_after_seconds={} quota_headers_present={quota_headers_present} www_authenticate_present={www_authenticate_present})",
+					retry_after.map_or(0.0, |delay| delay.as_secs_f64()),
+				)
+			}
 			Self::Timeout(duration) => write!(formatter, "request timed out after {duration:?}"),
 		}
 	}
@@ -437,6 +688,12 @@ fn response_retry_after(headers: &wreq::header::HeaderMap) -> Option<Duration> {
 		.ok()
 		.and_then(|deadline| deadline.duration_since(SystemTime::now()).ok())
 		.map(|delay| delay.min(MAX_SERVER_RETRY_DELAY))
+}
+
+fn response_has_quota_headers(headers: &wreq::header::HeaderMap) -> bool {
+	["x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-used"]
+		.iter()
+		.any(|header| headers.contains_key(*header))
 }
 
 fn sampled_token_refresh_delay(expires_in: u64) -> Duration {
@@ -647,7 +904,7 @@ impl MobileSpoofAuth {
 	fn new(lane: RedditLane) -> Self {
 		Self {
 			lane,
-			device: Device::new(),
+			device: Device::new(lane),
 			additional_headers: HashMap::new(),
 		}
 	}
@@ -694,6 +951,9 @@ impl OauthBackend for MobileSpoofAuth {
 			return Err(AuthError::HttpStatus {
 				status: status.as_u16(),
 				retry_after: response_retry_after(resp.headers()),
+				retry_after_present: resp.headers().contains_key(wreq::header::RETRY_AFTER),
+				quota_headers_present: response_has_quota_headers(resp.headers()),
+				www_authenticate_present: resp.headers().contains_key(wreq::header::WWW_AUTHENTICATE),
 			});
 		}
 
@@ -777,7 +1037,7 @@ impl GenericWebAuth {
 			})
 			.collect();
 
-		info!("[🔄] Using GenericWebAuth");
+		info!("[🔄] Created a stable GenericWebAuth identity: lane={}", lane.label());
 
 		Self {
 			lane,
@@ -825,6 +1085,9 @@ impl OauthBackend for GenericWebAuth {
 			return Err(AuthError::HttpStatus {
 				status: status.as_u16(),
 				retry_after: response_retry_after(resp.headers()),
+				retry_after_present: resp.headers().contains_key(wreq::header::RETRY_AFTER),
+				quota_headers_present: response_has_quota_headers(resp.headers()),
+				www_authenticate_present: resp.headers().contains_key(wreq::header::WWW_AUTHENTICATE),
 			});
 		}
 
@@ -891,7 +1154,7 @@ impl OauthBackend for GenericWebAuth {
 }
 
 impl Device {
-	fn android() -> Self {
+	fn android(lane: RedditLane) -> Self {
 		// Generate uuid
 		let uuid = uuid::Uuid::new_v4().to_string();
 
@@ -919,7 +1182,11 @@ impl Device {
 			("X-Reddit-Device-Id".into(), uuid.clone()),
 		]);
 
-		info!("[🔄] Created a stable spoofed Android identity for OAuth");
+		let app_version_year = android_app_version.strip_prefix("Version ").and_then(|version| version.get(..4)).unwrap_or("unknown");
+		info!(
+			"[🔄] Created a stable spoofed Android identity for OAuth: lane={} app_version_year={app_version_year} android_major={android_version}",
+			lane.label(),
+		);
 
 		Self {
 			oauth_id: REDDIT_ANDROID_OAUTH_CLIENT_ID.to_string(),
@@ -928,9 +1195,9 @@ impl Device {
 			user_agent: android_user_agent,
 		}
 	}
-	fn new() -> Self {
+	fn new(lane: RedditLane) -> Self {
 		// See https://github.com/redlib-org/redlib/issues/8
-		Self::android()
+		Self::android(lane)
 	}
 }
 
@@ -1005,7 +1272,132 @@ mod tests {
 
 	#[test]
 	fn test_creating_device() {
-		Device::new();
+		Device::new(RedditLane::Direct);
+	}
+
+	#[test]
+	fn startup_recovery_rotates_mobile_identity_once() {
+		let forbidden = AuthError::HttpStatus {
+			status: 403,
+			retry_after: Some(Duration::ZERO),
+			retry_after_present: true,
+			quota_headers_present: false,
+			www_authenticate_present: false,
+		};
+		let mut recovery = StartupRecovery::default();
+
+		assert!(!recovery.record_mobile_failure(&forbidden));
+		assert!(!recovery.record_mobile_failure(&forbidden));
+		assert!(recovery.record_mobile_failure(&forbidden));
+		assert_eq!(
+			refresh_retry_base_delay(STARTUP_MOBILE_ROTATION_THRESHOLD, forbidden.retry_after()),
+			(Duration::from_secs(20), false),
+		);
+		recovery.complete_mobile_rotation();
+		assert_eq!(recovery.mobile_identity_generation, 1);
+		for _ in 0..STARTUP_MOBILE_ROTATION_THRESHOLD * 2 {
+			assert!(!recovery.record_mobile_failure(&forbidden));
+		}
+		assert_eq!(recovery.mobile_identity_generation, MAX_STARTUP_MOBILE_IDENTITY_ROTATIONS);
+	}
+
+	#[test]
+	fn startup_recovery_rotates_only_on_identity_policy_forbidden() {
+		let quota_forbidden = AuthError::HttpStatus {
+			status: 403,
+			retry_after: Some(Duration::from_secs(60)),
+			retry_after_present: true,
+			quota_headers_present: true,
+			www_authenticate_present: false,
+		};
+		let mut recovery = StartupRecovery::default();
+
+		for _ in 0..STARTUP_MOBILE_ROTATION_THRESHOLD * 2 {
+			assert!(!recovery.record_mobile_failure(&quota_forbidden));
+		}
+		assert_eq!(recovery.mobile_identity_generation, 0);
+		assert_eq!(recovery.consecutive_mobile_forbidden, 0);
+
+		let credential_forbidden = AuthError::HttpStatus {
+			status: 403,
+			retry_after: None,
+			retry_after_present: false,
+			quota_headers_present: false,
+			www_authenticate_present: true,
+		};
+		for _ in 0..STARTUP_MOBILE_ROTATION_THRESHOLD * 2 {
+			assert!(!recovery.record_mobile_failure(&credential_forbidden));
+		}
+		assert_eq!(recovery.mobile_identity_generation, 0);
+	}
+
+	#[test]
+	fn startup_mobile_rotation_replaces_identity_and_transport() {
+		let (original, original_client) = new_startup_mobile_identity(RedditLane::Direct).unwrap();
+		let (replacement, replacement_client) = new_startup_mobile_identity(RedditLane::Direct).unwrap();
+		let original_device_id = match original {
+			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
+			OauthBackendImpl::GenericWeb(_) => unreachable!(),
+		};
+		let replacement_device_id = match replacement {
+			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
+			OauthBackendImpl::GenericWeb(_) => unreachable!(),
+		};
+
+		assert_ne!(original_device_id, replacement_device_id);
+		assert!(!Arc::ptr_eq(&original_client, &replacement_client));
+	}
+
+	#[test]
+	fn startup_recovery_quarantines_repeated_generic_unauthorized() {
+		let now = Instant::now();
+		let unauthorized = AuthError::HttpStatus {
+			status: 401,
+			retry_after: None,
+			retry_after_present: false,
+			quota_headers_present: false,
+			www_authenticate_present: true,
+		};
+		let mut recovery = StartupRecovery::default();
+
+		assert!(!recovery.record_generic_failure(&unauthorized, now));
+		assert!(recovery.record_generic_failure(&unauthorized, now));
+		assert!(recovery.generic_web_quarantined(now));
+		assert!(!recovery.should_try_generic(now + GENERIC_WEB_QUARANTINE_DURATION - Duration::from_secs(1)));
+		assert!(recovery.should_try_generic(now + GENERIC_WEB_QUARANTINE_DURATION));
+
+		let upstream = AuthError::HttpStatus {
+			status: 503,
+			retry_after: None,
+			retry_after_present: false,
+			quota_headers_present: false,
+			www_authenticate_present: false,
+		};
+		assert!(!recovery.record_generic_failure(&upstream, now + GENERIC_WEB_QUARANTINE_DURATION));
+		assert!(recovery.should_try_generic(now + GENERIC_WEB_QUARANTINE_DURATION));
+	}
+
+	#[test]
+	fn oauth_failure_classes_are_privacy_safe_and_actionable() {
+		for (status, quota_headers_present, www_authenticate_present, expected) in [
+			(400, false, false, "request_rejected"),
+			(401, false, true, "credential_or_grant_rejected"),
+			(403, false, false, "edge_egress_or_identity_policy"),
+			(403, false, true, "credential_or_grant_rejected"),
+			(403, true, false, "rate_limited"),
+			(429, false, false, "rate_limited"),
+			(503, false, false, "upstream"),
+		] {
+			let error = AuthError::HttpStatus {
+				status,
+				retry_after: None,
+				retry_after_present: false,
+				quota_headers_present,
+				www_authenticate_present,
+			};
+			assert_eq!(error.failure_class(), expected);
+			assert_eq!(error.is_credential_or_grant_rejected(), expected == "credential_or_grant_rejected");
+		}
 	}
 
 	#[test]
