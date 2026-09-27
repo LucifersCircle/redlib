@@ -369,6 +369,8 @@ test('gallery stages use each item aspect ratio without a fixed black frame', ()
     assert.ok(template.includes('{% call render_gallery_carousel(post.gallery, "detail") %}'));
     assert.ok(template.includes('{% call render_gallery_carousel(post.gallery, "feed") %}'));
     assert.ok(template.includes('data-gallery-viewport'));
+    assert.equal((template.match(/\{% for image in &images/g) || []).length, 3, 'shared gallery media is always borrowed');
+    assert.doesNotMatch(template, /\{% for image in images/);
     assert.ok(template.includes('class="gallery gallery_detail"'), 'single-item detail galleries keep responsive gallery styles');
     assert.match(stylesheet, /\.gallery-js \.adaptive_gallery \.feed_gallery_viewport \{[^}]+height: var\(--gallery-media-height, auto\);/s);
     assert.match(stylesheet, /\.gallery-js \.feed_gallery_control \{[^}]+width: 44px;[^}]+height: 44px;/s);

@@ -111,7 +111,7 @@
 				<button class="feed_gallery_control feed_gallery_next" type="button" data-gallery-next aria-label="Next gallery image">›</button>
 			</div>
 			<div class="feed_gallery_actions">
-			{% for image in images -%}
+			{% for image in &images -%}
 				<a data-gallery-original-control href="{{ image.url }}" draggable="false" aria-label="Open original gallery item {{ loop.index }} of {{ images.len() }}"{% if !loop.first %} hidden{% endif %}>original ↗</a>
 			{%- endfor %}
 				<span class="feed_gallery_count" aria-live="polite"><span data-gallery-current>1</span> / {{ images.len() }}</span>
