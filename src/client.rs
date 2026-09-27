@@ -3,7 +3,7 @@ use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_l
 use crate::reddit_lane::{RedditLane, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
-use crate::utils::{format_url, Post};
+use crate::utils::format_url;
 use arc_swap::ArcSwapOption;
 use cached::proc_macro::cached;
 use futures_lite::{future::Boxed, FutureExt};
@@ -49,7 +49,7 @@ impl OauthTransportProfile {
 		}
 	}
 
-	fn label(self) -> &'static str {
+	pub(crate) fn label(self) -> &'static str {
 		match self {
 			Self::MobileAndroid => "mobile_android",
 			Self::GenericWeb => "generic_web",
@@ -2360,13 +2360,20 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 	(result, edge_rejected)
 }
 
-async fn self_check(sub: &str) -> Result<(), String> {
-	let query = format!("/r/{sub}/hot.json?&raw_json=1");
-
-	match Post::fetch(&query, true).await {
-		Ok(_) => Ok(()),
-		Err(e) => Err(e),
+async fn self_check_on_lane(sub: &str, lane: RedditLane) -> Result<(), String> {
+	let query = normalize_reddit_api_path(&format!("/r/{sub}/hot.json?raw_json=1"));
+	record_logical_json(&query);
+	let (response, _) = json_uncached_on_lane(query, true, lane).await;
+	let response = response?;
+	if response["data"]["children"].as_array().is_some() {
+		Ok(())
+	} else {
+		Err("No posts found".to_string())
 	}
+}
+
+fn oauth_startup_validation_lane() -> RedditLane {
+	RedditLane::Direct
 }
 
 pub async fn rate_limit_check() -> Result<(), String> {
@@ -2381,7 +2388,10 @@ pub async fn rate_limit_check() -> Result<(), String> {
 	// Make one uncached request. Quota-driven identity rotation is handled only
 	// after Reddit reports a low budget, rather than creating extra authentication
 	// traffic during every startup.
-	self_check("reddit").await?;
+	// This check specifically validates the newly installed direct identity.
+	// Do not allow the normal edge-triggered Tor failover to hide a direct-lane
+	// rejection here.
+	self_check_on_lane("reddit", oauth_startup_validation_lane()).await?;
 	Ok(())
 }
 
@@ -3364,6 +3374,11 @@ mod tests {
 		assert_eq!(select_preferred_api_lane(true, true, false), RedditLane::Direct);
 		assert_eq!(select_preferred_api_lane(true, true, true), RedditLane::Tor);
 		assert_eq!(select_preferred_api_lane(true, false, true), RedditLane::Direct);
+	}
+
+	#[test]
+	fn direct_oauth_validation_never_uses_tor_lane() {
+		assert_eq!(oauth_startup_validation_lane(), RedditLane::Direct);
 	}
 
 	#[test]

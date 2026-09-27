@@ -77,6 +77,7 @@ jobs:
           cargo test --locked --lib test_edge_throttle_uses_one_probe_and_escalates_until_success
           cargo test --locked --lib test_edge_fallback_is_lane_isolated_and_never_bypasses_quota
           cargo test --locked --lib test_tor_retry_requires_this_request_to_be_edge_rejected
+          cargo test --locked --lib direct_oauth_validation_never_uses_tor_lane
           cargo test --locked --lib test_only_edge_redirect_deferrals_qualify_for_tor_retry
           cargo test --locked --lib test_equal_numbered_quota_tickets_remain_lane_scoped
           cargo test --locked --lib test_oauth_refresh_preserves_all_cooldowns
@@ -107,6 +108,9 @@ jobs:
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
           cargo test --locked --lib test_token_refresh_delay_cannot_underflow
+          cargo test --locked --lib startup_recovery_
+          cargo test --locked --lib startup_mobile_rotation_replaces_identity_and_transport
+          cargo test --locked --lib oauth_failure_classes_are_privacy_safe_and_actionable
           cargo test --locked --lib oauth_transport_profiles_match_backend_identities
           cargo test --locked --lib oauth_refresh_reuses_only_stable_matching_transport
           cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
