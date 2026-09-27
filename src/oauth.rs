@@ -1,7 +1,7 @@
 use crate::{
 	client::{
-		claim_quota_rotation, client_for_new_identity, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, QuotaRotationTicket,
-		OauthTransportProfile, GENERIC_WEB_USER_AGENT, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
+		claim_quota_rotation, client_for_new_identity, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, OauthTransportProfile,
+		QuotaRotationTicket, GENERIC_WEB_USER_AGENT, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::RedditLane,
@@ -147,10 +147,10 @@ impl Oauth {
 		let mut primary = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
 		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new(lane));
 		let mut failure_count = 0_u32;
-		let primary_http_client = client_for_new_identity(lane, primary.transport_profile())
-			.unwrap_or_else(|error| panic!("Could not build {} Reddit client: {error}", lane.label()));
-		let fallback_http_client = client_for_new_identity(lane, fallback.transport_profile())
-			.unwrap_or_else(|error| panic!("Could not build {} Reddit fallback client: {error}", lane.label()));
+		let primary_http_client =
+			client_for_new_identity(lane, primary.transport_profile()).unwrap_or_else(|error| panic!("Could not build {} Reddit client: {error}", lane.label()));
+		let fallback_http_client =
+			client_for_new_identity(lane, fallback.transport_profile()).unwrap_or_else(|error| panic!("Could not build {} Reddit fallback client: {error}", lane.label()));
 
 		loop {
 			let mut retry_after = None;
@@ -1076,10 +1076,16 @@ mod tests {
 		let generic = OauthBackendImpl::GenericWeb(GenericWebAuth::new(RedditLane::Direct));
 
 		assert_eq!(mobile.transport_profile(), OauthTransportProfile::MobileAndroid);
-		assert_eq!(mobile.transport_profile().emulation_profile(), (wreq_util::Emulation::OkHttp4_12, wreq_util::EmulationOS::Android));
+		assert_eq!(
+			mobile.transport_profile().emulation_profile(),
+			(wreq_util::Emulation::OkHttp4_12, wreq_util::EmulationOS::Android)
+		);
 		assert!(mobile.user_agent().contains("Android"));
 		assert_eq!(generic.transport_profile(), OauthTransportProfile::GenericWeb);
-		assert_eq!(generic.transport_profile().emulation_profile(), (wreq_util::Emulation::Firefox147, wreq_util::EmulationOS::Windows));
+		assert_eq!(
+			generic.transport_profile().emulation_profile(),
+			(wreq_util::Emulation::Firefox147, wreq_util::EmulationOS::Windows)
+		);
 		assert_eq!(generic.user_agent(), GENERIC_WEB_USER_AGENT);
 	}
 
