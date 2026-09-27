@@ -34,9 +34,8 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
-pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
-
-static TOR_CLIENT: LazyLock<Result<WreqClient, String>> = LazyLock::new(build_tor_client);
+pub static CLIENT: LazyLock<Arc<WreqClient>> = LazyLock::new(|| Arc::new(build_client()));
+static TOR_EMULATION_PROFILE: LazyLock<(Emulation, EmulationOS)> = LazyLock::new(random_emulation_profile);
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new(RedditLane::Direct));
@@ -1264,7 +1263,7 @@ fn cooldown_error(lane: RedditLane) -> Option<(String, bool)> {
 }
 
 fn tor_fallback_ready() -> bool {
-	TOR_OAUTH_CLIENT.load().is_some() && client_for_lane(RedditLane::Tor).is_ok()
+	TOR_OAUTH_CLIENT.load().is_some()
 }
 
 fn edge_fallback_active(guard: &UpstreamGuard, now: Instant) -> bool {
@@ -1462,14 +1461,28 @@ pub fn build_client() -> WreqClient {
 fn build_tor_client() -> Result<WreqClient, String> {
 	let config = TOR_FALLBACK_CONFIG.as_ref().map_err(|error| error.clone())?;
 	let config = config.as_ref().ok_or_else(|| "Tor fallback is disabled".to_string())?;
-	let proxy = Proxy::all(config.proxy_url.as_str()).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
+	let isolation_id = format!("redlib-{:016x}", fastrand::u64(..));
+	let proxy_url = tor_isolation_proxy_url(&config.proxy_url, &isolation_id)?;
+	let proxy = Proxy::all(proxy_url.as_str()).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
+	info!("Created an isolated Tor SOCKS transport for a Reddit identity");
 	build_emulated_client(RedditLane::Tor, Some(proxy))
 }
 
-pub(crate) fn client_for_lane(lane: RedditLane) -> Result<&'static WreqClient, String> {
+fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String, String> {
+	let mut proxy_url = url::Url::parse(proxy_url).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
+	proxy_url
+		.set_username(&isolation_id)
+		.map_err(|_| "could not add a Tor SOCKS isolation username".to_string())?;
+	proxy_url
+		.set_password(Some(&isolation_id))
+		.map_err(|_| "could not add a Tor SOCKS isolation password".to_string())?;
+	Ok(proxy_url.to_string())
+}
+
+pub(crate) fn client_for_new_identity(lane: RedditLane) -> Result<Arc<WreqClient>, String> {
 	match lane {
-		RedditLane::Direct => Ok(&CLIENT),
-		RedditLane::Tor => TOR_CLIENT.as_ref().map_err(|error| error.clone()),
+		RedditLane::Direct => Ok(CLIENT.clone()),
+		RedditLane::Tor => build_tor_client().map(Arc::new),
 	}
 }
 
@@ -1485,7 +1498,7 @@ pub fn start_tor_fallback() {
 	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
-	if let Err(error) = client_for_lane(RedditLane::Tor) {
+	if let Err(error) = client_for_new_identity(RedditLane::Tor) {
 		warn!("Tor fallback is disabled because its HTTP client could not be built: {error}");
 		return;
 	}
@@ -1500,6 +1513,15 @@ pub fn start_tor_fallback() {
 }
 
 fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqClient, String> {
+	let (selected_emulation, selected_operating_system) = match lane {
+		RedditLane::Direct => random_emulation_profile(),
+		RedditLane::Tor => *TOR_EMULATION_PROFILE,
+	};
+
+	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system)
+}
+
+fn random_emulation_profile() -> (Emulation, EmulationOS) {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
@@ -1509,6 +1531,15 @@ fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqC
 	let rand = fastrand::usize(..);
 	let selected_emulation = emulations[rand % emulations.len()];
 	let selected_operating_system = emulation_operating_systems[rand % emulation_operating_systems.len()];
+	(selected_emulation, selected_operating_system)
+}
+
+fn build_emulated_client_with_profile(
+	lane: RedditLane,
+	proxy: Option<Proxy>,
+	selected_emulation: Emulation,
+	selected_operating_system: EmulationOS,
+) -> Result<WreqClient, String> {
 	let emulation = EmulationOption::builder()
 		.emulation(selected_emulation)
 		.emulation_os(selected_operating_system)
@@ -1809,10 +1840,7 @@ fn request_once(
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let client = match client_for_lane(lane) {
-		Ok(client) => client,
-		Err(error) => return async move { Err(error) }.boxed(),
-	};
+	let client = oauth_client.http_client.clone();
 	let mut builder = client.request(method.clone(), &url);
 
 	for (key, value) in headers {
@@ -2336,6 +2364,17 @@ mod tests {
 		let (first, second, third) = tokio::join!(coalesced_test_fetch(42), coalesced_test_fetch(42), coalesced_test_fetch(42));
 		assert_eq!((first, second, third), (42, 42, 42));
 		assert_eq!(COALESCED_TEST_CALLS.load(Ordering::SeqCst), 1);
+	}
+
+	#[test]
+	fn tor_identity_uses_socks_auth_isolation() {
+		let isolated = tor_isolation_proxy_url("socks5h://tor:9050", "identity-17").unwrap();
+		let parsed = url::Url::parse(&isolated).unwrap();
+		assert_eq!(parsed.scheme(), "socks5h");
+		assert_eq!(parsed.host_str(), Some("tor"));
+		assert_eq!(parsed.port(), Some(9050));
+		assert_eq!(parsed.username(), "identity-17");
+		assert_eq!(parsed.password(), Some("identity-17"));
 	}
 
 	#[test]
