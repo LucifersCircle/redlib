@@ -187,46 +187,51 @@ impl Media {
 		let thumbnail = data["thumbnail"].as_str().unwrap_or_default();
 		let thumbnail_url = format_url(thumbnail);
 
-		if !thumbnail_url.is_empty() {
-			return Self {
+		let thumbnail_media = if !thumbnail_url.is_empty() {
+			Self {
 				url: thumbnail_url,
 				alt_url: String::new(),
 				width: data["thumbnail_width"].as_i64().unwrap_or_default(),
 				height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 				poster: String::new(),
 				download_name: String::new(),
-			};
-		}
+			}
+		} else {
+			Self::default()
+		};
 
 		// Reddit uses these sentinel values to prevent previews from exposing
-		// content before the user has opted in. Never replace them with a fallback.
+		// content before the user has opted in. Keep the supplied thumbnail (if
+		// any), but never upgrade restricted posts to a preview.
 		if post_type != "link" || data["over_18"].as_bool().unwrap_or_default() || data["spoiler"].as_bool().unwrap_or_default() || matches!(thumbnail, "nsfw" | "spoiler") {
-			return Self::default();
+			return thumbnail_media;
 		}
 
 		let preview = &data["preview"]["images"][0];
-		let resolution = preview["resolutions"].as_array().and_then(|resolutions| {
-			resolutions
-				.iter()
-				.find(|resolution| resolution["width"].as_i64().unwrap_or_default() >= 320 && resolution["url"].as_str().is_some_and(|url| !url.is_empty()))
-				.or_else(|| resolutions.iter().rev().find(|resolution| resolution["url"].as_str().is_some_and(|url| !url.is_empty())))
-		});
-		let fallback = resolution.unwrap_or(&preview["source"]);
-		let url = format_url(fallback["url"].as_str().unwrap_or_default());
+		// Mobile article cards need more than Reddit's usual 140px thumbnail.
+		// Use only metadata already present in the listing: the smallest valid
+		// preview at least 960px wide, or the largest available smaller image.
+		// Validate candidates before ranking so a malformed entry cannot hide a
+		// usable preview. All preview URLs must remain behind our media proxy.
+		let candidate = preview["resolutions"]
+			.as_array()
+			.into_iter()
+			.flatten()
+			.chain(std::iter::once(&preview["source"]))
+			.filter_map(|image| {
+				let width = image["width"].as_i64().unwrap_or_default();
+				let height = image["height"].as_i64().unwrap_or_default();
+				let url = format_url(image["url"].as_str().unwrap_or_default());
+				if width <= 0 || height <= 0 || !(url.starts_with("/preview/") || url.starts_with("/img/") || url.starts_with("/thumb/")) {
+					return None;
+				}
+				Some(Self { url, width, height, ..Self::default() })
+			})
+			.min_by_key(|image| if image.width >= 960 { (0, image.width) } else { (1, -image.width) });
 
-		// Preview fallbacks must remain behind Redlib's media proxy. If Reddit ever
-		// supplies an unexpected third-party URL, retain the ordinary link icon.
-		if !url.starts_with("/preview/") && !url.starts_with("/img/") && !url.starts_with("/thumb/") {
-			return Self::default();
-		}
-
-		Self {
-			url,
-			alt_url: String::new(),
-			width: fallback["width"].as_i64().unwrap_or_default(),
-			height: fallback["height"].as_i64().unwrap_or_default(),
-			poster: String::new(),
-			download_name: String::new(),
+		match candidate {
+			Some(image) if thumbnail_media.url.is_empty() || image.width > thumbnail_media.width => image,
+			_ => thumbnail_media,
 		}
 	}
 
@@ -1911,7 +1916,7 @@ mod tests {
 	}
 
 	#[test]
-	fn thumbnail_keeps_reddit_thumbnail() {
+	fn thumbnail_prefers_article_preview_over_small_reddit_thumbnail() {
 		let data = serde_json::json!({
 			"thumbnail": "https://a.thumbs.redditmedia.com/article.jpg",
 			"thumbnail_width": 140,
@@ -1929,8 +1934,8 @@ mod tests {
 
 		let thumbnail = Media::parse_thumbnail(&data, "link");
 
-		assert_eq!(thumbnail.url, "/thumb/a/article.jpg");
-		assert_eq!((thumbnail.width, thumbnail.height), (140, 79));
+		assert_eq!(thumbnail.url, "/preview/external-pre/source.jpg");
+		assert_eq!((thumbnail.width, thumbnail.height), (640, 360));
 	}
 
 	#[test]
@@ -1941,6 +1946,11 @@ mod tests {
 				"images": [{
 					"resolutions": [
 						{
+							"url": "https://external-preview.redd.it/article.jpg?width=960",
+							"width": 960,
+							"height": 540
+						},
+						{
 							"url": "https://external-preview.redd.it/article.jpg?width=108",
 							"width": 108,
 							"height": 61
@@ -1949,12 +1959,17 @@ mod tests {
 							"url": "https://external-preview.redd.it/article.jpg?width=320",
 							"width": 320,
 							"height": 180
+						},
+						{
+							"url": "https://external-preview.redd.it/article.jpg?width=640",
+							"width": 640,
+							"height": 360
 						}
 					],
 					"source": {
-						"url": "https://external-preview.redd.it/article.jpg?width=640",
-						"width": 640,
-						"height": 360
+						"url": "https://external-preview.redd.it/article.jpg?width=1920",
+						"width": 1920,
+						"height": 1080
 					}
 				}]
 			}
@@ -1962,8 +1977,60 @@ mod tests {
 
 		let thumbnail = Media::parse_thumbnail(&data, "link");
 
-		assert_eq!(thumbnail.url, "/preview/external-pre/article.jpg?width=320");
+		assert_eq!(thumbnail.url, "/preview/external-pre/article.jpg?width=960");
+		assert_eq!((thumbnail.width, thumbnail.height), (960, 540));
+	}
+
+	#[test]
+	fn thumbnail_uses_largest_valid_preview_below_target() {
+		let data = serde_json::json!({
+			"thumbnail": "default",
+			"preview": {"images": [{"resolutions": [
+				{"url": "https://external-preview.redd.it/larger.jpg", "width": 320, "height": 180},
+				{"url": "https://external-preview.redd.it/small.jpg", "width": 108, "height": 61},
+				{"url": "https://tracking.example/image.jpg", "width": 640, "height": 360},
+				{"url": "https://external-preview.redd.it/invalid.jpg", "width": 640, "height": 0}
+			]}]}
+		});
+
+		let thumbnail = Media::parse_thumbnail(&data, "link");
+		assert_eq!(thumbnail.url, "/preview/external-pre/larger.jpg");
 		assert_eq!((thumbnail.width, thumbnail.height), (320, 180));
+	}
+
+	#[test]
+	fn thumbnail_falls_back_to_reddit_thumbnail_when_preview_is_unusable() {
+		for preview in [
+			serde_json::Value::Null,
+			serde_json::json!({"images": [{"source": {"url": "https://tracking.example/image.jpg", "width": 640, "height": 360}}]}),
+			serde_json::json!({"images": [{"source": {"url": "https://external-preview.redd.it/image.jpg", "width": 640, "height": -1}}]}),
+			serde_json::json!({"images": [{"source": {"url": "https://external-preview.redd.it/image.jpg", "width": 108, "height": 61}}]}),
+		] {
+			let data = serde_json::json!({
+				"thumbnail": "https://a.thumbs.redditmedia.com/article.jpg",
+				"thumbnail_width": 140,
+				"thumbnail_height": 79,
+				"preview": preview
+			});
+			let thumbnail = Media::parse_thumbnail(&data, "link");
+			assert_eq!(thumbnail.url, "/thumb/a/article.jpg");
+			assert_eq!((thumbnail.width, thumbnail.height), (140, 79));
+		}
+	}
+
+	#[test]
+	fn thumbnail_keeps_supplied_thumbnail_for_restricted_and_non_link_posts() {
+		for (post_type, over_18, spoiler) in [("link", true, false), ("link", false, true), ("image", false, false), ("gallery", false, false)] {
+			let data = serde_json::json!({
+				"thumbnail": "https://a.thumbs.redditmedia.com/article.jpg",
+				"thumbnail_width": 140,
+				"thumbnail_height": 79,
+				"over_18": over_18,
+				"spoiler": spoiler,
+				"preview": {"images": [{"source": {"url": "https://external-preview.redd.it/image.jpg", "width": 640, "height": 360}}]}
+			});
+			assert_eq!(Media::parse_thumbnail(&data, post_type).url, "/thumb/a/article.jpg");
+		}
 	}
 
 	#[test]
