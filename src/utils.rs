@@ -367,7 +367,9 @@ impl GalleryMedia {
 					|| image["mp4"].as_str().is_some_and(|url| !url.is_empty());
 				let proxied_url = |value: &Value| {
 					let url = format_url(value.as_str().unwrap_or_default());
-					(url.starts_with("/preview/") || url.starts_with("/img/") || url.starts_with("/vid/")).then_some(url).unwrap_or_default()
+					(url.starts_with("/preview/") || url.starts_with("/img/") || url.starts_with("/vid/"))
+						.then_some(url)
+						.unwrap_or_default()
 				};
 				let gif_url = is_animated.then(|| proxied_url(&image["gif"])).unwrap_or_default();
 				let mp4_url = is_animated.then(|| proxied_url(&image["mp4"])).unwrap_or_default();
