@@ -56,7 +56,6 @@ const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
 const QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(120);
 const EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(30);
 const QUOTA_SAFETY_RESERVE: u16 = 5;
-const QUOTA_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
 const LOCAL_QUOTA_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const LOCAL_QUOTA_RETRY_INTERVAL: Duration = Duration::from_millis(650);
 const MAX_LOCAL_QUOTA_RETRIES: u8 = 3;
@@ -199,6 +198,7 @@ struct UpstreamAttempt {
 	generation: u64,
 	quota_epoch: u64,
 	request_id: u64,
+	quota_consumption_watermark: u64,
 	discovery_probe: bool,
 	sent: bool,
 	quota_reconciled: bool,
@@ -243,14 +243,13 @@ impl Drop for UpstreamAttempt {
 
 #[derive(Debug, Clone, Copy)]
 enum QuotaWindow {
-	Unknown { not_before: Instant, probe_in_flight: bool },
+	Unknown { probe_in_flight: bool },
 	Unreported,
 	Known { available: u16, reset_at: Instant },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum QuotaReserveError {
-	Deferred(Duration),
 	ReserveExhausted(Duration),
 	StaleGeneration,
 }
@@ -262,6 +261,7 @@ struct QuotaGovernor {
 	next_request_id: u64,
 	outstanding: u16,
 	rollover_reserve: u16,
+	headerless_consumption: u64,
 	window: QuotaWindow,
 }
 
@@ -273,10 +273,8 @@ impl Default for QuotaGovernor {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
-			window: QuotaWindow::Unknown {
-				not_before: Instant::now(),
-				probe_in_flight: false,
-			},
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
 		}
 	}
 }
@@ -304,10 +302,8 @@ impl QuotaGovernor {
 			self.epoch = self.epoch.wrapping_add(1);
 			self.outstanding = 0;
 			self.rollover_reserve = 0;
-			self.window = QuotaWindow::Unknown {
-				not_before: Instant::now(),
-				probe_in_flight: false,
-			};
+			self.headerless_consumption = 0;
+			self.window = QuotaWindow::Unknown { probe_in_flight: false };
 		}
 	}
 
@@ -319,23 +315,19 @@ impl QuotaGovernor {
 			self.epoch = self.epoch.wrapping_add(1);
 			self.rollover_reserve = self.rollover_reserve.saturating_add(self.outstanding);
 			self.outstanding = 0;
-			self.window = QuotaWindow::Unknown {
-				not_before: now,
-				probe_in_flight: false,
-			};
+			self.headerless_consumption = 0;
+			self.window = QuotaWindow::Unknown { probe_in_flight: false };
 		}
 
 		let discovery_probe = match &mut self.window {
-			QuotaWindow::Unknown { not_before, probe_in_flight } => {
-				if *probe_in_flight {
-					return Err(QuotaReserveError::Deferred(QUOTA_UNKNOWN_RETRY));
-				}
-				if now < *not_before {
-					let delay = (*not_before).duration_since(now);
-					return Err(QuotaReserveError::Deferred(delay.max(Duration::from_secs(1))));
-				}
+			QuotaWindow::Unknown { probe_in_flight } => {
+				// Every caller reaches quota admission only after acquiring a
+				// transport permit. Let those already-bounded requests proceed
+				// while the first response discovers the new identity's quota,
+				// instead of returning a recoverable error to the user.
+				let discovery_probe = !*probe_in_flight;
 				*probe_in_flight = true;
-				true
+				discovery_probe
 			}
 			QuotaWindow::Unreported => false,
 			QuotaWindow::Known { available, reset_at } => {
@@ -384,17 +376,22 @@ impl QuotaGovernor {
 		}
 		self.outstanding = self.outstanding.saturating_sub(1);
 		if attempt.generation != self.generation {
-			if attempt.discovery_probe && matches!(self.window, QuotaWindow::Unknown { .. }) {
-				self.window = QuotaWindow::Unknown {
-					not_before: now + proportional_positive_jitter(QUOTA_UNKNOWN_RETRY),
-					probe_in_flight: false,
-				};
+			if matches!(self.window, QuotaWindow::Unknown { .. } | QuotaWindow::Unreported) {
+				// A stable token refresh changes generations without changing the
+				// Reddit identity. Preserve conservative debt for a response from
+				// the previous token until current-generation quota headers arrive.
+				self.headerless_consumption = self.headerless_consumption.saturating_add(1);
+				if attempt.discovery_probe {
+					self.window = QuotaWindow::Unknown { probe_in_flight: false };
+				}
 			}
 			return false;
 		}
 
 		let reset_at = reset.map(|delay| now + delay.min(MAX_RATE_LIMIT_COOLDOWN));
 		if quota_exhausted {
+			self.rollover_reserve = 0;
+			self.headerless_consumption = 0;
 			self.window = QuotaWindow::Known {
 				available: 0,
 				reset_at: reset_at.unwrap_or(now + DEFAULT_RATE_LIMIT_COOLDOWN),
@@ -408,6 +405,7 @@ impl QuotaGovernor {
 				self.epoch = self.epoch.wrapping_add(1);
 				self.outstanding = 0;
 				self.rollover_reserve = 0;
+				self.headerless_consumption = 0;
 				self.window = QuotaWindow::Known {
 					available: remaining.saturating_sub(unresolved),
 					reset_at: observed_reset,
@@ -416,28 +414,43 @@ impl QuotaGovernor {
 			}
 		}
 
+		let overlapping_headerless = self.headerless_consumption.saturating_sub(attempt.quota_consumption_watermark).min(u64::from(u16::MAX)) as u16;
 		match (&mut self.window, remaining) {
 			(QuotaWindow::Unknown { .. }, Some(remaining)) => {
 				self.window = QuotaWindow::Known {
-					available: remaining.saturating_sub(self.outstanding).saturating_sub(self.rollover_reserve),
+					available: remaining
+						.saturating_sub(self.outstanding)
+						.saturating_sub(self.rollover_reserve)
+						.saturating_sub(overlapping_headerless),
 					reset_at: reset_at.unwrap_or(now + MAX_RATE_LIMIT_COOLDOWN),
 				};
 				self.rollover_reserve = 0;
+				self.headerless_consumption = 0;
 			}
 			(QuotaWindow::Unknown { .. }, None) => {
-				self.window = QuotaWindow::Unknown {
-					not_before: now + proportional_positive_jitter(QUOTA_UNKNOWN_RETRY),
-					probe_in_flight: false,
-				};
+				// Quota discovery is not complete until the response body is known
+				// to be a successful headerless JSON response. Keep the probe owned
+				// through body parsing so other requests remain bounded followers.
+				// Also retain conservative debt for this completed request: a later
+				// quota snapshot may have been produced before this response.
+				self.headerless_consumption = self.headerless_consumption.saturating_add(1);
 			}
 			(QuotaWindow::Unreported, Some(remaining)) => {
 				self.window = QuotaWindow::Known {
-					available: remaining.saturating_sub(self.outstanding).saturating_sub(self.rollover_reserve),
+					available: remaining
+						.saturating_sub(self.outstanding)
+						.saturating_sub(self.rollover_reserve)
+						.saturating_sub(overlapping_headerless),
 					reset_at: reset_at.unwrap_or(now + MAX_RATE_LIMIT_COOLDOWN),
 				};
 				self.rollover_reserve = 0;
+				self.headerless_consumption = 0;
 			}
-			(QuotaWindow::Unreported, None) => {}
+			(QuotaWindow::Unreported, None) => {
+				// Continue carrying headerless consumption debt until Reddit sends
+				// the first authoritative quota snapshot for this identity.
+				self.headerless_consumption = self.headerless_consumption.saturating_add(1);
+			}
 			(QuotaWindow::Known { available, reset_at: known_reset }, Some(remaining)) => {
 				// The local allowance already excludes every admitted request.
 				// Therefore an out-of-order response may lower, but never raise it.
@@ -453,38 +466,44 @@ impl QuotaGovernor {
 
 	fn confirm_headerless_success(&mut self, attempt: &UpstreamAttempt) {
 		if attempt.generation == self.generation && attempt.quota_epoch == self.epoch && matches!(self.window, QuotaWindow::Unknown { .. }) {
-			self.rollover_reserve = 0;
 			self.window = QuotaWindow::Unreported;
 		}
 	}
 
-	fn continue_headerless_discovery_after_redirect(&mut self, now: Instant, attempt: &UpstreamAttempt) {
+	fn continue_headerless_discovery_after_redirect(&mut self, _now: Instant, attempt: &UpstreamAttempt) {
 		if attempt.discovery_probe && attempt.generation == self.generation && attempt.quota_epoch == self.epoch && matches!(self.window, QuotaWindow::Unknown { .. }) {
 			// The redirect response is accounted for, but it is not evidence that
-			// the final JSON endpoint omits quota headers. Keep the discovery chain
-			// exclusive and let its next hop inherit probe ownership immediately.
-			self.window = QuotaWindow::Unknown {
-				not_before: now,
-				probe_in_flight: false,
-			};
+			// the final JSON endpoint omits quota headers. Let its next hop inherit
+			// probe ownership immediately.
+			self.window = QuotaWindow::Unknown { probe_in_flight: false };
 		}
 	}
 
-	fn abandon(&mut self, now: Instant, attempt: &UpstreamAttempt) {
-		if attempt.quota_reconciled || attempt.quota_epoch != self.epoch {
+	fn abandon(&mut self, _now: Instant, attempt: &UpstreamAttempt) {
+		if attempt.quota_epoch != self.epoch {
+			return;
+		}
+		if attempt.quota_reconciled {
+			if attempt.discovery_probe && matches!(self.window, QuotaWindow::Unknown { .. }) {
+				self.window = QuotaWindow::Unknown { probe_in_flight: false };
+			}
 			return;
 		}
 		self.outstanding = self.outstanding.saturating_sub(1);
+		if attempt.sent && matches!(self.window, QuotaWindow::Unknown { .. } | QuotaWindow::Unreported) {
+			// The request may finish upstream after a later reservation captures
+			// its watermark. Keep this uncertain consumption outside the completed
+			// headerless counter so the first quota snapshot always reserves it.
+			self.rollover_reserve = self.rollover_reserve.saturating_add(1);
+		}
 		match &mut self.window {
 			QuotaWindow::Known { available, .. } if !attempt.sent => {
 				*available = available.saturating_add(1);
 			}
-			QuotaWindow::Unknown { .. } => {
-				self.window = QuotaWindow::Unknown {
-					not_before: now + proportional_positive_jitter(QUOTA_UNKNOWN_RETRY),
-					probe_in_flight: false,
-				};
+			QuotaWindow::Unknown { .. } if attempt.discovery_probe => {
+				self.window = QuotaWindow::Unknown { probe_in_flight: false };
 			}
+			QuotaWindow::Unknown { .. } => {}
 			QuotaWindow::Unreported => {}
 			QuotaWindow::Known { .. } => {}
 		}
@@ -668,13 +687,6 @@ impl UpstreamGuard {
 		}
 
 		let (quota_epoch, request_id, discovery_probe) = self.quota.reserve(now, generation).map_err(|error| match error {
-			QuotaReserveError::Deferred(delay) => AdmissionDenied {
-				delay,
-				reason: CooldownReason::RateLimit,
-				reserve_exhausted: false,
-				local_quota_retry: true,
-				source: "quota_discovery",
-			},
 			QuotaReserveError::ReserveExhausted(delay) => AdmissionDenied {
 				delay,
 				reason: CooldownReason::RateLimit,
@@ -690,6 +702,7 @@ impl UpstreamGuard {
 				source: "stale_generation",
 			},
 		})?;
+		let quota_consumption_watermark = self.quota.headerless_consumption;
 		let edge = match self.begin_attempt(now) {
 			Ok(edge) => edge,
 			Err(error) => {
@@ -702,6 +715,7 @@ impl UpstreamGuard {
 					generation,
 					quota_epoch,
 					request_id,
+					quota_consumption_watermark,
 					discovery_probe,
 					sent: false,
 					quota_reconciled: false,
@@ -725,6 +739,7 @@ impl UpstreamGuard {
 			generation,
 			quota_epoch,
 			request_id,
+			quota_consumption_watermark,
 			discovery_probe,
 			sent: false,
 			quota_reconciled: false,
@@ -1452,9 +1467,6 @@ fn local_admission_message(denial: AdmissionDenied, short_refresh_retry: bool) -
 			retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
 		);
 	}
-	if denial.source == "quota_discovery" {
-		return "Checking the anonymous Reddit session quota. Retry in 1 second".to_string();
-	}
 	format!("{}. Retry in {} seconds", denial.reason.message(), retry_after_seconds(denial.delay))
 }
 
@@ -1590,17 +1602,6 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 		Ok(reservation) => reservation,
 		Err(error) => {
 			let (denial, denied_quota_epoch, emergency_ticket) = match error {
-				QuotaReserveError::Deferred(delay) => (
-					AdmissionDenied {
-						delay,
-						reason: CooldownReason::RateLimit,
-						reserve_exhausted: false,
-						local_quota_retry: true,
-						source: "quota_discovery",
-					},
-					None,
-					None,
-				),
 				QuotaReserveError::ReserveExhausted(delay) => (
 					AdmissionDenied {
 						delay,
@@ -1641,9 +1642,11 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 			return Err(ApiRequestError::deferred(local_admission_message(denial, short_refresh_retry), CooldownReason::RateLimit));
 		}
 	};
+	let quota_consumption_watermark = guard.quota.headerless_consumption;
 	attempt.generation = generation;
 	attempt.quota_epoch = quota_epoch;
 	attempt.request_id = request_id;
+	attempt.quota_consumption_watermark = quota_consumption_watermark;
 	attempt.discovery_probe = discovery_probe;
 	attempt.sent = false;
 	attempt.quota_reconciled = false;
@@ -1651,7 +1654,11 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 }
 
 fn block_for_edge_throttle(attempt: &mut UpstreamAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
-	let decision = upstream_guard(attempt.lane).record_edge_throttle(Instant::now(), attempt.edge, retry_after);
+	let now = Instant::now();
+	let mut guard = upstream_guard(attempt.lane);
+	let decision = guard.record_edge_throttle(now, attempt.edge, retry_after);
+	guard.quota.abandon(now, attempt);
+	drop(guard);
 	attempt.complete();
 	decision
 }
@@ -3032,6 +3039,7 @@ mod tests {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: QUOTA_SAFETY_RESERVE + 3,
 				reset_at: now + Duration::from_secs(120),
@@ -3053,6 +3061,7 @@ mod tests {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: QUOTA_SAFETY_RESERVE,
 				reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
@@ -3069,11 +3078,11 @@ mod tests {
 	fn test_local_quota_retries_are_attempt_and_time_bounded() {
 		let retryable = BeginAttemptDenied {
 			admission: Some(AdmissionDenied {
-				delay: QUOTA_UNKNOWN_RETRY,
+				delay: DEFAULT_RATE_LIMIT_COOLDOWN,
 				reason: CooldownReason::RateLimit,
-				reserve_exhausted: false,
+				reserve_exhausted: true,
 				local_quota_retry: true,
-				source: "quota_discovery",
+				source: "quota_reserve",
 			}),
 			message: "retry".to_string(),
 			edge_deferred: false,
@@ -3106,10 +3115,6 @@ mod tests {
 			quota_spillover: None,
 		};
 		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded), None);
-		assert_eq!(
-			local_admission_message(retryable.admission.unwrap(), false),
-			"Checking the anonymous Reddit session quota. Retry in 1 second"
-		);
 		assert_eq!(
 			local_admission_message(retryable.admission.unwrap(), true),
 			"Refreshing the anonymous Reddit session. Retry in 2 seconds"
@@ -3150,10 +3155,7 @@ mod tests {
 			}
 		));
 
-		direct.quota.window = QuotaWindow::Unknown {
-			not_before: now,
-			probe_in_flight: false,
-		};
+		direct.quota.window = QuotaWindow::Unknown { probe_in_flight: false };
 		assert!(!direct.quota_spillover_still_needed(now, ticket));
 		direct.quota.window = QuotaWindow::Unreported;
 		assert!(!direct.quota_spillover_still_needed(now, ticket));
@@ -3259,6 +3261,7 @@ mod tests {
 				next_request_id: 0,
 				outstanding: 0,
 				rollover_reserve: 0,
+				headerless_consumption: 0,
 				window: QuotaWindow::Known {
 					available: LOW_RATE_LIMIT_THRESHOLD - 1,
 					reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_nanos(1),
@@ -3300,10 +3303,7 @@ mod tests {
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 
-		guard.quota.window = QuotaWindow::Unknown {
-			not_before: now,
-			probe_in_flight: true,
-		};
+		guard.quota.window = QuotaWindow::Unknown { probe_in_flight: true };
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		guard.quota.window = QuotaWindow::Unreported;
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
@@ -3331,6 +3331,7 @@ mod tests {
 				next_request_id: 0,
 				outstanding: 0,
 				rollover_reserve: 0,
+				headerless_consumption: 0,
 				window: QuotaWindow::Known {
 					available: QUOTA_SAFETY_RESERVE + 1,
 					reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
@@ -3383,10 +3384,7 @@ mod tests {
 		assert!(!guard.completed_quota_rotation_still_valid(now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING, ticket));
 
 		guard.emergency_rotation_claimed_epoch = None;
-		guard.quota.window = QuotaWindow::Unknown {
-			not_before: now,
-			probe_in_flight: false,
-		};
+		guard.quota.window = QuotaWindow::Unknown { probe_in_flight: false };
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
 		guard.quota.window = QuotaWindow::Unreported;
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
@@ -3409,6 +3407,7 @@ mod tests {
 				next_request_id: 0,
 				outstanding: 0,
 				rollover_reserve: 0,
+				headerless_consumption: 0,
 				window: QuotaWindow::Known {
 					available: QUOTA_SAFETY_RESERVE,
 					reset_at: emergency_reset,
@@ -3455,6 +3454,7 @@ mod tests {
 				next_request_id: 0,
 				outstanding: 0,
 				rollover_reserve: 0,
+				headerless_consumption: 0,
 				window: QuotaWindow::Known {
 					available: QUOTA_SAFETY_RESERVE,
 					reset_at: now + Duration::from_secs(90),
@@ -3537,6 +3537,7 @@ mod tests {
 			next_request_id: 2,
 			outstanding: 2,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 6,
 				reset_at: now + Duration::from_secs(120),
@@ -3548,6 +3549,7 @@ mod tests {
 			generation: 3,
 			quota_epoch: 4,
 			request_id,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3568,6 +3570,7 @@ mod tests {
 			next_request_id: 2,
 			outstanding: 2,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: LOW_RATE_LIMIT_THRESHOLD - 1,
 				reset_at: old_reset,
@@ -3579,6 +3582,7 @@ mod tests {
 			generation: 3,
 			quota_epoch: 4,
 			request_id: 1,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3612,6 +3616,7 @@ mod tests {
 			generation: 3,
 			quota_epoch,
 			request_id,
+			quota_consumption_watermark: 0,
 			discovery_probe,
 			sent: true,
 			quota_reconciled: true,
@@ -3628,6 +3633,7 @@ mod tests {
 			generation: 3,
 			quota_epoch: 4,
 			request_id: 2,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3654,6 +3660,7 @@ mod tests {
 			next_request_id: 1,
 			outstanding: 1,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: LOW_RATE_LIMIT_THRESHOLD - 1,
 				reset_at: old_reset,
@@ -3665,6 +3672,7 @@ mod tests {
 			generation: 2,
 			quota_epoch: 3,
 			request_id: 1,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3685,6 +3693,7 @@ mod tests {
 			next_request_id: 1,
 			outstanding: 1,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 40,
 				reset_at: old_reset,
@@ -3696,6 +3705,7 @@ mod tests {
 			generation: 2,
 			quota_epoch: 3,
 			request_id: 1,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3715,6 +3725,7 @@ mod tests {
 			next_request_id: 8,
 			outstanding: 0,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 7,
 				reset_at: now + Duration::from_secs(90),
@@ -3734,6 +3745,7 @@ mod tests {
 			next_request_id: 8,
 			outstanding: 2,
 			rollover_reserve: 1,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 5,
 				reset_at: now + Duration::from_secs(90),
@@ -3745,6 +3757,7 @@ mod tests {
 			generation: 4,
 			quota_epoch: 2,
 			request_id: 8,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3756,6 +3769,7 @@ mod tests {
 			generation: 4,
 			quota_epoch: 2,
 			request_id: 9,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: false,
 			quota_reconciled: false,
@@ -3778,7 +3792,9 @@ mod tests {
 		stale_unsent_attempt.completed = true;
 		assert_eq!(quota.outstanding, 1);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
-		assert!(quota.reserve(fresh_now + Duration::from_secs(1), 5).is_err());
+		let (_, _, follower_is_probe) = quota.reserve(fresh_now + Duration::from_secs(1), 5).unwrap();
+		assert!(!follower_is_probe);
+		assert_eq!(quota.outstanding, 2);
 	}
 
 	#[test]
@@ -3790,6 +3806,7 @@ mod tests {
 			next_request_id: 1,
 			outstanding: 1,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 7,
 				reset_at: now + Duration::from_secs(90),
@@ -3804,6 +3821,7 @@ mod tests {
 			generation: 4,
 			quota_epoch: 3,
 			request_id: 1,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3823,10 +3841,8 @@ mod tests {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
-			window: QuotaWindow::Unknown {
-				not_before: now,
-				probe_in_flight: false,
-			},
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		assert!(discovery_probe);
@@ -3836,17 +3852,349 @@ mod tests {
 			generation: 2,
 			quota_epoch,
 			request_id,
+			quota_consumption_watermark: 0,
 			discovery_probe,
 			sent: true,
 			quota_reconciled: true,
 			completed: true,
 		};
 		quota.reconcile(now, &attempt, None, None, false);
-		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
-		assert!(quota.reserve(now, 2).is_err());
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+		assert!(!quota.reserve(now, 2).unwrap().2);
 		quota.confirm_headerless_success(&attempt);
 		assert!(matches!(quota.window, QuotaWindow::Unreported));
 		assert!(quota.reserve(now, 2).is_ok());
+	}
+
+	#[test]
+	fn test_follower_redirect_during_headerless_discovery_remains_admitted() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		assert!(discovery_probe);
+		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!follower_is_probe);
+
+		let probe = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id: probe_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: true,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		let follower = UpstreamAttempt {
+			request_id: follower_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: false,
+			..probe
+		};
+		quota.reconcile(now, &probe, None, None, false);
+		quota.reconcile(now, &follower, None, None, false);
+		quota.continue_headerless_discovery_after_redirect(now, &follower);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+		let (_, _, redirect_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!redirect_is_probe);
+
+		quota.confirm_headerless_success(&probe);
+		assert!(matches!(quota.window, QuotaWindow::Unreported));
+	}
+
+	#[test]
+	fn test_headerless_follower_consumption_is_debited_from_first_quota_snapshot() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		assert!(discovery_probe);
+		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!follower_is_probe);
+
+		let follower = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id: follower_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		quota.reconcile(now, &follower, None, None, false);
+		assert_eq!(quota.headerless_consumption, 1);
+		let (_, _, redirect_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!redirect_is_probe);
+
+		let probe = UpstreamAttempt {
+			request_id: probe_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: true,
+			..follower
+		};
+		quota.reconcile(now, &probe, Some(99), Some(Duration::from_secs(300)), false);
+		assert!(matches!(quota.window, QuotaWindow::Known { available: 97, .. }));
+		assert_eq!(quota.headerless_consumption, 0);
+	}
+
+	#[test]
+	fn test_successful_headerless_follower_keeps_debt_until_first_quota_snapshot() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		assert!(discovery_probe);
+		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!follower_is_probe);
+
+		let follower = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id: follower_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		quota.reconcile(now, &follower, None, None, false);
+		quota.confirm_headerless_success(&follower);
+		assert!(matches!(quota.window, QuotaWindow::Unreported));
+		assert_eq!(quota.headerless_consumption, 1);
+
+		let probe = UpstreamAttempt {
+			request_id: probe_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: true,
+			..follower
+		};
+		quota.reconcile(now, &probe, Some(99), Some(Duration::from_secs(300)), false);
+		assert!(matches!(quota.window, QuotaWindow::Known { available: 98, .. }));
+		assert_eq!(quota.headerless_consumption, 0);
+	}
+
+	#[test]
+	fn test_sequential_headerless_history_is_not_charged_to_later_quota_snapshot() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+
+		for index in 0..100 {
+			let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+			let watermark = quota.headerless_consumption;
+			let attempt = UpstreamAttempt {
+				lane: RedditLane::Direct,
+				edge: EdgeAttempt { epoch: 0, half_open: false },
+				generation: 2,
+				quota_epoch,
+				request_id,
+				quota_consumption_watermark: watermark,
+				discovery_probe,
+				sent: true,
+				quota_reconciled: true,
+				completed: true,
+			};
+			quota.reconcile(now, &attempt, None, None, false);
+			if index == 0 {
+				quota.confirm_headerless_success(&attempt);
+			}
+		}
+		assert!(matches!(quota.window, QuotaWindow::Unreported));
+		assert_eq!(quota.headerless_consumption, 100);
+
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		let snapshot = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id,
+			quota_consumption_watermark: quota.headerless_consumption,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		quota.reconcile(now, &snapshot, Some(99), Some(Duration::from_secs(300)), false);
+		assert!(matches!(quota.window, QuotaWindow::Known { available: 99, .. }));
+		assert_eq!(quota.headerless_consumption, 0);
+	}
+
+	#[test]
+	fn test_reconciled_discovery_probe_failure_releases_probe() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		let mut probe = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: true,
+			completed: false,
+		};
+		quota.reconcile(now, &probe, None, None, false);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+		quota.abandon(now, &probe);
+		probe.completed = true;
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
+		assert!(quota.reserve(now, 2).unwrap().2);
+	}
+
+	#[test]
+	fn test_sent_abandoned_discovery_request_remains_uncertain_quota_debt() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		let abandoned = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: false,
+			completed: true,
+		};
+		quota.abandon(now, &abandoned);
+		assert_eq!(quota.rollover_reserve, 1);
+		assert_eq!(quota.headerless_consumption, 0);
+
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		let snapshot = UpstreamAttempt {
+			quota_epoch,
+			request_id,
+			quota_consumption_watermark: quota.headerless_consumption,
+			discovery_probe,
+			quota_reconciled: true,
+			..abandoned
+		};
+		quota.reconcile(now, &snapshot, Some(99), Some(Duration::from_secs(300)), false);
+		assert!(matches!(quota.window, QuotaWindow::Known { available: 98, .. }));
+		assert_eq!(quota.rollover_reserve, 0);
+	}
+
+	#[test]
+	fn test_discovery_follower_failure_does_not_release_probe() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor {
+			generation: 2,
+			epoch: 4,
+			next_request_id: 0,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
+		};
+		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		assert!(discovery_probe);
+		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!follower_is_probe);
+
+		let follower = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt { epoch: 0, half_open: false },
+			generation: 2,
+			quota_epoch,
+			request_id: follower_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: false,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		quota.reconcile(now, &follower, None, None, false);
+		assert_eq!(quota.outstanding, 1);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+
+		let (_, abandoned_request_id, abandoned_is_probe) = quota.reserve(now, 2).unwrap();
+		assert!(!abandoned_is_probe);
+		let mut abandoned_follower = UpstreamAttempt {
+			request_id: abandoned_request_id,
+			quota_consumption_watermark: 0,
+			sent: false,
+			quota_reconciled: false,
+			completed: false,
+			..follower
+		};
+		quota.abandon(now, &abandoned_follower);
+		abandoned_follower.quota_reconciled = true;
+		abandoned_follower.completed = true;
+		assert_eq!(quota.outstanding, 1);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+
+		let mut probe = UpstreamAttempt {
+			request_id: probe_request_id,
+			quota_consumption_watermark: 0,
+			discovery_probe: true,
+			sent: false,
+			quota_reconciled: false,
+			completed: false,
+			..follower
+		};
+		quota.abandon(now, &probe);
+		probe.quota_reconciled = true;
+		probe.completed = true;
+		assert_eq!(quota.outstanding, 0);
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
 	}
 
 	#[test]
@@ -3858,10 +4206,8 @@ mod tests {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
-			window: QuotaWindow::Unknown {
-				not_before: now,
-				probe_in_flight: false,
-			},
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 1).unwrap();
 		quota.install_generation(2, false);
@@ -3871,6 +4217,7 @@ mod tests {
 			generation: 1,
 			quota_epoch,
 			request_id,
+			quota_consumption_watermark: 0,
 			discovery_probe,
 			sent: true,
 			quota_reconciled: true,
@@ -3879,11 +4226,11 @@ mod tests {
 		quota.reconcile(now, &stale_attempt, Some(99), Some(Duration::from_secs(300)), false);
 		assert_eq!(quota.outstanding, 0);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
-		assert_eq!(quota.reserve(now + QUOTA_UNKNOWN_RETRY + Duration::from_secs(2), 2).unwrap().2, true);
+		assert!(quota.reserve(now, 2).unwrap().2);
 	}
 
 	#[test]
-	fn test_headerless_redirect_preserves_exclusive_discovery_with_a_new_reservation() {
+	fn test_headerless_redirect_preserves_discovery_probe_with_a_new_reservation() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
 			generation: 3,
@@ -3891,10 +4238,8 @@ mod tests {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
-			window: QuotaWindow::Unknown {
-				not_before: now,
-				probe_in_flight: false,
-			},
+			headerless_consumption: 0,
+			window: QuotaWindow::Unknown { probe_in_flight: false },
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 3).unwrap();
 		let mut attempt = UpstreamAttempt {
@@ -3903,6 +4248,7 @@ mod tests {
 			generation: 3,
 			quota_epoch,
 			request_id,
+			quota_consumption_watermark: 0,
 			discovery_probe,
 			sent: true,
 			quota_reconciled: false,
@@ -3911,14 +4257,14 @@ mod tests {
 		assert_eq!(quota.outstanding, 1);
 		quota.reconcile(now, &attempt, None, None, false);
 		attempt.quota_reconciled = true;
-		assert!(quota.reserve(now, 3).is_err());
 		quota.continue_headerless_discovery_after_redirect(now, &attempt);
 		let (next_epoch, next_request_id, next_discovery_probe) = quota.reserve(now, 3).unwrap();
 		assert_eq!(next_epoch, quota_epoch);
 		assert_ne!(next_request_id, request_id);
 		assert!(next_discovery_probe);
-		assert!(quota.reserve(now, 3).is_err());
-		assert_eq!(quota.outstanding, 1);
+		let (_, _, follower_is_probe) = quota.reserve(now, 3).unwrap();
+		assert!(!follower_is_probe);
+		assert_eq!(quota.outstanding, 2);
 		attempt.completed = true;
 	}
 
@@ -3932,6 +4278,7 @@ mod tests {
 			next_request_id: 3,
 			outstanding: 3,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 6,
 				reset_at: old_reset,
@@ -3943,6 +4290,7 @@ mod tests {
 			generation: 8,
 			quota_epoch: 12,
 			request_id: 3,
+			quota_consumption_watermark: 0,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -3963,13 +4311,17 @@ mod tests {
 			next_request_id: 0,
 			outstanding: 0,
 			rollover_reserve: 0,
+			headerless_consumption: 0,
 			window: QuotaWindow::Known {
 				available: 0,
 				reset_at: now - RATE_LIMIT_COOLDOWN_MARGIN,
 			},
 		};
-		assert!(quota.reserve(now, 1).is_ok());
-		assert!(quota.reserve(now, 1).is_err());
+		assert!(quota.reserve(now, 1).unwrap().2);
+		for _ in 0..16 {
+			assert!(!quota.reserve(now, 1).unwrap().2);
+		}
+		assert_eq!(quota.outstanding, 17);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
 	}
 
@@ -4139,6 +4491,7 @@ mod tests {
 				next_request_id: 0,
 				outstanding: 0,
 				rollover_reserve: 0,
+				headerless_consumption: 0,
 				window: QuotaWindow::Known {
 					available: LOW_RATE_LIMIT_THRESHOLD - 1,
 					reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),

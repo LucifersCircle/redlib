@@ -75,8 +75,15 @@ jobs:
           cargo test --locked --lib test_fresh_identity_starts_unknown_quota_window_and_ignores_late_responses
           cargo test --locked --lib test_stale_generation_cannot_reserve_or_replace_budget
           cargo test --locked --lib test_headerless_backend_leaves_discovery_mode
+          cargo test --locked --lib test_follower_redirect_during_headerless_discovery_remains_admitted
+          cargo test --locked --lib test_headerless_follower_consumption_is_debited_from_first_quota_snapshot
+          cargo test --locked --lib test_successful_headerless_follower_keeps_debt_until_first_quota_snapshot
+          cargo test --locked --lib test_sequential_headerless_history_is_not_charged_to_later_quota_snapshot
+          cargo test --locked --lib test_reconciled_discovery_probe_failure_releases_probe
+          cargo test --locked --lib test_sent_abandoned_discovery_request_remains_uncertain_quota_debt
+          cargo test --locked --lib test_discovery_follower_failure_does_not_release_probe
           cargo test --locked --lib test_stale_discovery_releases_probe_without_applying_headers
-          cargo test --locked --lib test_headerless_redirect_preserves_exclusive_discovery_with_a_new_reservation
+          cargo test --locked --lib test_headerless_redirect_preserves_discovery_probe_with_a_new_reservation
           cargo test --locked --lib test_response_after_reset_establishes_new_quota_window
           cargo test --locked --lib test_reset_allows_exactly_one_discovery_probe
           cargo test --locked --lib test_redirect_validation_rejects_off_origin_and_normalizes_reddit
