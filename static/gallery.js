@@ -162,12 +162,13 @@
         let galleryVisible = false;
         let activeIndex = 0;
         let settledIndex = 0;
+        let pendingResize = false;
 
         function viewportWidth() {
             return viewport.clientWidth || gallery.clientWidth || track.clientWidth || slides[0].clientWidth || 1;
         }
 
-        function viewportHeightLimit() {
+        function currentViewportHeightLimit() {
             const visualHeight = Number(window.visualViewport && window.visualViewport.height);
             const windowHeight = Number(window.innerHeight);
             const availableHeight = visualHeight > 0 ? visualHeight : (windowHeight > 0 ? windowHeight : 800);
@@ -175,22 +176,32 @@
             return Math.min(availableHeight * (detail ? 0.76 : 0.68), detail ? 720 : 560);
         }
 
+        // iOS Safari changes visualViewport.height as its browser bars expand
+        // and collapse. Capture the limit once and only replace it alongside a
+        // real width change so vertical page scrolling cannot resize the card.
+        let viewportHeightLimit = currentViewportHeightLimit();
+
         function dimensionsForSlide(slide) {
             const width = Number(slide && slide.dataset.galleryWidth);
             const height = Number(slide && slide.dataset.galleryHeight);
             return width > 0 && height > 0 ? { width, height } : { width: 4, height: 3 };
         }
 
+        function slideHasDimensions(slide) {
+            return Number(slide && slide.dataset.galleryWidth) > 0 && Number(slide && slide.dataset.galleryHeight) > 0;
+        }
+
         function mediaHeightForSlide(slide) {
             const dimensions = dimensionsForSlide(slide);
             const naturalHeight = viewportWidth() * dimensions.height / dimensions.width;
-            return Math.max(1, Math.round(Math.min(naturalHeight, viewportHeightLimit())));
+            return Math.max(1, Math.round(Math.min(naturalHeight, viewportHeightLimit)));
         }
 
         function resizeToLargestSlide() {
             const height = Math.max(...slides.map(mediaHeightForSlide));
             gallery.style.setProperty('--gallery-media-height', `${height}px`);
             gallery.style.setProperty('--gallery-control-top', `${Math.round(height / 2)}px`);
+            pendingResize = false;
         }
 
         function canResizeGallery() {
@@ -201,6 +212,14 @@
             if (typeof viewport.getBoundingClientRect !== 'function') return;
             const height = viewport.getBoundingClientRect().height;
             if (height > 0) gallery.style.setProperty('--gallery-media-height', `${Math.round(height)}px`);
+        }
+
+        function resizeWhenSafe() {
+            if (canResizeGallery()) {
+                resizeToLargestSlide();
+            } else {
+                pendingResize = true;
+            }
         }
 
         function closestSlideIndex() {
@@ -229,10 +248,10 @@
             const stage = slide.querySelector('.feed_gallery_stage') || slide;
             slide.querySelectorAll('img').forEach(function(image) {
                 image.addEventListener('load', function() {
-                    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+                    if (!slideHasDimensions(slide) && image.naturalWidth > 0 && image.naturalHeight > 0) {
                         slide.dataset.galleryWidth = String(image.naturalWidth);
                         slide.dataset.galleryHeight = String(image.naturalHeight);
-                        if (canResizeGallery()) resizeToLargestSlide();
+                        resizeWhenSafe();
                     }
                 });
             });
@@ -240,10 +259,10 @@
                 initializeVideoFallback(video);
                 video.dataset.mediaVisible = 'false';
                 video.addEventListener('loadedmetadata', function() {
-                    if (video.videoWidth > 0 && video.videoHeight > 0) {
+                    if (!slideHasDimensions(slide) && video.videoWidth > 0 && video.videoHeight > 0) {
                         slide.dataset.galleryWidth = String(video.videoWidth);
                         slide.dataset.galleryHeight = String(video.videoHeight);
-                        if (canResizeGallery()) resizeToLargestSlide();
+                        resizeWhenSafe();
                     }
                 });
                 observeVisibility(stage, function(visible) {
@@ -316,7 +335,7 @@
             updateCurrentSlide();
             settledIndex = activeIndex;
             gallery.classList.remove('gallery_dragging');
-            resizeToLargestSlide();
+            if (pendingResize) resizeToLargestSlide();
             showActiveMetadata(settledIndex);
             updatePlayback();
         }
@@ -338,7 +357,6 @@
             scheduleCurrentSlideUpdate();
             settleCurrentSlide();
         });
-        window.addEventListener('orientationchange', scheduleSettle, { passive: true });
         document.addEventListener('visibilitychange', function() {
             if (document.hidden) {
                 slides.forEach(function(slide) {
@@ -418,10 +436,11 @@
         observeVisibility(gallery, function(visible) {
             galleryVisible = visible;
             if (visible) {
+                const firstInitialization = !initialized;
                 initialized = true;
                 updateCurrentSlide();
                 settledIndex = activeIndex;
-                resizeToLargestSlide();
+                if (firstInitialization) resizeToLargestSlide();
                 showActiveMetadata(settledIndex);
                 updatePlayback();
             } else if (initialized) {
@@ -431,18 +450,23 @@
             }
         });
 
+        let observedWidth = viewportWidth();
+        function resizeForWidthChange(width) {
+            if (!width || Math.abs(width - observedWidth) < 1) return;
+            observedWidth = width;
+            viewportHeightLimit = currentViewportHeightLimit();
+            resizeWhenSafe();
+        }
+
         if (typeof window.ResizeObserver === 'function') {
-            let observedWidth = gallery.clientWidth;
             const resizeObserver = new window.ResizeObserver(function(entries) {
                 const width = entries[0] && entries[0].contentRect.width;
-                if (!width || Math.abs(width - observedWidth) < 1) return;
-                observedWidth = width;
-                if (canResizeGallery()) resizeToLargestSlide();
+                resizeForWidthChange(width);
             });
             resizeObserver.observe(gallery);
         } else {
             window.addEventListener('resize', function() {
-                if (canResizeGallery()) resizeToLargestSlide();
+                resizeForWidthChange(viewportWidth());
             }, { passive: true });
         }
     }

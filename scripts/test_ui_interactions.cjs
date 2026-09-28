@@ -109,7 +109,7 @@ class Element extends Events {
     }
 }
 
-function browser({ coarse = false, readyState = 'complete', intersection = false } = {}) {
+function browser({ coarse = false, readyState = 'complete', intersection = false, visualViewportHeight = 0 } = {}) {
     let now = 10_000;
     let frameId = 0;
     let timerId = 0;
@@ -122,6 +122,7 @@ function browser({ coarse = false, readyState = 'complete', intersection = false
     document.querySelectorAll = selector => document.body.querySelectorAll(selector);
     window.matchMedia = () => ({ matches: coarse });
     window.innerHeight = 1000;
+    if (visualViewportHeight > 0) window.visualViewport = { height: visualViewportHeight };
     const observers = [];
     if (intersection) {
         window.IntersectionObserver = class {
@@ -182,11 +183,11 @@ function galleryFixture(options) {
     const captions = [];
     const originals = [];
     const slides = Array.from({ length: 5 }, (_, index) => {
-        const slide = new Element('figure', {
-            'data-gallery-slide': '',
+        const dimensions = index === options?.missingDimensionIndex ? {} : {
             'data-gallery-width': String(index === 1 ? 900 : 1600),
             'data-gallery-height': String(index === 1 ? 1600 : 900),
-        });
+        };
+        const slide = new Element('figure', { 'data-gallery-slide': '', ...dimensions });
         const image = new Element('img', { [index === 0 ? 'src' : 'data-src']: `/preview/${index}.jpg` });
         images.push(image);
         slide.offsetLeft = index * 300;
@@ -373,6 +374,7 @@ test('gallery stages use the tallest rendered item without a fixed black frame',
     assert.doesNotMatch(template, /\{% for image in images/);
     assert.ok(template.includes('class="gallery gallery_detail"'), 'single-item detail galleries keep responsive gallery styles');
     assert.match(stylesheet, /\.gallery-js \.adaptive_gallery \.feed_gallery_viewport \{[^}]+height: var\(--gallery-media-height, auto\);/s);
+    assert.doesNotMatch(stylesheet, /transition: height/);
     assert.match(stylesheet, /\.gallery-js \.feed_gallery_control \{[^}]+width: 44px;[^}]+height: 44px;/s);
     assert.match(stylesheet, /\.gallery_detail > figure > a:not\(\.gallery_original_link\) > img,[^{]+\{[^}]+height: auto;/s);
     assert.doesNotMatch(stylesheet, /--gallery-active-aspect-ratio/);
@@ -498,7 +500,7 @@ test('gallery navigation updates loading, counter and boundary buttons', () => {
     assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
 });
 
-test('late media dimensions cannot resize a gallery while touch scrolling settles', () => {
+test('loaded previews cannot replace valid metadata while touch scrolling settles', () => {
     const env = galleryFixture();
     env.track.emit('pointerdown', pointer());
     env.window.emit('pointercancel', pointer());
@@ -509,8 +511,36 @@ test('late media dimensions cannot resize a gallery while touch scrolling settle
     assert.equal(env.gallery.classList.contains('gallery_dragging'), true);
 
     env.flushTimers();
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px');
     assert.equal(env.gallery.classList.contains('gallery_dragging'), false);
+});
+
+test('gallery fills missing media dimensions after loading', () => {
+    const env = galleryFixture({ missingDimensionIndex: 0 });
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px');
+    env.images[0].naturalWidth = 100;
+    env.images[0].naturalHeight = 1000;
+    env.images[0].emit('load');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
+});
+
+test('iOS browser chrome changes cannot resize a gallery during vertical scrolling', () => {
+    const env = galleryFixture({ visualViewportHeight: 700, intersection: true });
+    env.intersect(env.gallery, true);
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '476px');
+
+    env.window.visualViewport.height = 1000;
+    env.window.emit('resize');
+    env.track.emit('pointerdown', pointer());
+    env.window.emit('pointerup', pointer());
+    env.flushTimers();
+    env.intersect(env.gallery, false);
+    env.intersect(env.gallery, true);
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '476px');
+
+    env.viewport.clientWidth = 400;
+    env.window.emit('resize');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
 });
 
 test('detail galleries use the larger viewport cap without oversized portrait slides', () => {
