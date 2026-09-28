@@ -110,12 +110,12 @@ jobs:
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
           cargo test --locked --lib test_refresh_backoff_recovers_after_success
           cargo test --locked --lib test_token_refresh_delay_cannot_underflow
-          cargo test --locked --lib startup_recovery_
-          cargo test --locked --lib startup_mobile_rotation_replaces_identity_and_transport
+          cargo test --locked --lib startup_rotates_immediately_only_for_identity_policy_forbidden
+          cargo test --locked --lib startup_browser_rotation_replaces_identity_and_transport
           cargo test --locked --lib oauth_failure_classes_are_privacy_safe_and_actionable
           cargo test --locked --lib oauth_transport_profile_matches_android_identity
           cargo test --locked --lib oauth_refresh_reuses_only_stable_matching_transport
-          cargo test --locked --lib direct_compatibility_transport_persists_for_mobile_refreshes
+          cargo test --locked --lib shuffled_oauth_profile_cycle_contains_each_profile_once
           cargo test --locked --lib newest_android_identity_cohort_excludes_older_versions
           cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
           cargo test --locked --lib tor_fallback_requires_explicit_valid_socks5h_proxy
