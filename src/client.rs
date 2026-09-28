@@ -55,6 +55,10 @@ impl OauthTransportProfile {
 			Self::GenericWeb => "generic_web",
 		}
 	}
+
+	pub(crate) fn skips_emulation_headers(self) -> bool {
+		self == Self::GenericWeb
+	}
 }
 
 pub(crate) const GENERIC_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0";
@@ -1615,6 +1619,10 @@ pub(crate) fn client_for_new_identity(lane: RedditLane, profile: OauthTransportP
 	}
 }
 
+pub(crate) fn direct_oauth_compatibility_client() -> Arc<WreqClient> {
+	CLIENT.clone()
+}
+
 pub fn start_oauth() {
 	if DIRECT_OAUTH_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
@@ -1675,9 +1683,11 @@ fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqC
 
 fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>, profile: OauthTransportProfile) -> Result<WreqClient, String> {
 	let (selected_emulation, selected_operating_system) = profile.emulation_profile();
-	// OAuth backends supply their own identity headers. Retain the selected
-	// TLS/HTTP2 fingerprint without mixing in OkHttp or browser navigation defaults.
-	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, true, profile.label())
+	// Mobile OAuth overrides the emulated User-Agent and content type with its
+	// Reddit identity, while retaining OkHttp's ordinary Accept headers. Generic
+	// web OAuth supplies its complete browser request explicitly.
+	let skip_emulation_headers = profile.skips_emulation_headers();
+	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, skip_emulation_headers, profile.label())
 }
 
 fn random_emulation_profile() -> (Emulation, EmulationOS) {
