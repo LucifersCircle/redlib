@@ -1561,18 +1561,30 @@ const URL_PAIRS: [(&str, &str); 2] = [
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum OauthTransportProfile {
+	Chrome140Android,
+	Chrome141Android,
+	Chrome142Android,
 	Chrome143Android,
 	Chrome144Android,
 	Chrome145Android,
+	Firefox142Android,
+	Firefox143Android,
+	Firefox144Android,
 	Firefox145Android,
 	Firefox146Android,
 	Firefox147Android,
 }
 
-pub(crate) const OAUTH_BROWSER_PROFILES: [OauthTransportProfile; 6] = [
+pub(crate) const OAUTH_BROWSER_PROFILES: [OauthTransportProfile; 12] = [
+	OauthTransportProfile::Chrome140Android,
+	OauthTransportProfile::Chrome141Android,
+	OauthTransportProfile::Chrome142Android,
 	OauthTransportProfile::Chrome143Android,
 	OauthTransportProfile::Chrome144Android,
 	OauthTransportProfile::Chrome145Android,
+	OauthTransportProfile::Firefox142Android,
+	OauthTransportProfile::Firefox143Android,
+	OauthTransportProfile::Firefox144Android,
 	OauthTransportProfile::Firefox145Android,
 	OauthTransportProfile::Firefox146Android,
 	OauthTransportProfile::Firefox147Android,
@@ -1581,9 +1593,15 @@ pub(crate) const OAUTH_BROWSER_PROFILES: [OauthTransportProfile; 6] = [
 impl OauthTransportProfile {
 	pub(crate) fn label(self) -> &'static str {
 		match self {
+			Self::Chrome140Android => "chrome_140_android",
+			Self::Chrome141Android => "chrome_141_android",
+			Self::Chrome142Android => "chrome_142_android",
 			Self::Chrome143Android => "chrome_143_android",
 			Self::Chrome144Android => "chrome_144_android",
 			Self::Chrome145Android => "chrome_145_android",
+			Self::Firefox142Android => "firefox_142_android",
+			Self::Firefox143Android => "firefox_143_android",
+			Self::Firefox144Android => "firefox_144_android",
 			Self::Firefox145Android => "firefox_145_android",
 			Self::Firefox146Android => "firefox_146_android",
 			Self::Firefox147Android => "firefox_147_android",
@@ -1592,9 +1610,15 @@ impl OauthTransportProfile {
 
 	pub(crate) fn emulation(self) -> Emulation {
 		match self {
+			Self::Chrome140Android => Emulation::Chrome140,
+			Self::Chrome141Android => Emulation::Chrome141,
+			Self::Chrome142Android => Emulation::Chrome142,
 			Self::Chrome143Android => Emulation::Chrome143,
 			Self::Chrome144Android => Emulation::Chrome144,
 			Self::Chrome145Android => Emulation::Chrome145,
+			Self::Firefox142Android => Emulation::Firefox142,
+			Self::Firefox143Android => Emulation::Firefox143,
+			Self::Firefox144Android => Emulation::Firefox144,
 			Self::Firefox145Android => Emulation::Firefox145,
 			Self::Firefox146Android => Emulation::Firefox146,
 			Self::Firefox147Android => Emulation::Firefox147,
@@ -1612,7 +1636,7 @@ fn build_tor_client(profile: OauthTransportProfile) -> Result<WreqClient, String
 	let isolation_id = format!("redlib-{:016x}", fastrand::u64(..));
 	let proxy_url = tor_isolation_proxy_url(&config.proxy_url, &isolation_id)?;
 	let proxy = Proxy::all(proxy_url.as_str()).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
-	info!("Created an isolated Tor SOCKS transport for a Reddit identity");
+	info!("Configured an isolated Tor SOCKS transport for a Reddit identity");
 	build_oauth_client(RedditLane::Tor, Some(proxy), profile)
 }
 
@@ -1632,10 +1656,6 @@ pub(crate) fn client_for_oauth_profile(lane: RedditLane, profile: OauthTransport
 		RedditLane::Direct => build_oauth_client(RedditLane::Direct, None, profile).map(Arc::new),
 		RedditLane::Tor => build_tor_client(profile).map(Arc::new),
 	}
-}
-
-pub(crate) fn random_oauth_profile() -> OauthTransportProfile {
-	OAUTH_BROWSER_PROFILES[fastrand::usize(..OAUTH_BROWSER_PROFILES.len())]
 }
 
 pub(crate) fn random_oauth_profile_except(current: OauthTransportProfile) -> OauthTransportProfile {
@@ -1680,10 +1700,6 @@ pub fn start_tor_fallback() {
 		}
 	};
 	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-		return;
-	}
-	if let Err(error) = client_for_oauth_profile(RedditLane::Tor, random_oauth_profile()) {
-		warn!("Tor fallback is disabled because its HTTP client could not be built: {error}");
 		return;
 	}
 	info!("Warming Tor fallback through {}", config.proxy_url);
