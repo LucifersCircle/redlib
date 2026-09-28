@@ -1,7 +1,7 @@
 use crate::{
 	client::{
-		claim_quota_rotation, client_for_new_identity, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send, OauthTransportProfile,
-		QuotaRotationTicket, GENERIC_WEB_USER_AGENT, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
+		claim_quota_rotation, client_for_new_identity, direct_oauth_compatibility_client, install_oauth_client, oauth_client, quota_rotation_still_needed, record_oauth_send,
+		QuotaRotationTicket, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::RedditLane,
@@ -24,8 +24,7 @@ const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
 const STARTUP_MOBILE_ROTATION_THRESHOLD: u32 = 3;
 const MAX_STARTUP_MOBILE_IDENTITY_ROTATIONS: u8 = 1;
-const GENERIC_WEB_QUARANTINE_THRESHOLD: u32 = 2;
-const GENERIC_WEB_QUARANTINE_DURATION: Duration = Duration::from_secs(60 * 60);
+const ANDROID_APP_VERSION_COHORT_WEEKS: u32 = 8;
 const TOKEN_REFRESH_MIN_EARLY_BY: u64 = 120;
 const TOKEN_REFRESH_MAX_EARLY_BY: u64 = 240;
 static DIRECT_REFRESH_BACKOFF: LazyLock<Mutex<RefreshBackoff>> = LazyLock::new(|| Mutex::new(RefreshBackoff::default()));
@@ -67,73 +66,14 @@ trait OauthBackend: Send + Sync {
 	fn get_headers(&self) -> HashMap<String, String>;
 }
 
-// OAuth backend implementations
-#[derive(Debug, Clone)]
-pub(crate) enum OauthBackendImpl {
-	MobileSpoof(MobileSpoofAuth),
-	GenericWeb(GenericWebAuth),
-}
-
-impl OauthBackend for OauthBackendImpl {
-	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
-		match self {
-			OauthBackendImpl::MobileSpoof(backend) => backend.authenticate(client).await,
-			OauthBackendImpl::GenericWeb(backend) => backend.authenticate(client).await,
-		}
-	}
-
-	fn user_agent(&self) -> &str {
-		match self {
-			OauthBackendImpl::MobileSpoof(backend) => backend.user_agent(),
-			OauthBackendImpl::GenericWeb(backend) => backend.user_agent(),
-		}
-	}
-
-	fn get_headers(&self) -> HashMap<String, String> {
-		match self {
-			OauthBackendImpl::MobileSpoof(backend) => backend.get_headers(),
-			OauthBackendImpl::GenericWeb(backend) => backend.get_headers(),
-		}
-	}
-}
-
-impl OauthBackendImpl {
-	fn transport_profile(&self) -> OauthTransportProfile {
-		match self {
-			Self::MobileSpoof(_) => OauthTransportProfile::MobileAndroid,
-			Self::GenericWeb(_) => OauthTransportProfile::GenericWeb,
-		}
-	}
-
-	fn lane(&self) -> RedditLane {
-		match self {
-			Self::MobileSpoof(backend) => backend.lane,
-			Self::GenericWeb(backend) => backend.lane,
-		}
-	}
-
-	fn name(&self) -> &'static str {
-		match self {
-			Self::MobileSpoof(_) => "MobileSpoofAuth",
-			Self::GenericWeb(_) => "GenericWebAuth",
-		}
-	}
-
-	fn alternate(&self) -> Self {
-		match self {
-			Self::MobileSpoof(backend) => Self::GenericWeb(GenericWebAuth::new(backend.lane)),
-			Self::GenericWeb(backend) => Self::MobileSpoof(MobileSpoofAuth::new(backend.lane)),
-		}
-	}
-}
-
 // Spoofed client for Android devices
 #[derive(Clone)]
 pub struct Oauth {
 	pub(crate) headers_map: HashMap<String, String>,
 	pub(crate) http_client: Arc<wreq::Client>,
 	refresh_at: Instant,
-	pub(crate) backend: OauthBackendImpl,
+	backend: MobileSpoofAuth,
+	transport_mode: OauthTransportMode,
 	pub(crate) generation: u64,
 	pub(crate) lane: RedditLane,
 }
@@ -143,12 +83,26 @@ struct RefreshedOauth {
 	fresh_identity: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OauthTransportMode {
+	AlignedMobile,
+	DirectCompatibility,
+}
+
+impl OauthTransportMode {
+	fn label(self) -> &'static str {
+		match self {
+			Self::AlignedMobile => "mobile_android",
+			Self::DirectCompatibility => "direct_legacy_compat",
+		}
+	}
+}
+
 #[derive(Debug, Default)]
 struct StartupRecovery {
 	consecutive_mobile_forbidden: u32,
 	mobile_identity_generation: u8,
-	consecutive_generic_unauthorized: u32,
-	generic_retry_not_before: Option<Instant>,
+	direct_compatibility_probed: bool,
 }
 
 impl StartupRecovery {
@@ -162,39 +116,12 @@ impl StartupRecovery {
 		self.consecutive_mobile_forbidden >= STARTUP_MOBILE_ROTATION_THRESHOLD && self.mobile_identity_generation < MAX_STARTUP_MOBILE_IDENTITY_ROTATIONS
 	}
 
-	fn should_try_generic(&self, now: Instant) -> bool {
-		match self.generic_retry_not_before {
-			Some(deadline) => now >= deadline,
-			None => true,
+	fn claim_direct_compatibility_probe(&mut self, lane: RedditLane) -> bool {
+		if lane != RedditLane::Direct || self.direct_compatibility_probed || self.consecutive_mobile_forbidden < STARTUP_MOBILE_ROTATION_THRESHOLD {
+			return false;
 		}
-	}
-
-	fn generic_web_quarantined(&self, now: Instant) -> bool {
-		!self.should_try_generic(now)
-	}
-
-	fn record_generic_failure(&mut self, error: &AuthError, now: Instant) -> bool {
-		if error.is_credential_or_grant_rejected() {
-			self.consecutive_generic_unauthorized = self.consecutive_generic_unauthorized.saturating_add(1);
-		} else {
-			self.consecutive_generic_unauthorized = 0;
-			self.generic_retry_not_before = None;
-		}
-
-		if self.consecutive_generic_unauthorized >= GENERIC_WEB_QUARANTINE_THRESHOLD {
-			self.generic_retry_not_before = Some(now + GENERIC_WEB_QUARANTINE_DURATION);
-			true
-		} else {
-			false
-		}
-	}
-
-	fn defer_generic(&mut self, now: Instant) {
-		self.generic_retry_not_before = Some(now + GENERIC_WEB_QUARANTINE_DURATION);
-	}
-
-	fn generic_transport_ready(&mut self) {
-		self.generic_retry_not_before = None;
+		self.direct_compatibility_probed = true;
+		true
 	}
 
 	fn complete_mobile_rotation(&mut self) {
@@ -203,13 +130,21 @@ impl StartupRecovery {
 	}
 }
 
-fn new_startup_mobile_identity(lane: RedditLane) -> Result<(OauthBackendImpl, Arc<wreq::Client>), String> {
-	let http_client = client_for_new_identity(lane, OauthTransportProfile::MobileAndroid)?;
-	let backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(lane));
+fn new_startup_mobile_identity(lane: RedditLane) -> Result<(MobileSpoofAuth, Arc<wreq::Client>), String> {
+	let http_client = client_for_new_identity(lane)?;
+	let backend = MobileSpoofAuth::new(lane);
 	Ok((backend, http_client))
 }
 
-async fn wait_for_startup_mobile_identity(lane: RedditLane) -> (OauthBackendImpl, Arc<wreq::Client>) {
+fn client_for_transport_mode(lane: RedditLane, mode: OauthTransportMode) -> Result<Arc<wreq::Client>, String> {
+	match mode {
+		OauthTransportMode::AlignedMobile => client_for_new_identity(lane),
+		OauthTransportMode::DirectCompatibility if lane == RedditLane::Direct => Ok(direct_oauth_compatibility_client()),
+		OauthTransportMode::DirectCompatibility => Err("the legacy OAuth compatibility transport is direct-only".to_string()),
+	}
+}
+
+async fn wait_for_startup_mobile_identity(lane: RedditLane) -> (MobileSpoofAuth, Arc<wreq::Client>) {
 	let mut failure_count = 0_u32;
 	loop {
 		match new_startup_mobile_identity(lane) {
@@ -220,7 +155,7 @@ async fn wait_for_startup_mobile_identity(lane: RedditLane) -> (OauthBackendImpl
 				error!(
 					"[⛔] OAuth startup transport construction failed: lane={} backend=MobileSpoofAuth profile={} attempt={failure_count} class=configuration error={error}; retrying_in={delay:?}",
 					lane.label(),
-					OauthTransportProfile::MobileAndroid.label(),
+					"mobile_android",
 				);
 				tokio::time::sleep(delay).await;
 			}
@@ -231,35 +166,25 @@ async fn wait_for_startup_mobile_identity(lane: RedditLane) -> (OauthBackendImpl
 impl Oauth {
 	/// Create a new OAuth client
 	pub(crate) async fn new(lane: RedditLane) -> Self {
-		// Keep identities stable across ordinary startup retries. A single bounded
-		// Mobile identity/client replacement probes whether the randomized identity
-		// was rejected without turning every retry into identity churn.
+		// Keep identities stable across ordinary startup retries. Direct startup
+		// compares one legacy transport using the same identity before a single
+		// bounded identity/client replacement, avoiding uncontrolled churn.
 		let (mut primary, mut primary_http_client) = wait_for_startup_mobile_identity(lane).await;
-		let mut fallback = OauthBackendImpl::GenericWeb(GenericWebAuth::new(lane));
 		let mut failure_count = 0_u32;
 		let mut recovery = StartupRecovery::default();
-		let mut fallback_http_client = match client_for_new_identity(lane, fallback.transport_profile()) {
-			Ok(client) => Some(client),
-			Err(error) => {
-				warn!(
-					"GenericWebAuth is unavailable because its transport could not be built; MobileSpoofAuth startup will continue: lane={} class=configuration error={error}",
-					lane.label(),
-				);
-				recovery.defer_generic(Instant::now());
-				None
-			}
-		};
 
 		loop {
 			let attempt = failure_count.saturating_add(1);
 			let mut retry_after = None;
-			let rotate_primary = match Self::authenticate_with_backend(&mut primary, primary_http_client.clone()).await {
+			let aligned_mode = OauthTransportMode::AlignedMobile;
+			let repeated_mobile_forbidden = match Self::authenticate_with_backend(&mut primary, primary_http_client.clone(), aligned_mode).await {
 				Ok(oauth) => {
 					info!(
-						"[✅] Successfully created OAuth client: lane={} backend={} profile={} identity_generation={}",
+						"[✅] Successfully created OAuth client: lane={} backend={} identity_profile={} transport={} identity_generation={}",
 						lane.label(),
-						primary.name(),
-						primary.transport_profile().label(),
+						"MobileSpoofAuth",
+						"mobile_android",
+						aligned_mode.label(),
 						recovery.mobile_identity_generation,
 					);
 					return oauth;
@@ -267,10 +192,11 @@ impl Oauth {
 				Err(error) => {
 					retry_after = max_duration(retry_after, error.retry_after());
 					error!(
-						"[⛔] OAuth startup authentication failed: lane={} backend={} profile={} attempt={attempt} identity_generation={} class={} error={error}",
+						"[⛔] OAuth startup authentication failed: lane={} backend={} identity_profile={} transport={} attempt={attempt} identity_generation={} class={} error={error}",
 						lane.label(),
-						primary.name(),
-						primary.transport_profile().label(),
+						"MobileSpoofAuth",
+						"mobile_android",
+						aligned_mode.label(),
 						recovery.mobile_identity_generation,
 						error.failure_class(),
 					);
@@ -278,55 +204,46 @@ impl Oauth {
 				}
 			};
 
-			if recovery.should_try_generic(Instant::now()) {
-				if fallback_http_client.is_none() {
-					match client_for_new_identity(lane, fallback.transport_profile()) {
-						Ok(client) => {
-							fallback_http_client = Some(client);
-							recovery.generic_transport_ready();
-							info!("GenericWebAuth transport recovered: lane={}", lane.label());
-						}
-						Err(error) => {
-							recovery.defer_generic(Instant::now());
-							warn!(
-								"GenericWebAuth transport remains unavailable; retrying it in one hour: lane={} class=configuration error={error}",
-								lane.label(),
-							);
-						}
-					}
-				}
-				if let Some(fallback_http_client) = &fallback_http_client {
-					match Self::authenticate_with_backend(&mut fallback, fallback_http_client.clone()).await {
+			if repeated_mobile_forbidden && recovery.claim_direct_compatibility_probe(lane) {
+				let compatibility_mode = OauthTransportMode::DirectCompatibility;
+				info!(
+					"[🔄] Trying one direct OAuth compatibility transport after {STARTUP_MOBILE_ROTATION_THRESHOLD} consecutive MobileSpoofAuth policy 403 responses: lane={} same_identity=true transport={}",
+					lane.label(),
+					compatibility_mode.label(),
+				);
+				match client_for_transport_mode(lane, compatibility_mode) {
+					Ok(compatibility_client) => match Self::authenticate_with_backend(&mut primary, compatibility_client, compatibility_mode).await {
 						Ok(oauth) => {
 							info!(
-								"[✅] Successfully created OAuth client: lane={} backend={} profile={} identity_generation=0",
+								"[✅] Direct OAuth compatibility transport succeeded: lane={} backend={} identity_profile={} transport={} identity_generation={}",
 								lane.label(),
-								fallback.name(),
-								fallback.transport_profile().label(),
+								"MobileSpoofAuth",
+								"mobile_android",
+								compatibility_mode.label(),
+								recovery.mobile_identity_generation,
 							);
 							return oauth;
 						}
 						Err(error) => {
 							retry_after = max_duration(retry_after, error.retry_after());
-							error!(
-								"[⛔] OAuth startup authentication failed: lane={} backend={} profile={} attempt={attempt} identity_generation=0 class={} error={error}",
+							warn!(
+								"Direct OAuth compatibility transport was also rejected: lane={} backend={} identity_profile={} transport={} same_identity=true class={} error={error}",
 								lane.label(),
-								fallback.name(),
-								fallback.transport_profile().label(),
+								"MobileSpoofAuth",
+								"mobile_android",
+								compatibility_mode.label(),
 								error.failure_class(),
 							);
-							if recovery.record_generic_failure(&error, Instant::now()) {
-								warn!(
-									"Quarantining GenericWebAuth for one hour after repeated credential or grant rejections: lane={}; MobileSpoofAuth startup retries will continue",
-									lane.label(),
-								);
-							}
 						}
-					}
+					},
+					Err(error) => warn!(
+						"Could not build the direct OAuth compatibility transport: lane={} class=configuration error={error}",
+						lane.label()
+					),
 				}
 			}
 
-			if rotate_primary {
+			if repeated_mobile_forbidden {
 				match new_startup_mobile_identity(lane) {
 					Ok((replacement, replacement_http_client)) => {
 						primary = replacement;
@@ -347,18 +264,13 @@ impl Oauth {
 
 			failure_count = failure_count.saturating_add(1);
 			let delay = refresh_retry_delay(failure_count, retry_after);
-			warn!(
-				"[⏳] OAuth startup attempt failed: lane={} attempt={attempt} generic_web_available={} generic_web_quarantined={} retrying_in={delay:?}",
-				lane.label(),
-				fallback_http_client.is_some(),
-				recovery.generic_web_quarantined(Instant::now()),
-			);
+			warn!("[⏳] OAuth startup attempt failed: lane={} attempt={attempt} retrying_in={delay:?}", lane.label());
 			tokio::time::sleep(delay).await;
 		}
 	}
 
-	async fn authenticate_with_backend(backend: &mut OauthBackendImpl, http_client: Arc<wreq::Client>) -> Result<Self, AuthError> {
-		let oauth_timeout = match backend.lane() {
+	async fn authenticate_with_backend(backend: &mut MobileSpoofAuth, http_client: Arc<wreq::Client>, transport_mode: OauthTransportMode) -> Result<Self, AuthError> {
+		let oauth_timeout = match backend.lane {
 			RedditLane::Direct => OAUTH_TIMEOUT,
 			RedditLane::Tor => TOR_OAUTH_TIMEOUT,
 		};
@@ -377,68 +289,48 @@ impl Oauth {
 			http_client,
 			refresh_at,
 			backend: backend.clone(),
+			transport_mode,
 			generation: 0,
-			lane: backend.lane(),
+			lane: backend.lane,
 		})
 	}
 
-	fn refresh_backend(&self, reason: RefreshReason, fallback: bool) -> (OauthBackendImpl, bool) {
-		match (reason, fallback) {
-			(RefreshReason::LowRateLimit, false) => (OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(self.lane)), true),
-			(RefreshReason::LowRateLimit, true) => (OauthBackendImpl::GenericWeb(GenericWebAuth::new(self.lane)), true),
-			(RefreshReason::Scheduled | RefreshReason::Unauthorized, false) => (self.backend.clone(), false),
-			(RefreshReason::Scheduled | RefreshReason::Unauthorized, true) => (self.backend.alternate(), true),
+	fn refresh_backend(&self, reason: RefreshReason) -> (MobileSpoofAuth, bool) {
+		match reason {
+			RefreshReason::LowRateLimit => (MobileSpoofAuth::new(self.lane), true),
+			RefreshReason::Scheduled | RefreshReason::Unauthorized => (self.backend.clone(), false),
 		}
 	}
 
 	async fn refreshed(&self, reason: RefreshReason) -> Result<RefreshedOauth, RefreshError> {
-		let (mut primary, primary_is_fresh) = self.refresh_backend(reason, false);
-		let primary_name = primary.name();
-		let primary_http_client = self
-			.http_client_for_refresh(&primary, primary_is_fresh)
-			.map_err(|error| RefreshError::configuration(primary_name, error))?;
-		match Self::authenticate_with_backend(&mut primary, primary_http_client).await {
-			Ok(oauth) => Ok(RefreshedOauth {
-				oauth,
-				fresh_identity: primary_is_fresh,
-			}),
-			Err(primary_error) => {
-				warn!("OAuth {} refresh with {primary_name} failed: {primary_error}", reason.label());
-				let (mut fallback, fallback_is_fresh) = self.refresh_backend(reason, true);
-				let fallback_name = fallback.name();
-				let fallback_http_client = match self.http_client_for_refresh(&fallback, fallback_is_fresh) {
-					Ok(client) => client,
-					Err(error) => {
-						return Err(RefreshError {
-							primary_name,
-							primary_error,
-							fallback_name,
-							fallback_error: AuthError::Configuration(error),
-						});
-					}
-				};
-				match Self::authenticate_with_backend(&mut fallback, fallback_http_client).await {
-					Ok(oauth) => Ok(RefreshedOauth {
-						oauth,
-						fresh_identity: fallback_is_fresh,
-					}),
-					Err(fallback_error) => Err(RefreshError {
-						primary_name,
-						primary_error,
-						fallback_name,
-						fallback_error,
-					}),
-				}
-			}
+		let (mut backend, fresh_identity) = self.refresh_backend(reason);
+		let http_client = self
+			.http_client_for_refresh(fresh_identity)
+			.map_err(|error| RefreshError::configuration("MobileSpoofAuth", error))?;
+		let transport_mode = self.transport_mode_for_refresh();
+		Self::authenticate_with_backend(&mut backend, http_client, transport_mode)
+			.await
+			.map(|oauth| RefreshedOauth { oauth, fresh_identity })
+			.map_err(|error| RefreshError {
+				backend_name: "MobileSpoofAuth",
+				error,
+			})
+	}
+
+	fn http_client_for_refresh(&self, fresh_identity: bool) -> Result<Arc<wreq::Client>, String> {
+		let target_mode = self.transport_mode_for_refresh();
+		if can_reuse_transport(self.transport_mode, target_mode, fresh_identity) {
+			Ok(self.http_client.clone())
+		} else {
+			client_for_transport_mode(self.lane, target_mode)
 		}
 	}
 
-	fn http_client_for_refresh(&self, backend: &OauthBackendImpl, fresh_identity: bool) -> Result<Arc<wreq::Client>, String> {
-		let target_profile = backend.transport_profile();
-		if can_reuse_transport(self.backend.transport_profile(), target_profile, fresh_identity) {
-			Ok(self.http_client.clone())
+	fn transport_mode_for_refresh(&self) -> OauthTransportMode {
+		if self.lane == RedditLane::Direct && self.transport_mode == OauthTransportMode::DirectCompatibility {
+			OauthTransportMode::DirectCompatibility
 		} else {
-			client_for_new_identity(self.lane, target_profile)
+			OauthTransportMode::AlignedMobile
 		}
 	}
 
@@ -447,7 +339,7 @@ impl Oauth {
 	}
 }
 
-fn can_reuse_transport(current: OauthTransportProfile, target: OauthTransportProfile, fresh_identity: bool) -> bool {
+fn can_reuse_transport(current: OauthTransportMode, target: OauthTransportMode, fresh_identity: bool) -> bool {
 	!fresh_identity && current == target
 }
 
@@ -475,10 +367,6 @@ impl AuthError {
 		}
 	}
 
-	fn is_http_status(&self, expected: u16) -> bool {
-		matches!(self, Self::HttpStatus { status, .. } if *status == expected)
-	}
-
 	fn is_identity_policy_forbidden(&self) -> bool {
 		matches!(
 			self,
@@ -488,18 +376,6 @@ impl AuthError {
 				www_authenticate_present: false,
 				..
 			}
-		)
-	}
-
-	fn is_credential_or_grant_rejected(&self) -> bool {
-		matches!(
-			self,
-			Self::HttpStatus { status: 401, .. }
-				| Self::HttpStatus {
-					status: 403,
-					www_authenticate_present: true,
-					..
-				}
 		)
 	}
 
@@ -556,34 +432,26 @@ impl fmt::Display for AuthError {
 
 #[derive(Debug)]
 struct RefreshError {
-	primary_name: &'static str,
-	primary_error: AuthError,
-	fallback_name: &'static str,
-	fallback_error: AuthError,
+	backend_name: &'static str,
+	error: AuthError,
 }
 
 impl RefreshError {
 	fn configuration(backend_name: &'static str, error: String) -> Self {
 		Self {
-			primary_name: backend_name,
-			primary_error: AuthError::Configuration(error),
-			fallback_name: "Tor transport",
-			fallback_error: AuthError::Configuration("no isolated client was available".to_string()),
+			backend_name,
+			error: AuthError::Configuration(error),
 		}
 	}
 
 	fn retry_after(&self) -> Option<Duration> {
-		max_duration(self.primary_error.retry_after(), self.fallback_error.retry_after())
+		self.error.retry_after()
 	}
 }
 
 impl fmt::Display for RefreshError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"{} failed: {}; {} failed: {}",
-			self.primary_name, self.primary_error, self.fallback_name, self.fallback_error
-		)
+		write!(formatter, "{} failed: {}", self.backend_name, self.error)
 	}
 }
 
@@ -1017,150 +885,14 @@ impl OauthBackend for MobileSpoofAuth {
 	}
 }
 
-// GenericWebAuth backend - simple web-based authentication
-#[derive(Debug, Clone)]
-pub struct GenericWebAuth {
-	lane: RedditLane,
-	device_id: String,
-	user_agent: String,
-	additional_headers: HashMap<String, String>,
-}
-
-impl GenericWebAuth {
-	fn new(lane: RedditLane) -> Self {
-		// Generate random 20-character alphanumeric device_id
-		let device_id: String = (0..20)
-			.map(|_| {
-				let idx = fastrand::usize(..62);
-				let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-				chars[idx] as char
-			})
-			.collect();
-
-		info!("[🔄] Created a stable GenericWebAuth identity: lane={}", lane.label());
-
-		Self {
-			lane,
-			device_id,
-			user_agent: GENERIC_WEB_USER_AGENT.to_owned(),
-			additional_headers: HashMap::new(),
-		}
-	}
-}
-
-impl OauthBackend for GenericWebAuth {
-	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
-		// Construct URL for OAuth token
-		let origin = self.lane.auth_origin();
-		let url = format!("{}/api/v1/access_token", origin.base);
-		record_oauth_send(self.lane);
-		let mut builder = client.post(&url);
-
-		// Add minimal headers
-		builder = builder.header("Host", origin.host);
-		builder = builder.header("User-Agent", &self.user_agent);
-		builder = builder.header("Accept", "*/*");
-		builder = builder.header("Accept-Language", "en-US,en;q=0.5");
-		// builder = builder.header("Accept-Encoding", "gzip, deflate, br, zstd");
-		builder = builder.header("Authorization", "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=");
-		builder = builder.header("Content-Type", "application/x-www-form-urlencoded");
-		builder = builder.header("Sec-GPC", "1");
-		for (key, value) in &self.additional_headers {
-			if key == "x-reddit-loid" || key == "x-reddit-session" {
-				builder = builder.header(key, value);
-			}
-		}
-
-		// Set up form body
-		let body_str = format!("grant_type=https%3A%2F%2Foauth.reddit.com%2Fgrants%2Finstalled_client&device_id={}", self.device_id);
-
-		trace!("Sending GenericWebAuth token request to {url}...");
-
-		// Send request
-		let resp: wreq::Response = builder.body(body_str).send().await?;
-
-		let status = resp.status();
-		trace!("Received response with status {} and length {:?}", status, resp.headers().get("content-length"));
-		if !status.is_success() {
-			return Err(AuthError::HttpStatus {
-				status: status.as_u16(),
-				retry_after: response_retry_after(resp.headers()),
-				retry_after_present: resp.headers().contains_key(wreq::header::RETRY_AFTER),
-				quota_headers_present: response_has_quota_headers(resp.headers()),
-				www_authenticate_present: resp.headers().contains_key(wreq::header::WWW_AUTHENTICATE),
-			});
-		}
-
-		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
-		// Technically it's not needed, but it's easy for Reddit API to check for this.
-		// It's some kind of header that uniquely identifies the device.
-		// Not worried about the privacy implications, since this is randomly changed
-		// and really only as privacy-concerning as the OAuth token itself.
-		if let Some(header) = resp.headers().get("x-reddit-loid") {
-			let header_val: &wreq::header::HeaderValue = header;
-			if let Ok(value) = header_val.to_str() {
-				self.additional_headers.insert("x-reddit-loid".to_owned(), value.to_owned());
-			}
-		}
-
-		// Same with x-reddit-session
-		if let Some(header) = resp.headers().get("x-reddit-session") {
-			let header_val: &wreq::header::HeaderValue = header;
-			if let Ok(value) = header_val.to_str() {
-				self.additional_headers.insert("x-reddit-session".to_owned(), value.to_owned());
-			}
-		}
-
-		trace!("Serializing GenericWebAuth response...");
-
-		// Serialize response
-		let json: serde_json::Value = resp.json().await?;
-
-		trace!("Accessing relevant fields...");
-
-		// Parse response - access_token, token_type, device_id, expires_in, scope
-		let token = json
-			.get("access_token")
-			.ok_or(AuthError::Field("access_token"))?
-			.as_str()
-			.ok_or(AuthError::Field("access_token"))?
-			.to_string();
-		let expires_in = json
-			.get("expires_in")
-			.ok_or(AuthError::Field("expires_in"))?
-			.as_u64()
-			.ok_or(AuthError::Field("expires_in"))?;
-
-		info!("[✅] GenericWebAuth retrieved an OAuth token that expires in {expires_in} seconds");
-
-		// Insert a few necessary headers
-		self.additional_headers.insert("Origin".to_owned(), origin.base.to_owned());
-		self.additional_headers.insert("User-Agent".to_owned(), self.user_agent.to_owned());
-
-		Ok(OauthResponse {
-			token,
-			expires_in,
-			additional_headers: self.additional_headers.clone(),
-		})
-	}
-
-	fn user_agent(&self) -> &str {
-		&self.user_agent
-	}
-
-	fn get_headers(&self) -> HashMap<String, String> {
-		self.additional_headers.clone()
-	}
-}
-
 impl Device {
 	fn android(lane: RedditLane) -> Self {
 		// Generate uuid
 		let uuid = uuid::Uuid::new_v4().to_string();
 
 		// Generate random user-agent
-		let android_app_version = choose(ANDROID_APP_VERSION_LIST).to_string();
-		let android_version = fastrand::u8(9..=14);
+		let android_app_version = choose_newest_android_app_version(ANDROID_APP_VERSION_LIST).to_string();
+		let android_version = fastrand::u8(10..=16);
 
 		let android_user_agent = format!("Reddit/{android_app_version}/Android {android_version}");
 
@@ -1205,6 +937,31 @@ fn choose<T: Copy>(list: &[T]) -> T {
 	*fastrand::choose_multiple(list.iter(), 1)[0]
 }
 
+fn android_app_version_release_index(version: &str) -> Option<u32> {
+	let version = version.strip_prefix("Version ")?.split('/').next()?;
+	let mut parts = version.split('.');
+	let year: u32 = parts.next()?.parse().ok()?;
+	let week: u32 = parts.next()?.parse().ok()?;
+	Some(year.saturating_mul(53).saturating_add(week))
+}
+
+fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
+	let newest_release = versions.iter().filter_map(|version| android_app_version_release_index(version)).max();
+	let Some(newest_release) = newest_release else {
+		return choose(versions);
+	};
+	let is_current =
+		|version: &str| android_app_version_release_index(version).is_some_and(|release| newest_release.saturating_sub(release) <= ANDROID_APP_VERSION_COHORT_WEEKS);
+	let candidate_count = versions.iter().filter(|version| is_current(version)).count();
+	let selected = fastrand::usize(..candidate_count);
+	versions
+		.iter()
+		.filter(|version| is_current(version))
+		.nth(selected)
+		.copied()
+		.unwrap_or_else(|| choose(versions))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1215,7 +972,7 @@ mod tests {
 	async fn test_mobile_spoof_backend() {
 		// Test MobileSpoofAuth backend specifically
 		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
-		let client = client_for_new_identity(RedditLane::Direct, OauthTransportProfile::MobileAndroid).unwrap();
+		let client = client_for_new_identity(RedditLane::Direct).unwrap();
 		let response = backend.authenticate(client.as_ref()).await;
 		assert!(response.is_ok());
 		let response = response.unwrap();
@@ -1223,20 +980,6 @@ mod tests {
 		assert!(response.expires_in > 0);
 		assert!(!backend.user_agent().is_empty());
 		assert!(!backend.get_headers().is_empty());
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "requires live Reddit GenericWeb OAuth access"]
-	async fn test_generic_web_backend() {
-		// Test GenericWebAuth backend specifically
-		let mut backend = GenericWebAuth::new(RedditLane::Direct);
-		let client = client_for_new_identity(RedditLane::Direct, OauthTransportProfile::GenericWeb).unwrap();
-		let response = backend.authenticate(client.as_ref()).await;
-		assert!(response.is_ok());
-		let response = response.unwrap();
-		assert!(!response.token.is_empty());
-		assert!(response.expires_in > 0);
-		assert!(!backend.user_agent().is_empty());
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -1289,6 +1032,8 @@ mod tests {
 		assert!(!recovery.record_mobile_failure(&forbidden));
 		assert!(!recovery.record_mobile_failure(&forbidden));
 		assert!(recovery.record_mobile_failure(&forbidden));
+		assert!(recovery.claim_direct_compatibility_probe(RedditLane::Direct));
+		assert!(!recovery.claim_direct_compatibility_probe(RedditLane::Direct));
 		assert_eq!(
 			refresh_retry_base_delay(STARTUP_MOBILE_ROTATION_THRESHOLD, forbidden.retry_after()),
 			(Duration::from_secs(20), false),
@@ -1299,6 +1044,23 @@ mod tests {
 			assert!(!recovery.record_mobile_failure(&forbidden));
 		}
 		assert_eq!(recovery.mobile_identity_generation, MAX_STARTUP_MOBILE_IDENTITY_ROTATIONS);
+	}
+
+	#[test]
+	fn startup_recovery_never_probes_legacy_transport_on_tor() {
+		let forbidden = AuthError::HttpStatus {
+			status: 403,
+			retry_after: Some(Duration::ZERO),
+			retry_after_present: true,
+			quota_headers_present: false,
+			www_authenticate_present: false,
+		};
+		let mut recovery = StartupRecovery::default();
+		for _ in 0..STARTUP_MOBILE_ROTATION_THRESHOLD {
+			recovery.record_mobile_failure(&forbidden);
+		}
+		assert!(!recovery.claim_direct_compatibility_probe(RedditLane::Tor));
+		assert!(!recovery.direct_compatibility_probed);
 	}
 
 	#[test]
@@ -1335,46 +1097,11 @@ mod tests {
 	fn startup_mobile_rotation_replaces_identity_and_transport() {
 		let (original, original_client) = new_startup_mobile_identity(RedditLane::Direct).unwrap();
 		let (replacement, replacement_client) = new_startup_mobile_identity(RedditLane::Direct).unwrap();
-		let original_device_id = match original {
-			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
-			OauthBackendImpl::GenericWeb(_) => unreachable!(),
-		};
-		let replacement_device_id = match replacement {
-			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
-			OauthBackendImpl::GenericWeb(_) => unreachable!(),
-		};
+		let original_device_id = original.device.headers.get("X-Reddit-Device-Id").unwrap().clone();
+		let replacement_device_id = replacement.device.headers.get("X-Reddit-Device-Id").unwrap().clone();
 
 		assert_ne!(original_device_id, replacement_device_id);
 		assert!(!Arc::ptr_eq(&original_client, &replacement_client));
-	}
-
-	#[test]
-	fn startup_recovery_quarantines_repeated_generic_unauthorized() {
-		let now = Instant::now();
-		let unauthorized = AuthError::HttpStatus {
-			status: 401,
-			retry_after: None,
-			retry_after_present: false,
-			quota_headers_present: false,
-			www_authenticate_present: true,
-		};
-		let mut recovery = StartupRecovery::default();
-
-		assert!(!recovery.record_generic_failure(&unauthorized, now));
-		assert!(recovery.record_generic_failure(&unauthorized, now));
-		assert!(recovery.generic_web_quarantined(now));
-		assert!(!recovery.should_try_generic(now + GENERIC_WEB_QUARANTINE_DURATION - Duration::from_secs(1)));
-		assert!(recovery.should_try_generic(now + GENERIC_WEB_QUARANTINE_DURATION));
-
-		let upstream = AuthError::HttpStatus {
-			status: 503,
-			retry_after: None,
-			retry_after_present: false,
-			quota_headers_present: false,
-			www_authenticate_present: false,
-		};
-		assert!(!recovery.record_generic_failure(&upstream, now + GENERIC_WEB_QUARANTINE_DURATION));
-		assert!(recovery.should_try_generic(now + GENERIC_WEB_QUARANTINE_DURATION));
 	}
 
 	#[test]
@@ -1396,15 +1123,12 @@ mod tests {
 				www_authenticate_present,
 			};
 			assert_eq!(error.failure_class(), expected);
-			assert_eq!(error.is_credential_or_grant_rejected(), expected == "credential_or_grant_rejected");
 		}
 	}
 
 	#[test]
-	fn test_creating_backends() {
-		// Test that both backends can be created
+	fn test_creating_mobile_backend() {
 		MobileSpoofAuth::new(RedditLane::Direct);
-		GenericWebAuth::new(RedditLane::Direct);
 	}
 
 	#[test]
@@ -1472,95 +1196,92 @@ mod tests {
 	}
 
 	#[test]
-	fn oauth_transport_profiles_match_backend_identities() {
-		let mobile = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
-		let generic = OauthBackendImpl::GenericWeb(GenericWebAuth::new(RedditLane::Direct));
-
-		assert_eq!(mobile.transport_profile(), OauthTransportProfile::MobileAndroid);
-		assert_eq!(
-			mobile.transport_profile().emulation_profile(),
-			(wreq_util::Emulation::OkHttp4_12, wreq_util::EmulationOS::Android)
-		);
+	fn oauth_transport_profile_matches_android_identity() {
+		let mobile = MobileSpoofAuth::new(RedditLane::Direct);
 		assert!(mobile.user_agent().contains("Android"));
-		assert_eq!(generic.transport_profile(), OauthTransportProfile::GenericWeb);
-		assert_eq!(
-			generic.transport_profile().emulation_profile(),
-			(wreq_util::Emulation::Firefox147, wreq_util::EmulationOS::Windows)
-		);
-		assert_eq!(generic.user_agent(), GENERIC_WEB_USER_AGENT);
+		assert!(client_for_new_identity(RedditLane::Direct).is_ok());
 	}
 
 	#[test]
 	fn oauth_refresh_reuses_only_stable_matching_transport() {
-		let backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
-		let http_client = client_for_new_identity(RedditLane::Direct, backend.transport_profile()).unwrap();
+		let backend = MobileSpoofAuth::new(RedditLane::Direct);
+		let http_client = client_for_new_identity(RedditLane::Direct).unwrap();
 		let oauth = Oauth {
 			headers_map: HashMap::new(),
 			http_client: http_client.clone(),
 			refresh_at: Instant::now() + Duration::from_secs(3480),
 			backend: backend.clone(),
+			transport_mode: OauthTransportMode::AlignedMobile,
 			generation: 4,
 			lane: RedditLane::Direct,
 		};
 
-		let stable = oauth.http_client_for_refresh(&backend, false).unwrap();
+		let stable = oauth.http_client_for_refresh(false).unwrap();
 		assert!(Arc::ptr_eq(&stable, &http_client));
 
-		let fresh = oauth.http_client_for_refresh(&backend, true).unwrap();
+		let fresh = oauth.http_client_for_refresh(true).unwrap();
 		assert!(!Arc::ptr_eq(&fresh, &http_client));
 
-		let alternate = backend.alternate();
-		let alternate_client = oauth.http_client_for_refresh(&alternate, false).unwrap();
-		assert!(!Arc::ptr_eq(&alternate_client, &http_client));
+		assert!(can_reuse_transport(OauthTransportMode::AlignedMobile, OauthTransportMode::AlignedMobile, false));
+		assert!(!can_reuse_transport(OauthTransportMode::AlignedMobile, OauthTransportMode::AlignedMobile, true));
+		assert!(!can_reuse_transport(OauthTransportMode::AlignedMobile, OauthTransportMode::DirectCompatibility, false));
+	}
 
-		assert!(can_reuse_transport(OauthTransportProfile::MobileAndroid, OauthTransportProfile::MobileAndroid, false));
-		assert!(!can_reuse_transport(OauthTransportProfile::MobileAndroid, OauthTransportProfile::MobileAndroid, true));
-		assert!(!can_reuse_transport(OauthTransportProfile::MobileAndroid, OauthTransportProfile::GenericWeb, false));
+	#[test]
+	fn direct_compatibility_transport_persists_for_mobile_refreshes() {
+		let backend = MobileSpoofAuth::new(RedditLane::Direct);
+		let compatibility_client = direct_oauth_compatibility_client();
+		let oauth = Oauth {
+			headers_map: HashMap::new(),
+			http_client: compatibility_client.clone(),
+			refresh_at: Instant::now() + Duration::from_secs(3480),
+			backend: backend.clone(),
+			transport_mode: OauthTransportMode::DirectCompatibility,
+			generation: 4,
+			lane: RedditLane::Direct,
+		};
+
+		let stable = oauth.http_client_for_refresh(false).unwrap();
+		assert!(Arc::ptr_eq(&stable, &compatibility_client));
+		let fresh = oauth.http_client_for_refresh(true).unwrap();
+		assert!(Arc::ptr_eq(&fresh, &compatibility_client));
+		assert_eq!(oauth.transport_mode_for_refresh(), OauthTransportMode::DirectCompatibility);
+	}
+
+	#[test]
+	fn newest_android_identity_cohort_excludes_older_versions() {
+		for _ in 0..20 {
+			let selected = choose_newest_android_app_version(ANDROID_APP_VERSION_LIST);
+			assert!(matches!(
+				selected,
+				"Version 2026.37.0/Build 2637051" | "Version 2026.38.0/Build 2638050" | "Version 2026.39.0/Build 2639031"
+			));
+		}
 	}
 
 	#[test]
 	fn test_refresh_reason_selects_stable_or_fresh_identity() {
-		let original_backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
-		let original_device_id = match &original_backend {
-			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
-			OauthBackendImpl::GenericWeb(_) => unreachable!(),
-		};
+		let original_backend = MobileSpoofAuth::new(RedditLane::Direct);
+		let original_device_id = original_backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone();
 		let oauth = Oauth {
 			headers_map: HashMap::new(),
 			http_client: crate::client::CLIENT.clone(),
 			refresh_at: Instant::now() + Duration::from_secs(3480),
 			backend: original_backend,
+			transport_mode: OauthTransportMode::DirectCompatibility,
 			generation: 4,
 			lane: RedditLane::Direct,
 		};
 		assert_eq!(oauth.clone().refresh_at, oauth.refresh_at);
 
-		let (stable, stable_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled, false);
-		let (_, stable_fallback_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled, true);
-		let stable_device_id = match stable {
-			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
-			OauthBackendImpl::GenericWeb(_) => unreachable!(),
-		};
+		let (stable, stable_is_fresh) = oauth.refresh_backend(RefreshReason::Scheduled);
+		let stable_device_id = stable.device.headers.get("X-Reddit-Device-Id").unwrap().clone();
 		assert!(!stable_is_fresh);
-		assert!(stable_fallback_is_fresh);
 		assert_eq!(stable_device_id, original_device_id);
 
-		let (rotated, rotated_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit, false);
-		let (_, rotated_fallback_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit, true);
-		let rotated_device_id = match rotated {
-			OauthBackendImpl::MobileSpoof(backend) => backend.device.headers.get("X-Reddit-Device-Id").unwrap().clone(),
-			OauthBackendImpl::GenericWeb(_) => unreachable!(),
-		};
+		let (rotated, rotated_is_fresh) = oauth.refresh_backend(RefreshReason::LowRateLimit);
+		let rotated_device_id = rotated.device.headers.get("X-Reddit-Device-Id").unwrap().clone();
 		assert!(rotated_is_fresh);
-		assert!(rotated_fallback_is_fresh);
 		assert_ne!(rotated_device_id, original_device_id);
-	}
-
-	#[test]
-	fn test_alternate_backend_changes_kind() {
-		let mobile = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new(RedditLane::Direct));
-		let generic = mobile.alternate();
-		assert!(matches!(generic, OauthBackendImpl::GenericWeb(_)));
-		assert!(matches!(generic.alternate(), OauthBackendImpl::MobileSpoof(_)));
 	}
 }

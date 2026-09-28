@@ -227,7 +227,7 @@ test('gallery initializes only the first and adjacent previews', () => {
     assert.equal(env.current.textContent, '1');
     assert.equal(env.previous.disabled, true);
     assert.equal(env.next.disabled, false);
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px');
     assert.equal('src' in env.images[1].dataset, false);
     assert.deepEqual(env.images[1].srcAssignments, [{ value: '/preview/1.jpg', loading: 'eager' }]);
 });
@@ -359,7 +359,7 @@ test('gallery keeps the video visible if its GIF fallback also fails', () => {
     assert.equal(fallback.srcAssignments.length, 1, 'a failed fallback is not retried in a loop');
 });
 
-test('gallery stages use each item aspect ratio without a fixed black frame', () => {
+test('gallery stages use the tallest rendered item without a fixed black frame', () => {
     const template = fs.readFileSync(path.join(__dirname, '..', 'templates', 'utils.html'), 'utf8');
     const stylesheet = fs.readFileSync(path.join(__dirname, '..', 'static', 'style.css'), 'utf8');
 
@@ -459,14 +459,14 @@ test('gallery animation playback follows the media stage visibility', () => {
 test('gallery navigation updates loading, counter and boundary buttons', () => {
     const env = galleryFixture();
     env.next.emit('click');
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px', 'height is frozen during navigation');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px', 'height stays fixed to the tallest slide during navigation');
     assert.deepEqual(env.track.lastScroll, { left: 300, behavior: 'smooth' });
     assert.equal(env.images[2].src, '/preview/2.jpg');
     assert.equal(env.images[3].src, '');
     env.flushFrames();
     assert.equal(env.current.textContent, '2');
     assert.equal(env.previous.disabled, false);
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px');
     assert.equal(env.captions[0].hidden, false, 'caption remains stable until the slide settles');
     assert.equal(env.captions[1].hidden, true);
     env.flushTimers();
@@ -485,7 +485,7 @@ test('gallery navigation updates loading, counter and boundary buttons', () => {
     assert.equal(env.images[3].src, '/preview/3.jpg');
     assert.equal(env.images[4].src, '/preview/4.jpg');
     env.flushTimers();
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px', 'landscape slide sheds the portrait height');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px', 'landscape slides retain the tallest gallery height');
 
     env.previous.emit('click');
     env.flushFrames();
@@ -495,7 +495,7 @@ test('gallery navigation updates loading, counter and boundary buttons', () => {
 
     env.viewport.clientWidth = 400;
     env.window.emit('resize');
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '225px');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '560px');
 });
 
 test('late media dimensions cannot resize a gallery while touch scrolling settles', () => {
@@ -505,7 +505,7 @@ test('late media dimensions cannot resize a gallery while touch scrolling settle
     env.images[0].naturalWidth = 100;
     env.images[0].naturalHeight = 1000;
     env.images[0].emit('load');
-    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '169px');
+    assert.equal(env.gallery.style.getPropertyValue('--gallery-media-height'), '533px');
     assert.equal(env.gallery.classList.contains('gallery_dragging'), true);
 
     env.flushTimers();

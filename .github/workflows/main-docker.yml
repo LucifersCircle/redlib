@@ -54,6 +54,8 @@ jobs:
           cargo test --locked --lib test_edge_throttle_delay_escalates_and_caps
           cargo test --locked --lib test_media_diagnostics_group_destinations_and_results
           cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
+          cargo test --locked --lib test_quota_admission_uses_remaining_allowance_near_reset
+          cargo test --locked --lib test_local_quota_retries_are_attempt_and_time_bounded
           cargo test --locked --lib test_quota_rotation_requires_known_exhausted_current_generation
           cargo test --locked --lib test_emergency_quota_rotation_requires_reserve_exhaustion_and_long_wait
           cargo test --locked --lib test_emergency_quota_rotation_claim_survives_stable_refresh_but_not_new_epoch
@@ -111,10 +113,11 @@ jobs:
           cargo test --locked --lib startup_recovery_
           cargo test --locked --lib startup_mobile_rotation_replaces_identity_and_transport
           cargo test --locked --lib oauth_failure_classes_are_privacy_safe_and_actionable
-          cargo test --locked --lib oauth_transport_profiles_match_backend_identities
+          cargo test --locked --lib oauth_transport_profile_matches_android_identity
           cargo test --locked --lib oauth_refresh_reuses_only_stable_matching_transport
+          cargo test --locked --lib direct_compatibility_transport_persists_for_mobile_refreshes
+          cargo test --locked --lib newest_android_identity_cohort_excludes_older_versions
           cargo test --locked --lib test_refresh_reason_selects_stable_or_fresh_identity
-          cargo test --locked --lib test_alternate_backend_changes_kind
           cargo test --locked --lib tor_fallback_requires_explicit_valid_socks5h_proxy
           cargo test --locked --lib each_lane_has_matching_origins_and_redirect_allowlist
 
