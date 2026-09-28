@@ -11,7 +11,7 @@ use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperR
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::result::Result;
@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify, Semaphore};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Proxy, Response as WreqResponse};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
@@ -63,6 +63,7 @@ const MAX_LOCAL_QUOTA_RETRIES: u8 = 3;
 const TOR_QUOTA_SPILLOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const EMERGENCY_QUOTA_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const OAUTH_STARTUP_RETRY: Duration = Duration::from_secs(5);
+const JSON_FLIGHT_ABORTED_ERROR: &str = "The shared Reddit request ended before producing a response";
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_API_REDIRECTS: usize = 3;
@@ -101,6 +102,19 @@ static TOR_QUOTA_SPILLOVER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static TOR_QUOTA_SPILLOVER_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static LAST_TRAFFIC_SUMMARY: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
 static COMMENT_JSON_KEYS: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+type JsonRequestKey = (String, bool);
+type JsonRequestResult = Result<Value, String>;
+type JsonFlightMap = AsyncMutex<HashMap<JsonRequestKey, JsonFlight>>;
+
+#[derive(Clone)]
+struct JsonFlight {
+	id: u64,
+	receiver: watch::Receiver<Option<JsonRequestResult>>,
+}
+
+static JSON_FLIGHTS: LazyLock<JsonFlightMap> = LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+static NEXT_JSON_FLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CooldownReason {
@@ -600,6 +614,25 @@ impl UpstreamGuard {
 		ticket.mode != QuotaRotationMode::Emergency || self.emergency_rotation_claimed_epoch == Some(ticket.quota_epoch)
 	}
 
+	fn completed_quota_rotation_still_valid(&self, now: Instant, ticket: QuotaRotationTicket) -> bool {
+		if ticket.quota_epoch != self.quota.epoch || !self.quota_rotation_allowed(now, ticket.generation) {
+			return false;
+		}
+		if ticket.mode == QuotaRotationMode::Emergency && self.emergency_rotation_claimed_epoch != Some(ticket.quota_epoch) {
+			return false;
+		}
+		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+			return false;
+		};
+		if now >= reset_at {
+			return false;
+		}
+		match ticket.mode {
+			QuotaRotationMode::Proactive => available < LOW_RATE_LIMIT_THRESHOLD,
+			QuotaRotationMode::Emergency => available <= QUOTA_SAFETY_RESERVE,
+		}
+	}
+
 	fn quota_spillover_still_needed(&self, now: Instant, ticket: QuotaSpilloverTicket) -> bool {
 		self.lane == RedditLane::Direct
 			&& ticket.generation == self.quota.generation
@@ -1015,7 +1048,7 @@ pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_
 	let generation = oauth.generation;
 	let mut guard = upstream_guard(lane);
 	if let Some(ticket) = expected_rotation {
-		if ticket.lane != lane || !is_current_oauth_generation(lane, ticket.generation) || !guard.quota_rotation_still_needed(Instant::now(), ticket) {
+		if ticket.lane != lane || !is_current_oauth_generation(lane, ticket.generation) || !guard.completed_quota_rotation_still_valid(Instant::now(), ticket) {
 			return false;
 		}
 	}
@@ -1397,6 +1430,34 @@ fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed
 	Some(admission.delay.min(LOCAL_QUOTA_RETRY_INTERVAL).min(LOCAL_QUOTA_RETRY_BUDGET.saturating_sub(elapsed)))
 }
 
+fn local_quota_retry_count_after_wait(retry_count: u8, timer_elapsed: bool) -> u8 {
+	if timer_elapsed {
+		retry_count.saturating_add(1)
+	} else {
+		retry_count
+	}
+}
+
+async fn wait_for_local_quota_retry(quota_changed: impl std::future::Future<Output = ()>, delay: Duration) -> bool {
+	tokio::select! {
+		_ = quota_changed => false,
+		_ = tokio::time::sleep(delay) => true,
+	}
+}
+
+fn local_admission_message(denial: AdmissionDenied, short_refresh_retry: bool) -> String {
+	if short_refresh_retry {
+		return format!(
+			"Refreshing the anonymous Reddit session. Retry in {} seconds",
+			retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
+		);
+	}
+	if denial.source == "quota_discovery" {
+		return "Checking the anonymous Reddit session quota. Retry in 1 second".to_string();
+	}
+	format!("{}. Retry in {} seconds", denial.reason.message(), retry_after_seconds(denial.delay))
+}
+
 fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
 	let mut guard = upstream_guard(lane);
 	let oauth_client = oauth_client(lane).ok_or_else(|| BeginAttemptDenied {
@@ -1432,14 +1493,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> R
 				reset_remaining.as_secs()
 			);
 		}
-		let message = if short_refresh_retry {
-			format!(
-				"Refreshing the anonymous Reddit session. Retry in {} seconds",
-				retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
-			)
-		} else {
-			format!("{}. Retry in {} seconds", denial.reason.message(), retry_after_seconds(denial.delay))
-		};
+		let message = local_admission_message(denial, short_refresh_retry);
 		let quota_spillover = quota_spillover_ticket(lane, denial, short_refresh_retry, generation, denied_quota_epoch);
 		BeginAttemptDenied {
 			edge_deferred: denial.reason == CooldownReason::EdgeThrottle,
@@ -1487,11 +1541,8 @@ async fn begin_upstream_attempt(lane: RedditLane, mode: AdmissionRetryMode) -> R
 					return Err(denied);
 				};
 				retry_source = denied.admission.as_ref().map_or("unknown", |admission| admission.source);
-				retry_count += 1;
-				tokio::select! {
-					_ = quota_changed => {}
-					_ = tokio::time::sleep(delay) => {}
-				}
+				let timer_elapsed = wait_for_local_quota_retry(quota_changed, delay).await;
+				retry_count = local_quota_retry_count_after_wait(retry_count, timer_elapsed);
 			}
 		}
 	}
@@ -1538,14 +1589,40 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
 		Ok(reservation) => reservation,
 		Err(error) => {
-			let (delay, denied_quota_epoch, emergency_ticket) = match error {
-				QuotaReserveError::Deferred(delay) => (delay, None, None),
+			let (denial, denied_quota_epoch, emergency_ticket) = match error {
+				QuotaReserveError::Deferred(delay) => (
+					AdmissionDenied {
+						delay,
+						reason: CooldownReason::RateLimit,
+						reserve_exhausted: false,
+						local_quota_retry: true,
+						source: "quota_discovery",
+					},
+					None,
+					None,
+				),
 				QuotaReserveError::ReserveExhausted(delay) => (
-					delay,
+					AdmissionDenied {
+						delay,
+						reason: CooldownReason::RateLimit,
+						reserve_exhausted: true,
+						local_quota_retry: true,
+						source: "quota_reserve",
+					},
 					Some(guard.quota.epoch),
 					guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency),
 				),
-				QuotaReserveError::StaleGeneration => (Duration::from_secs(1), None, None),
+				QuotaReserveError::StaleGeneration => (
+					AdmissionDenied {
+						delay: Duration::from_secs(1),
+						reason: CooldownReason::RateLimit,
+						reserve_exhausted: false,
+						local_quota_retry: true,
+						source: "stale_generation",
+					},
+					None,
+					None,
+				),
 			};
 			drop(guard);
 			let emergency_started = emergency_ticket
@@ -1554,26 +1631,14 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 			let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
 			let short_refresh_retry = emergency_started || matching_refresh_in_progress;
 			if emergency_started {
-				let reset_remaining = delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
+				let reset_remaining = denial.delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
 				warn!(
 					"Local Reddit quota reserve reached during redirect with {} seconds left in the current window; rotating once to avoid a prolonged pause",
 					reset_remaining.as_secs()
 				);
 			}
 			record_local_denial(CooldownReason::RateLimit);
-			if short_refresh_retry {
-				return Err(ApiRequestError::deferred(
-					format!(
-						"Refreshing the anonymous Reddit session. Retry in {} seconds",
-						retry_after_seconds(EMERGENCY_QUOTA_REFRESH_RETRY)
-					),
-					CooldownReason::RateLimit,
-				));
-			}
-			return Err(ApiRequestError::deferred(
-				format!("{}. Retry in {} seconds", CooldownReason::RateLimit.message(), retry_after_seconds(delay)),
-				CooldownReason::RateLimit,
-			));
+			return Err(ApiRequestError::deferred(local_admission_message(denial, short_refresh_retry), CooldownReason::RateLimit));
 		}
 	};
 	attempt.generation = generation;
@@ -2141,22 +2206,74 @@ fn request_once(
 
 /// Make a request to a Reddit API and parse the JSON response.
 ///
-/// The short outer cache coalesces identical concurrent misses and briefly
-/// caches errors. Successful metadata responses are kept longer than dynamic
-/// listings, and either cache can serve its most recent success if a refresh
-/// fails.
+/// Identical in-flight requests share one result, including errors, but a later
+/// request can retry immediately after that flight completes. Successful
+/// metadata responses are kept longer than dynamic listings, and either cache
+/// can serve its most recent success if a refresh fails.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	let path = normalize_reddit_api_path(&path);
 	record_logical_json(&path);
 	json_coalesced(path, quarantine).await
 }
 
-#[cached(size = 1024, time = 2, sync_writes = "by_key")]
 async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String> {
-	match json_cache_policy(&path) {
-		JsonCachePolicy::Metadata => json_metadata_cached(path, quarantine).await,
-		JsonCachePolicy::Comments => json_comments_cached(path, quarantine).await,
-		JsonCachePolicy::Dynamic => json_dynamic_cached(path, quarantine).await,
+	let key = (path.clone(), quarantine);
+	coalesce_json_request(&JSON_FLIGHTS, key, move || async move {
+		match json_cache_policy(&path) {
+			JsonCachePolicy::Metadata => json_metadata_cached(path, quarantine).await,
+			JsonCachePolicy::Comments => json_comments_cached(path, quarantine).await,
+			JsonCachePolicy::Dynamic => json_dynamic_cached(path, quarantine).await,
+		}
+	})
+	.await
+}
+
+async fn coalesce_json_request<F, Fut>(flights: &'static JsonFlightMap, key: JsonRequestKey, fetch: F) -> JsonRequestResult
+where
+	F: FnOnce() -> Fut + Send + 'static,
+	Fut: std::future::Future<Output = JsonRequestResult> + Send + 'static,
+{
+	let flight = {
+		let mut current = flights.lock().await;
+		if let Some(flight) = current.get(&key) {
+			flight.clone()
+		} else {
+			let id = NEXT_JSON_FLIGHT_ID.fetch_add(1, Ordering::Relaxed);
+			let (sender, receiver) = watch::channel(None);
+			let task_key = key.clone();
+			tokio::spawn(async move {
+				let result = match std::panic::AssertUnwindSafe(async move { fetch().await }).catch_unwind().await {
+					Ok(result) => result,
+					Err(_) => {
+						error!("Coalesced Reddit JSON request ended unexpectedly");
+						Err(JSON_FLIGHT_ABORTED_ERROR.to_string())
+					}
+				};
+				let mut current = flights.lock().await;
+				if current.get(&task_key).is_some_and(|flight| flight.id == id) {
+					current.remove(&task_key);
+				}
+				drop(current);
+				sender.send_replace(Some(result));
+			});
+			let flight = JsonFlight { id, receiver };
+			current.insert(key.clone(), flight.clone());
+			flight
+		}
+	};
+
+	let mut receiver = flight.receiver;
+	loop {
+		if let Some(result) = receiver.borrow_and_update().clone() {
+			return result;
+		}
+		if receiver.changed().await.is_err() {
+			let mut current = flights.lock().await;
+			if current.get(&key).is_some_and(|candidate| candidate.id == flight.id) {
+				current.remove(&key);
+			}
+			return Err(JSON_FLIGHT_ABORTED_ERROR.to_string());
+		}
 	}
 }
 
@@ -2720,6 +2837,10 @@ mod tests {
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
 	static COALESCED_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+	static COALESCED_RESULT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+	static COALESCED_PANIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+	static COALESCED_RESULT_TEST_FLIGHTS: LazyLock<JsonFlightMap> = LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+	static COALESCED_PANIC_TEST_FLIGHTS: LazyLock<JsonFlightMap> = LazyLock::new(|| AsyncMutex::new(HashMap::new()));
 
 	#[cached(size = 8, time = 30, sync_writes = "by_key")]
 	async fn coalesced_test_fetch(key: u8) -> u8 {
@@ -2728,12 +2849,79 @@ mod tests {
 		key
 	}
 
+	async fn coalesced_result_test_fetch(key: u8) -> JsonRequestResult {
+		coalesce_json_request(&COALESCED_RESULT_TEST_FLIGHTS, (format!("test-{key}"), false), move || async move {
+			let call = COALESCED_RESULT_TEST_CALLS.fetch_add(1, Ordering::SeqCst);
+			tokio::time::sleep(Duration::from_millis(50)).await;
+			if call == 0 {
+				Err("transient".to_string())
+			} else {
+				Ok(Value::from(key))
+			}
+		})
+		.await
+	}
+
+	async fn coalesced_panic_test_fetch(key: u8, panic_on_first: bool) -> JsonRequestResult {
+		coalesce_json_request(&COALESCED_PANIC_TEST_FLIGHTS, (format!("panic-test-{key}"), false), move || async move {
+			let call = COALESCED_PANIC_TEST_CALLS.fetch_add(1, Ordering::SeqCst);
+			tokio::time::sleep(Duration::from_millis(50)).await;
+			assert!(!panic_on_first || call != 0, "simulated fetch panic");
+			Ok(Value::from(key))
+		})
+		.await
+	}
+
 	#[tokio::test]
 	async fn test_identical_cache_misses_are_coalesced() {
 		COALESCED_TEST_CALLS.store(0, Ordering::SeqCst);
 		let (first, second, third) = tokio::join!(coalesced_test_fetch(42), coalesced_test_fetch(42), coalesced_test_fetch(42));
 		assert_eq!((first, second, third), (42, 42, 42));
 		assert_eq!(COALESCED_TEST_CALLS.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test]
+	async fn test_transient_coalesced_errors_are_not_cached() {
+		COALESCED_RESULT_TEST_CALLS.store(0, Ordering::SeqCst);
+		let (first, second, third) = tokio::join!(coalesced_result_test_fetch(43), coalesced_result_test_fetch(43), coalesced_result_test_fetch(43));
+		let expected_error = Err("transient".to_string());
+		assert_eq!(first, expected_error);
+		assert_eq!(second, expected_error);
+		assert_eq!(third, expected_error);
+		assert_eq!(COALESCED_RESULT_TEST_CALLS.load(Ordering::SeqCst), 1);
+
+		assert_eq!(coalesced_result_test_fetch(43).await, Ok(Value::from(43)));
+		assert_eq!(COALESCED_RESULT_TEST_CALLS.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test]
+	async fn test_panicked_coalesced_request_is_removed_and_retryable() {
+		COALESCED_PANIC_TEST_CALLS.store(0, Ordering::SeqCst);
+		let (first, second) = tokio::join!(coalesced_panic_test_fetch(44, true), coalesced_panic_test_fetch(44, true));
+		let expected_error = Err(JSON_FLIGHT_ABORTED_ERROR.to_string());
+		assert_eq!(first, expected_error);
+		assert_eq!(second, expected_error);
+		assert_eq!(COALESCED_PANIC_TEST_CALLS.load(Ordering::SeqCst), 1);
+
+		assert_eq!(coalesced_panic_test_fetch(44, false).await, Ok(Value::from(44)));
+		assert_eq!(COALESCED_PANIC_TEST_CALLS.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test]
+	async fn test_quota_notifications_do_not_consume_timed_retries() {
+		let notify = Notify::new();
+		let mut retry_count = 0;
+		for _ in 0..5 {
+			notify.notify_one();
+			let timer_elapsed = wait_for_local_quota_retry(notify.notified(), Duration::from_secs(1)).await;
+			assert!(!timer_elapsed);
+			retry_count = local_quota_retry_count_after_wait(retry_count, timer_elapsed);
+		}
+		assert_eq!(retry_count, 0);
+
+		let timer_elapsed = wait_for_local_quota_retry(notify.notified(), Duration::from_millis(1)).await;
+		assert!(timer_elapsed);
+		assert_eq!(local_quota_retry_count_after_wait(retry_count, timer_elapsed), 1);
 	}
 
 	#[test]
@@ -2905,6 +3093,8 @@ mod tests {
 		);
 		assert_eq!(local_quota_retry_delay(&retryable, 0, LOCAL_QUOTA_RETRY_BUDGET, AdmissionRetryMode::Bounded), None);
 		assert_eq!(local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Immediate), None);
+		assert_eq!(local_quota_retry_count_after_wait(2, false), 2);
+		assert_eq!(local_quota_retry_count_after_wait(2, true), 3);
 
 		let not_retryable = BeginAttemptDenied {
 			admission: Some(AdmissionDenied {
@@ -2916,6 +3106,14 @@ mod tests {
 			quota_spillover: None,
 		};
 		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded), None);
+		assert_eq!(
+			local_admission_message(retryable.admission.unwrap(), false),
+			"Checking the anonymous Reddit session quota. Retry in 1 second"
+		);
+		assert_eq!(
+			local_admission_message(retryable.admission.unwrap(), true),
+			"Refreshing the anonymous Reddit session. Retry in 2 seconds"
+		);
 	}
 
 	#[test]
@@ -3181,6 +3379,8 @@ mod tests {
 			reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
 		};
 		assert!(!guard.quota_rotation_still_needed(now, ticket));
+		assert!(guard.completed_quota_rotation_still_valid(now, ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING, ticket));
 
 		guard.emergency_rotation_claimed_epoch = None;
 		guard.quota.window = QuotaWindow::Unknown {
@@ -3196,6 +3396,53 @@ mod tests {
 			reset_at: now + Duration::from_secs(90),
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+	}
+
+	#[test]
+	fn test_completed_quota_rotation_can_cross_launch_threshold() {
+		let now = Instant::now();
+		let emergency_reset = now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1);
+		let mut guard = UpstreamGuard {
+			quota: QuotaGovernor {
+				generation: 7,
+				epoch: 4,
+				next_request_id: 0,
+				outstanding: 0,
+				rollover_reserve: 0,
+				window: QuotaWindow::Known {
+					available: QUOTA_SAFETY_RESERVE,
+					reset_at: emergency_reset,
+				},
+			},
+			quota_rotation_armed: true,
+			..UpstreamGuard::default()
+		};
+		let emergency = guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency).unwrap();
+		assert!(guard.claim_quota_rotation(now, emergency));
+		let completed_at = now + Duration::from_secs(4);
+		assert!(!guard.quota_rotation_still_needed(completed_at, emergency));
+		for available in 0..=QUOTA_SAFETY_RESERVE {
+			guard.quota.window = QuotaWindow::Known {
+				available,
+				reset_at: emergency_reset,
+			};
+			assert!(guard.completed_quota_rotation_still_valid(completed_at, emergency));
+		}
+		guard.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE + 1,
+			reset_at: emergency_reset,
+		};
+		assert!(!guard.completed_quota_rotation_still_valid(completed_at, emergency));
+
+		guard.emergency_rotation_claimed_epoch = None;
+		guard.quota.window = QuotaWindow::Known {
+			available: LOW_RATE_LIMIT_THRESHOLD - 1,
+			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
+		};
+		let proactive = guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive).unwrap();
+		let completed_at = now + Duration::from_secs(4);
+		assert!(!guard.quota_rotation_still_needed(completed_at, proactive));
+		assert!(guard.completed_quota_rotation_still_valid(completed_at, proactive));
 	}
 
 	#[test]
@@ -3226,17 +3473,21 @@ mod tests {
 		guard.quota.epoch = 9;
 		let next_ticket = guard.quota_rotation_candidate(now, 4, QuotaRotationMode::Emergency).unwrap();
 		assert!(!guard.quota_rotation_still_needed(now, ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(now, ticket));
 		assert!(guard.claim_quota_rotation(now, next_ticket));
 		guard.rate_limit_blocked_until = Some(now + Duration::from_secs(10));
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(now, next_ticket));
 		guard.rate_limit_blocked_until = None;
 		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(now, next_ticket));
 		guard.upstream_failure_blocked_until = None;
 		guard.edge_state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(10),
 		};
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(now, next_ticket));
 	}
 
 	#[test]

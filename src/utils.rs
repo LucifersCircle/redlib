@@ -1517,8 +1517,10 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 }
 
 fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
-	const TEMPORARY_ERRORS: [&str; 13] = [
+	const TEMPORARY_ERRORS: [&str; 15] = [
 		"Redlib is starting its anonymous Reddit session",
+		"Checking the anonymous Reddit session quota",
+		"The shared Reddit request ended before producing a response",
 		"Reddit requests are temporarily paused",
 		"Reddit is temporarily rejecting this instance",
 		"Reddit rate limit exceeded",
@@ -1674,6 +1676,8 @@ mod tests {
 			Some(Some(42))
 		);
 		assert_eq!(temporary_error_retry_after("Refreshing the anonymous Reddit session. Retry in 2 seconds"), Some(Some(2)));
+		assert_eq!(temporary_error_retry_after("Checking the anonymous Reddit session quota. Retry in 1 second"), Some(Some(1)));
+		assert_eq!(temporary_error_retry_after("The shared Reddit request ended before producing a response"), Some(None));
 		assert_eq!(
 			temporary_error_retry_after("Redlib is starting its anonymous Reddit session. Retry in 5 seconds"),
 			Some(Some(5))
