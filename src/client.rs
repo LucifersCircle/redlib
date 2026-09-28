@@ -1,5 +1,5 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, OauthBackendImpl, RefreshReason};
+use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, RefreshReason};
 use crate::reddit_lane::{RedditLane, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
@@ -34,34 +34,6 @@ const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
 pub static CLIENT: LazyLock<Arc<WreqClient>> = LazyLock::new(|| Arc::new(build_client()));
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum OauthTransportProfile {
-	MobileAndroid,
-	GenericWeb,
-}
-
-impl OauthTransportProfile {
-	pub(crate) fn emulation_profile(self) -> (Emulation, EmulationOS) {
-		match self {
-			Self::MobileAndroid => (Emulation::OkHttp4_12, EmulationOS::Android),
-			Self::GenericWeb => (Emulation::Firefox147, EmulationOS::Windows),
-		}
-	}
-
-	pub(crate) fn label(self) -> &'static str {
-		match self {
-			Self::MobileAndroid => "mobile_android",
-			Self::GenericWeb => "generic_web",
-		}
-	}
-
-	pub(crate) fn skips_emulation_headers(self) -> bool {
-		self == Self::GenericWeb
-	}
-}
-
-pub(crate) const GENERIC_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0";
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwapOption<Oauth>> = LazyLock::new(ArcSwapOption::empty);
 
@@ -1591,14 +1563,14 @@ pub fn build_client() -> WreqClient {
 	build_emulated_client(RedditLane::Direct, None).expect("Should always be able to build the direct Reddit client")
 }
 
-fn build_tor_client(profile: OauthTransportProfile) -> Result<WreqClient, String> {
+fn build_tor_client() -> Result<WreqClient, String> {
 	let config = TOR_FALLBACK_CONFIG.as_ref().map_err(|error| error.clone())?;
 	let config = config.as_ref().ok_or_else(|| "Tor fallback is disabled".to_string())?;
 	let isolation_id = format!("redlib-{:016x}", fastrand::u64(..));
 	let proxy_url = tor_isolation_proxy_url(&config.proxy_url, &isolation_id)?;
 	let proxy = Proxy::all(proxy_url.as_str()).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
 	info!("Created an isolated Tor SOCKS transport for a Reddit identity");
-	build_oauth_client(RedditLane::Tor, Some(proxy), profile)
+	build_oauth_client(RedditLane::Tor, Some(proxy))
 }
 
 fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String, String> {
@@ -1612,10 +1584,10 @@ fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String
 	Ok(proxy_url.to_string())
 }
 
-pub(crate) fn client_for_new_identity(lane: RedditLane, profile: OauthTransportProfile) -> Result<Arc<WreqClient>, String> {
+pub(crate) fn client_for_new_identity(lane: RedditLane) -> Result<Arc<WreqClient>, String> {
 	match lane {
-		RedditLane::Direct => build_oauth_client(RedditLane::Direct, None, profile).map(Arc::new),
-		RedditLane::Tor => build_tor_client(profile).map(Arc::new),
+		RedditLane::Direct => build_oauth_client(RedditLane::Direct, None).map(Arc::new),
+		RedditLane::Tor => build_tor_client().map(Arc::new),
 	}
 }
 
@@ -1661,7 +1633,7 @@ pub fn start_tor_fallback() {
 	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
-	if let Err(error) = client_for_new_identity(RedditLane::Tor, OauthTransportProfile::MobileAndroid) {
+	if let Err(error) = client_for_new_identity(RedditLane::Tor) {
 		warn!("Tor fallback is disabled because its HTTP client could not be built: {error}");
 		return;
 	}
@@ -1681,13 +1653,10 @@ fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqC
 	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, false, "general")
 }
 
-fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>, profile: OauthTransportProfile) -> Result<WreqClient, String> {
-	let (selected_emulation, selected_operating_system) = profile.emulation_profile();
+fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqClient, String> {
 	// Mobile OAuth overrides the emulated User-Agent and content type with its
-	// Reddit identity, while retaining OkHttp's ordinary Accept headers. Generic
-	// web OAuth supplies its complete browser request explicitly.
-	let skip_emulation_headers = profile.skips_emulation_headers();
-	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, skip_emulation_headers, profile.label())
+	// Reddit identity while retaining OkHttp's ordinary Accept headers.
+	build_emulated_client_with_profile(lane, proxy, Emulation::OkHttp4_12, EmulationOS::Android, false, "mobile_android")
 }
 
 fn random_emulation_profile() -> (Emulation, EmulationOS) {
@@ -2478,13 +2447,7 @@ fn oauth_startup_validation_lane() -> RedditLane {
 }
 
 pub async fn rate_limit_check() -> Result<(), String> {
-	// We can perform a startup reachability check if the OAuth backend is
-	// MobileSpoof; GenericWeb does not expose the same rate-limit behavior.
-	let oauth_client = oauth_client(RedditLane::Direct).ok_or_else(oauth_startup_error)?;
-	if matches!(&oauth_client.backend, OauthBackendImpl::GenericWeb(_)) {
-		warn!("[⚠️] Cannot perform rate limit check, running as GenericWeb. Skipping check.");
-		return Ok(());
-	}
+	oauth_client(RedditLane::Direct).ok_or_else(oauth_startup_error)?;
 
 	// Make one uncached request. Quota-driven identity rotation is handled only
 	// after Reddit reports a low budget, rather than creating extra authentication
