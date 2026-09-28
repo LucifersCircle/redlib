@@ -1559,18 +1559,61 @@ const URL_PAIRS: [(&str, &str); 2] = [
 	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
 ];
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OauthTransportProfile {
+	Chrome143Android,
+	Chrome144Android,
+	Chrome145Android,
+	Firefox145Android,
+	Firefox146Android,
+	Firefox147Android,
+}
+
+pub(crate) const OAUTH_BROWSER_PROFILES: [OauthTransportProfile; 6] = [
+	OauthTransportProfile::Chrome143Android,
+	OauthTransportProfile::Chrome144Android,
+	OauthTransportProfile::Chrome145Android,
+	OauthTransportProfile::Firefox145Android,
+	OauthTransportProfile::Firefox146Android,
+	OauthTransportProfile::Firefox147Android,
+];
+
+impl OauthTransportProfile {
+	pub(crate) fn label(self) -> &'static str {
+		match self {
+			Self::Chrome143Android => "chrome_143_android",
+			Self::Chrome144Android => "chrome_144_android",
+			Self::Chrome145Android => "chrome_145_android",
+			Self::Firefox145Android => "firefox_145_android",
+			Self::Firefox146Android => "firefox_146_android",
+			Self::Firefox147Android => "firefox_147_android",
+		}
+	}
+
+	pub(crate) fn emulation(self) -> Emulation {
+		match self {
+			Self::Chrome143Android => Emulation::Chrome143,
+			Self::Chrome144Android => Emulation::Chrome144,
+			Self::Chrome145Android => Emulation::Chrome145,
+			Self::Firefox145Android => Emulation::Firefox145,
+			Self::Firefox146Android => Emulation::Firefox146,
+			Self::Firefox147Android => Emulation::Firefox147,
+		}
+	}
+}
+
 pub fn build_client() -> WreqClient {
 	build_emulated_client(RedditLane::Direct, None).expect("Should always be able to build the direct Reddit client")
 }
 
-fn build_tor_client() -> Result<WreqClient, String> {
+fn build_tor_client(profile: OauthTransportProfile) -> Result<WreqClient, String> {
 	let config = TOR_FALLBACK_CONFIG.as_ref().map_err(|error| error.clone())?;
 	let config = config.as_ref().ok_or_else(|| "Tor fallback is disabled".to_string())?;
 	let isolation_id = format!("redlib-{:016x}", fastrand::u64(..));
 	let proxy_url = tor_isolation_proxy_url(&config.proxy_url, &isolation_id)?;
 	let proxy = Proxy::all(proxy_url.as_str()).map_err(|error| format!("invalid REDLIB_TOR_PROXY: {error}"))?;
 	info!("Created an isolated Tor SOCKS transport for a Reddit identity");
-	build_oauth_client(RedditLane::Tor, Some(proxy))
+	build_oauth_client(RedditLane::Tor, Some(proxy), profile)
 }
 
 fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String, String> {
@@ -1584,15 +1627,21 @@ fn tor_isolation_proxy_url(proxy_url: &str, isolation_id: &str) -> Result<String
 	Ok(proxy_url.to_string())
 }
 
-pub(crate) fn client_for_new_identity(lane: RedditLane) -> Result<Arc<WreqClient>, String> {
+pub(crate) fn client_for_oauth_profile(lane: RedditLane, profile: OauthTransportProfile) -> Result<Arc<WreqClient>, String> {
 	match lane {
-		RedditLane::Direct => build_oauth_client(RedditLane::Direct, None).map(Arc::new),
-		RedditLane::Tor => build_tor_client().map(Arc::new),
+		RedditLane::Direct => build_oauth_client(RedditLane::Direct, None, profile).map(Arc::new),
+		RedditLane::Tor => build_tor_client(profile).map(Arc::new),
 	}
 }
 
-pub(crate) fn direct_oauth_compatibility_client() -> Arc<WreqClient> {
-	CLIENT.clone()
+pub(crate) fn random_oauth_profile() -> OauthTransportProfile {
+	OAUTH_BROWSER_PROFILES[fastrand::usize(..OAUTH_BROWSER_PROFILES.len())]
+}
+
+pub(crate) fn random_oauth_profile_except(current: OauthTransportProfile) -> OauthTransportProfile {
+	let current_index = OAUTH_BROWSER_PROFILES.iter().position(|profile| *profile == current).unwrap_or(0);
+	let offset = fastrand::usize(1..OAUTH_BROWSER_PROFILES.len());
+	OAUTH_BROWSER_PROFILES[(current_index + offset) % OAUTH_BROWSER_PROFILES.len()]
 }
 
 pub fn start_oauth() {
@@ -1633,7 +1682,7 @@ pub fn start_tor_fallback() {
 	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
-	if let Err(error) = client_for_new_identity(RedditLane::Tor) {
+	if let Err(error) = client_for_oauth_profile(RedditLane::Tor, random_oauth_profile()) {
 		warn!("Tor fallback is disabled because its HTTP client could not be built: {error}");
 		return;
 	}
@@ -1653,10 +1702,11 @@ fn build_emulated_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqC
 	build_emulated_client_with_profile(lane, proxy, selected_emulation, selected_operating_system, false, "general")
 }
 
-fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>) -> Result<WreqClient, String> {
-	// Mobile OAuth overrides the emulated User-Agent and content type with its
-	// Reddit identity while retaining OkHttp's ordinary Accept headers.
-	build_emulated_client_with_profile(lane, proxy, Emulation::OkHttp4_12, EmulationOS::Android, false, "mobile_android")
+fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>, profile: OauthTransportProfile) -> Result<WreqClient, String> {
+	// Mobile OAuth overrides the browser User-Agent and content type with its
+	// stable Reddit Android identity while retaining the selected browser's
+	// transport fingerprint and ordinary Accept headers.
+	build_emulated_client_with_profile(lane, proxy, profile.emulation(), EmulationOS::Android, false, profile.label())
 }
 
 fn random_emulation_profile() -> (Emulation, EmulationOS) {
