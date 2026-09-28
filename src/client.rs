@@ -60,6 +60,7 @@ const QUOTA_UNKNOWN_RETRY: Duration = Duration::from_secs(5);
 const LOCAL_QUOTA_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const LOCAL_QUOTA_RETRY_INTERVAL: Duration = Duration::from_millis(650);
 const MAX_LOCAL_QUOTA_RETRIES: u8 = 3;
+const TOR_QUOTA_SPILLOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const EMERGENCY_QUOTA_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const OAUTH_STARTUP_RETRY: Duration = Duration::from_secs(5);
 const EDGE_THROTTLE_INITIAL_COOLDOWN: Duration = Duration::from_secs(5);
@@ -96,6 +97,8 @@ static MEDIA_DESTINATION_SENDS: LazyLock<[AtomicU64; 6]> = LazyLock::new(|| std:
 static MEDIA_RESULT_COUNTS: LazyLock<[AtomicU64; 6]> = LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static OAUTH_LANE_SENDS: LazyLock<[AtomicU64; 2]> = LazyLock::new(|| std::array::from_fn(|_| AtomicU64::new(0)));
 static TOR_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static TOR_QUOTA_SPILLOVER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static TOR_QUOTA_SPILLOVER_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static LAST_TRAFFIC_SUMMARY: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
 static COMMENT_JSON_KEYS: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -123,6 +126,19 @@ struct AdmissionDenied {
 	reserve_exhausted: bool,
 	local_quota_retry: bool,
 	source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct QuotaSpilloverTicket {
+	generation: u64,
+	quota_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TorRetryReason {
+	None,
+	EdgeRejected,
+	QuotaReserve(QuotaSpilloverTicket),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -331,6 +347,21 @@ impl QuotaGovernor {
 		self.outstanding = self.outstanding.saturating_add(1);
 		self.next_request_id = self.next_request_id.wrapping_add(1);
 		Ok((self.epoch, self.next_request_id, discovery_probe))
+	}
+
+	fn reserve_exhausted(&self, now: Instant) -> bool {
+		let QuotaWindow::Known { available, reset_at } = self.window else {
+			return false;
+		};
+		if now >= reset_at + RATE_LIMIT_COOLDOWN_MARGIN {
+			return false;
+		}
+		let safety_reserve = if reset_at.saturating_duration_since(now) <= EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING {
+			0
+		} else {
+			QUOTA_SAFETY_RESERVE
+		};
+		available <= safety_reserve
 	}
 
 	fn reconcile(&mut self, now: Instant, attempt: &UpstreamAttempt, remaining: Option<u16>, reset: Option<Duration>, quota_exhausted: bool) -> bool {
@@ -567,6 +598,14 @@ impl UpstreamGuard {
 			return false;
 		}
 		ticket.mode != QuotaRotationMode::Emergency || self.emergency_rotation_claimed_epoch == Some(ticket.quota_epoch)
+	}
+
+	fn quota_spillover_still_needed(&self, now: Instant, ticket: QuotaSpilloverTicket) -> bool {
+		self.lane == RedditLane::Direct
+			&& ticket.generation == self.quota.generation
+			&& ticket.quota_epoch == self.quota.epoch
+			&& self.active_cooldown(now).is_none()
+			&& self.quota.reserve_exhausted(now)
 	}
 
 	fn take_short_reset_notice(&mut self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
@@ -1216,7 +1255,7 @@ fn maybe_log_traffic_summary() {
 	drop(last);
 
 	info!(
-		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} comment_keys={} admitted_json={} api_sends={} api_lanes={} tor_fallbacks={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_lanes={} local_denials={}",
+		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} comment_keys={} admitted_json={} api_sends={} api_lanes={} tor_fallbacks={} tor_quota_spillover_attempts={} tor_quota_spillover_successes={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_lanes={} local_denials={}",
 		elapsed.as_secs().max(1),
 		take_counter_summary(
 			["home", "subreddit", "comments", "user", "search", "rss", "media", "health", "other"],
@@ -1244,6 +1283,8 @@ fn maybe_log_traffic_summary() {
 		),
 		take_counter_summary(["direct", "tor"], &API_LANE_SENDS),
 		TOR_FALLBACKS.swap(0, Ordering::Relaxed),
+		TOR_QUOTA_SPILLOVER_ATTEMPTS.swap(0, Ordering::Relaxed),
+		TOR_QUOTA_SPILLOVER_SUCCESSES.swap(0, Ordering::Relaxed),
 		REDIRECT_HOPS.swap(0, Ordering::Relaxed),
 		CANONICAL_HEAD_SENDS.swap(0, Ordering::Relaxed),
 		MEDIA_SENDS.swap(0, Ordering::Relaxed),
@@ -1321,14 +1362,34 @@ fn preferred_api_lane(now: Instant) -> RedditLane {
 	select_preferred_api_lane(direct_ready, tor_ready, direct_edge_active)
 }
 
+fn direct_quota_spillover_valid(ticket: QuotaSpilloverTicket, now: Instant) -> bool {
+	!OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst) && upstream_guard(RedditLane::Direct).quota_spillover_still_needed(now, ticket)
+}
+
 #[derive(Debug)]
 struct BeginAttemptDenied {
 	admission: Option<AdmissionDenied>,
 	message: String,
 	edge_deferred: bool,
+	quota_spillover: Option<QuotaSpilloverTicket>,
 }
 
-fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed: Duration) -> Option<Duration> {
+fn quota_spillover_ticket(lane: RedditLane, denial: AdmissionDenied, short_refresh_retry: bool, generation: u64, quota_epoch: Option<u64>) -> Option<QuotaSpilloverTicket> {
+	quota_epoch
+		.filter(|_| lane == RedditLane::Direct && !short_refresh_retry && denial.reserve_exhausted && denial.source == "quota_reserve")
+		.map(|quota_epoch| QuotaSpilloverTicket { generation, quota_epoch })
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AdmissionRetryMode {
+	Bounded,
+	Immediate,
+}
+
+fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed: Duration, mode: AdmissionRetryMode) -> Option<Duration> {
+	if mode == AdmissionRetryMode::Immediate {
+		return None;
+	}
 	let admission = denied.admission.as_ref()?;
 	if !admission.local_quota_retry || retry_count >= MAX_LOCAL_QUOTA_RETRIES || elapsed >= LOCAL_QUOTA_RETRY_BUDGET {
 		return None;
@@ -1336,22 +1397,27 @@ fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed
 	Some(admission.delay.min(LOCAL_QUOTA_RETRY_INTERVAL).min(LOCAL_QUOTA_RETRY_BUDGET.saturating_sub(elapsed)))
 }
 
-fn begin_upstream_attempt_once(lane: RedditLane) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
+fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
 	let mut guard = upstream_guard(lane);
 	let oauth_client = oauth_client(lane).ok_or_else(|| BeginAttemptDenied {
 		admission: None,
 		message: oauth_startup_error(),
 		edge_deferred: false,
+		quota_spillover: None,
 	})?;
 	let generation = oauth_client.generation;
 	let now = Instant::now();
 	let result = guard.try_admit(now, generation);
 	let denied_quota_epoch = result.as_ref().err().filter(|denial| denial.reserve_exhausted).map(|_| guard.quota.epoch);
-	let emergency_ticket = result
-		.as_ref()
-		.err()
-		.filter(|denial| denial.reserve_exhausted)
-		.and_then(|_| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency));
+	let emergency_ticket = allow_quota_refresh
+		.then(|| {
+			result
+				.as_ref()
+				.err()
+				.filter(|denial| denial.reserve_exhausted)
+				.and_then(|_| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency))
+		})
+		.flatten();
 	drop(guard);
 	result.map(|attempt| (oauth_client, attempt)).map_err(|denial| {
 		let emergency_started = emergency_ticket
@@ -1374,21 +1440,23 @@ fn begin_upstream_attempt_once(lane: RedditLane) -> Result<(Arc<Oauth>, Upstream
 		} else {
 			format!("{}. Retry in {} seconds", denial.reason.message(), retry_after_seconds(denial.delay))
 		};
+		let quota_spillover = quota_spillover_ticket(lane, denial, short_refresh_retry, generation, denied_quota_epoch);
 		BeginAttemptDenied {
 			edge_deferred: denial.reason == CooldownReason::EdgeThrottle,
 			message,
 			admission: Some(denial),
+			quota_spillover,
 		}
 	})
 }
 
-async fn begin_upstream_attempt(lane: RedditLane) -> Result<(Arc<Oauth>, UpstreamAttempt), (String, bool)> {
+async fn begin_upstream_attempt(lane: RedditLane, mode: AdmissionRetryMode) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
 	let started = Instant::now();
 	let mut retry_count = 0;
 	let mut retry_source = "none";
 	loop {
 		let quota_changed = quota_notify(lane).notified();
-		match begin_upstream_attempt_once(lane) {
+		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded) {
 			Ok(attempt) => {
 				if retry_count > 0 {
 					info!(
@@ -1403,7 +1471,7 @@ async fn begin_upstream_attempt(lane: RedditLane) -> Result<(Arc<Oauth>, Upstrea
 			}
 			Err(denied) => {
 				let elapsed = Instant::now().saturating_duration_since(started);
-				let Some(delay) = local_quota_retry_delay(&denied, retry_count, elapsed) else {
+				let Some(delay) = local_quota_retry_delay(&denied, retry_count, elapsed, mode) else {
 					if let Some(admission) = denied.admission {
 						record_local_denial(admission.reason);
 						if retry_count > 0 {
@@ -1416,7 +1484,7 @@ async fn begin_upstream_attempt(lane: RedditLane) -> Result<(Arc<Oauth>, Upstrea
 							);
 						}
 					}
-					return Err((denied.message, denied.edge_deferred));
+					return Err(denied);
 				};
 				retry_source = denied.admission.as_ref().map_or("unknown", |admission| admission.source);
 				retry_count += 1;
@@ -2244,47 +2312,131 @@ fn is_metadata_path(path: &str) -> bool {
 
 async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> {
 	let lane = preferred_api_lane(Instant::now());
-	let (result, edge_rejected) = json_uncached_on_lane(path.clone(), quarantine, lane).await;
-	if should_retry_on_tor(lane, edge_rejected, tor_fallback_ready(), direct_edge_fallback_active(Instant::now())) {
-		TOR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-		info!("Retrying edge-rejected Reddit API request on the Tor lane: endpoint={}", endpoint_class(&path));
-		return json_uncached_on_lane(path, quarantine, RedditLane::Tor).await.0;
+	let (result, retry_reason) = json_uncached_on_lane(path.clone(), quarantine, lane).await;
+	let now = Instant::now();
+	let tor_ready = tor_fallback_ready();
+	let direct_edge_active = direct_edge_fallback_active(now);
+	let direct_refreshing = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
+	let quota_spillover_valid = match retry_reason {
+		TorRetryReason::QuotaReserve(ticket) if !direct_refreshing => direct_quota_spillover_valid(ticket, now),
+		_ => false,
+	};
+	if !should_retry_on_tor(lane, retry_reason, tor_ready, direct_edge_active, direct_refreshing, quota_spillover_valid) {
+		return result;
 	}
-	result
+
+	match retry_reason {
+		TorRetryReason::EdgeRejected => {
+			TOR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+			info!("Retrying edge-rejected Reddit API request on the Tor lane: endpoint={}", endpoint_class(&path));
+			json_uncached_on_lane(path, quarantine, RedditLane::Tor).await.0
+		}
+		TorRetryReason::QuotaReserve(ticket) => {
+			TOR_QUOTA_SPILLOVER_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+			info!("Trying one bounded Tor request after direct quota reserve exhaustion: endpoint={}", endpoint_class(&path));
+			let (tor_result, _) = json_uncached_on_lane_with_options(
+				path.clone(),
+				quarantine,
+				RedditLane::Tor,
+				AdmissionRetryMode::Immediate,
+				Some(TOR_QUOTA_SPILLOVER_TIMEOUT),
+				Some(ticket),
+			)
+			.await;
+			match tor_result {
+				Ok(value) => {
+					TOR_QUOTA_SPILLOVER_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+					info!("Tor quota spillover recovered the Reddit API request: endpoint={}", endpoint_class(&path));
+					Ok(value)
+				}
+				Err(_) => {
+					warn!(
+						"Tor quota spillover did not recover the Reddit API request; preserving the direct-lane error: endpoint={}",
+						endpoint_class(&path)
+					);
+					result
+				}
+			}
+		}
+		TorRetryReason::None => result,
+	}
 }
 
-fn should_retry_on_tor(lane: RedditLane, edge_rejected: bool, tor_ready: bool, direct_edge_active: bool) -> bool {
-	lane == RedditLane::Direct && edge_rejected && tor_ready && direct_edge_active
+fn should_retry_on_tor(lane: RedditLane, reason: TorRetryReason, tor_ready: bool, direct_edge_active: bool, direct_refreshing: bool, quota_spillover_valid: bool) -> bool {
+	if lane != RedditLane::Direct || !tor_ready {
+		return false;
+	}
+	match reason {
+		TorRetryReason::EdgeRejected => direct_edge_active,
+		TorRetryReason::QuotaReserve(_) => !direct_refreshing && quota_spillover_valid,
+		TorRetryReason::None => false,
+	}
 }
 
-async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, bool) {
+fn request_timeout_is_transport_failure(timeout_override: Option<Duration>) -> bool {
+	timeout_override.is_none()
+}
+
+async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
+	json_uncached_on_lane_with_options(path, quarantine, lane, AdmissionRetryMode::Bounded, None, None).await
+}
+
+async fn json_uncached_on_lane_with_options(
+	path: String,
+	quarantine: bool,
+	lane: RedditLane,
+	admission_mode: AdmissionRetryMode,
+	timeout_override: Option<Duration>,
+	quota_spillover_ticket: Option<QuotaSpilloverTicket>,
+) -> (Result<Value, String>, TorRetryReason) {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	let request_timeout = lane.request_timeout();
+	let request_timeout = timeout_override.unwrap_or_else(|| lane.request_timeout());
 	let request_deadline = tokio::time::Instant::now() + request_timeout;
-	let _permit = match tokio::time::timeout_at(request_deadline, api_concurrency(lane).acquire()).await {
-		Ok(Ok(permit)) => permit,
-		Ok(Err(_)) => return (Err("Reddit request limiter is unavailable".to_string()), false),
-		Err(_) => return (Err("Reddit API request timed out while waiting for transport capacity".to_string()), false),
+	let _permit = if quota_spillover_ticket.is_some() {
+		match api_concurrency(lane).try_acquire() {
+			Ok(permit) => permit,
+			Err(_) => return (Err("Tor quota spillover skipped while transport capacity was busy".to_string()), TorRetryReason::None),
+		}
+	} else {
+		match tokio::time::timeout_at(request_deadline, api_concurrency(lane).acquire()).await {
+			Ok(Ok(permit)) => permit,
+			Ok(Err(_)) => return (Err("Reddit request limiter is unavailable".to_string()), TorRetryReason::None),
+			Err(_) => return (Err("Reddit API request timed out while waiting for transport capacity".to_string()), TorRetryReason::None),
+		}
 	};
+	if let Some(ticket) = quota_spillover_ticket {
+		debug_assert_eq!(lane, RedditLane::Tor);
+		debug_assert_eq!(admission_mode, AdmissionRetryMode::Immediate);
+		if !direct_quota_spillover_valid(ticket, Instant::now()) {
+			return (Err("Tor quota spillover skipped because direct-lane state changed".to_string()), TorRetryReason::None);
+		}
+	}
 
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
-	let (oauth_client, mut upstream_attempt) = match begin_upstream_attempt(lane).await {
+	let (oauth_client, mut upstream_attempt) = match begin_upstream_attempt(lane, admission_mode).await {
 		Ok(attempt) => attempt,
-		Err((error, edge_deferred)) => return (Err(error), edge_deferred),
+		Err(denied) => {
+			let retry_reason = if denied.edge_deferred {
+				TorRetryReason::EdgeRejected
+			} else {
+				denied.quota_spillover.map_or(TorRetryReason::None, TorRetryReason::QuotaReserve)
+			};
+			return (Err(denied.message), retry_reason);
+		}
 	};
 	let request_generation = oauth_client.generation;
 	// Admission atomically selects the OAuth client and owns its quota
 	// reservation and edge half-open probe.
 	record_admitted_json(&path);
 	let timeout_path = path.clone();
-	let mut edge_rejected = false;
+	let mut retry_reason = TorRetryReason::None;
 
 	// Fetch the url...
 	let result = tokio::time::timeout_at(request_deadline, async {
@@ -2343,7 +2495,7 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 						return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", retry_after_seconds(delay)));
 					}
 					Some(ThrottleKind::Edge) => {
-						edge_rejected = true;
+						retry_reason = TorRetryReason::EdgeRejected;
 						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
 						match decision {
 							decision if decision.started_cooldown => warn!(
@@ -2475,7 +2627,9 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 				message,
 				edge_rejected: deferred_edge_rejected,
 			}) => {
-				edge_rejected |= deferred_edge_rejected;
+				if deferred_edge_rejected {
+					retry_reason = TorRetryReason::EdgeRejected;
+				}
 				Err(message)
 			}
 			Err(ApiRequestError::Upstream(error)) => {
@@ -2489,11 +2643,15 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 	let result = match result {
 		Ok(result) => result,
 		Err(_) => {
-			record_upstream_failure(lane, "request_timeout", None, &timeout_path, request_generation);
+			if request_timeout_is_transport_failure(timeout_override) {
+				record_upstream_failure(lane, "request_timeout", None, &timeout_path, request_generation);
+			} else {
+				info!("Bounded Tor quota spillover reached its latency budget: endpoint={}", endpoint_class(&timeout_path));
+			}
 			Err(format!("Reddit API request timed out after {} seconds", request_timeout.as_secs()))
 		}
 	};
-	(result, edge_rejected)
+	(result, retry_reason)
 }
 
 async fn self_check_on_lane(sub: &str, lane: RedditLane) -> Result<(), String> {
@@ -2731,14 +2889,22 @@ mod tests {
 			}),
 			message: "retry".to_string(),
 			edge_deferred: false,
+			quota_spillover: None,
 		};
-		assert_eq!(local_quota_retry_delay(&retryable, 0, Duration::ZERO), Some(LOCAL_QUOTA_RETRY_INTERVAL));
 		assert_eq!(
-			local_quota_retry_delay(&retryable, 2, LOCAL_QUOTA_RETRY_BUDGET - Duration::from_millis(50)),
+			local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded),
+			Some(LOCAL_QUOTA_RETRY_INTERVAL)
+		);
+		assert_eq!(
+			local_quota_retry_delay(&retryable, 2, LOCAL_QUOTA_RETRY_BUDGET - Duration::from_millis(50), AdmissionRetryMode::Bounded,),
 			Some(Duration::from_millis(50))
 		);
-		assert_eq!(local_quota_retry_delay(&retryable, MAX_LOCAL_QUOTA_RETRIES, Duration::ZERO), None);
-		assert_eq!(local_quota_retry_delay(&retryable, 0, LOCAL_QUOTA_RETRY_BUDGET), None);
+		assert_eq!(
+			local_quota_retry_delay(&retryable, MAX_LOCAL_QUOTA_RETRIES, Duration::ZERO, AdmissionRetryMode::Bounded),
+			None
+		);
+		assert_eq!(local_quota_retry_delay(&retryable, 0, LOCAL_QUOTA_RETRY_BUDGET, AdmissionRetryMode::Bounded), None);
+		assert_eq!(local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Immediate), None);
 
 		let not_retryable = BeginAttemptDenied {
 			admission: Some(AdmissionDenied {
@@ -2747,8 +2913,142 @@ mod tests {
 			}),
 			message: "stop".to_string(),
 			edge_deferred: true,
+			quota_spillover: None,
 		};
-		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO), None);
+		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded), None);
+	}
+
+	#[test]
+	fn test_quota_spillover_requires_current_direct_reserve_without_cooldown() {
+		let now = Instant::now();
+		let mut direct = UpstreamGuard::new(RedditLane::Direct);
+		direct.install_oauth_generation(7, true);
+		direct.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + Duration::from_secs(120),
+		};
+		let ticket = QuotaSpilloverTicket {
+			generation: 7,
+			quota_epoch: direct.quota.epoch,
+		};
+		assert!(direct.quota_spillover_still_needed(now, ticket));
+
+		direct.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE + 1,
+			reset_at: now + Duration::from_secs(120),
+		};
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+
+		direct.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + Duration::from_secs(120),
+		};
+		assert!(!direct.quota_spillover_still_needed(now, QuotaSpilloverTicket { generation: 8, ..ticket }));
+		assert!(!direct.quota_spillover_still_needed(
+			now,
+			QuotaSpilloverTicket {
+				quota_epoch: ticket.quota_epoch.wrapping_add(1),
+				..ticket
+			}
+		));
+
+		direct.quota.window = QuotaWindow::Unknown {
+			not_before: now,
+			probe_in_flight: false,
+		};
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+		direct.quota.window = QuotaWindow::Unreported;
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+		direct.quota.window = QuotaWindow::Known {
+			available: 0,
+			reset_at: now - RATE_LIMIT_COOLDOWN_MARGIN,
+		};
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+
+		direct.quota.window = QuotaWindow::Known {
+			available: 1,
+			reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+		};
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+		direct.quota.window = QuotaWindow::Known {
+			available: 0,
+			reset_at: now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+		};
+		assert!(direct.quota_spillover_still_needed(now, ticket));
+
+		direct.block_for_rate_limit(now, Duration::from_secs(30));
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+		direct.rate_limit_blocked_until = None;
+		direct.upstream_failure_blocked_until = Some(now + Duration::from_secs(30));
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+		direct.upstream_failure_blocked_until = None;
+		let edge_attempt = direct.begin_attempt(now).unwrap();
+		direct.record_edge_throttle(now, edge_attempt, None);
+		assert!(!direct.quota_spillover_still_needed(now, ticket));
+
+		let mut tor = UpstreamGuard::new(RedditLane::Tor);
+		tor.install_oauth_generation(7, true);
+		tor.quota = direct.quota;
+		assert!(!tor.quota_spillover_still_needed(now, ticket));
+	}
+
+	#[test]
+	fn test_only_direct_local_reserve_denial_creates_spillover_ticket() {
+		let reserve_denial = AdmissionDenied {
+			delay: Duration::from_secs(30),
+			reason: CooldownReason::RateLimit,
+			reserve_exhausted: true,
+			local_quota_retry: true,
+			source: "quota_reserve",
+		};
+		let expected = Some(QuotaSpilloverTicket { generation: 7, quota_epoch: 3 });
+		assert_eq!(quota_spillover_ticket(RedditLane::Direct, reserve_denial, false, 7, Some(3)), expected);
+		assert_eq!(quota_spillover_ticket(RedditLane::Tor, reserve_denial, false, 7, Some(3)), None);
+		assert_eq!(quota_spillover_ticket(RedditLane::Direct, reserve_denial, true, 7, Some(3)), None);
+		assert_eq!(quota_spillover_ticket(RedditLane::Direct, reserve_denial, false, 7, None), None);
+		assert_eq!(
+			quota_spillover_ticket(
+				RedditLane::Direct,
+				AdmissionDenied {
+					source: "active_cooldown",
+					..reserve_denial
+				},
+				false,
+				7,
+				Some(3),
+			),
+			None
+		);
+	}
+
+	#[test]
+	fn test_quota_spillover_keeps_total_local_wait_bounded() {
+		assert_eq!(LOCAL_QUOTA_RETRY_BUDGET + TOR_QUOTA_SPILLOVER_TIMEOUT, Duration::from_secs(5));
+		assert!(request_timeout_is_transport_failure(None));
+		assert!(!request_timeout_is_transport_failure(Some(TOR_QUOTA_SPILLOVER_TIMEOUT)));
+	}
+
+	#[test]
+	fn test_tor_spillover_admission_respects_tor_guard() {
+		let now = Instant::now();
+		let mut tor = UpstreamGuard::new(RedditLane::Tor);
+		tor.install_oauth_generation(9, true);
+		tor.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE,
+			reset_at: now + Duration::from_secs(120),
+		};
+		let denial = tor.try_admit(now, 9).unwrap_err();
+		assert_eq!(denial.source, "quota_reserve");
+		assert!(denial.reserve_exhausted);
+
+		tor.quota.window = QuotaWindow::Known {
+			available: QUOTA_SAFETY_RESERVE + 1,
+			reset_at: now + Duration::from_secs(120),
+		};
+		tor.block_for_rate_limit(now, Duration::from_secs(30));
+		let denial = tor.try_admit(now, 9).unwrap_err();
+		assert_eq!(denial.source, "active_cooldown");
+		assert_eq!(denial.reason, CooldownReason::RateLimit);
 	}
 
 	#[test]
@@ -3542,12 +3842,17 @@ mod tests {
 	}
 
 	#[test]
-	fn test_tor_retry_requires_this_request_to_be_edge_rejected() {
-		assert!(should_retry_on_tor(RedditLane::Direct, true, true, true));
-		assert!(!should_retry_on_tor(RedditLane::Direct, false, true, true));
-		assert!(!should_retry_on_tor(RedditLane::Direct, true, false, true));
-		assert!(!should_retry_on_tor(RedditLane::Direct, true, true, false));
-		assert!(!should_retry_on_tor(RedditLane::Tor, true, true, true));
+	fn test_tor_retry_policy_distinguishes_edge_and_quota_spillover() {
+		let ticket = QuotaSpilloverTicket { generation: 7, quota_epoch: 2 };
+		assert!(should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, true, true, false, false,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, true, false, false, false,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, false, true, false, false,));
+		assert!(!should_retry_on_tor(RedditLane::Tor, TorRetryReason::EdgeRejected, true, true, false, false,));
+		assert!(should_retry_on_tor(RedditLane::Direct, TorRetryReason::QuotaReserve(ticket), true, false, false, true,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::QuotaReserve(ticket), true, false, true, true,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::QuotaReserve(ticket), false, false, false, true,));
+		assert!(!should_retry_on_tor(RedditLane::Tor, TorRetryReason::QuotaReserve(ticket), true, false, false, true,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::None, true, true, false, true,));
 	}
 
 	#[test]
