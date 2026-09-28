@@ -1356,11 +1356,6 @@ a.search_subreddit:hover {
 
 .gallery-js .adaptive_gallery .feed_gallery_viewport {
     height: var(--gallery-media-height, auto);
-    transition: height 160ms ease-out;
-}
-
-.gallery-js .adaptive_gallery.gallery_dragging .feed_gallery_viewport {
-    transition: none;
 }
 
 .gallery-js .adaptive_gallery .feed_gallery_track,
