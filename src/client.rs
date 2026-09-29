@@ -1699,6 +1699,41 @@ const URL_PAIRS: [(&str, &str); 2] = [
 	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
 ];
 
+#[derive(Debug)]
+enum CanonicalPathError {
+	RetryOnTor(String),
+	Terminal(String),
+}
+
+impl CanonicalPathError {
+	fn into_message(self) -> String {
+		match self {
+			Self::RetryOnTor(message) | Self::Terminal(message) => message,
+		}
+	}
+}
+
+fn canonical_head_origins(lane: RedditLane) -> [Option<(&'static str, &'static str)>; 2] {
+	match lane {
+		RedditLane::Direct => [Some(URL_PAIRS[0]), Some(URL_PAIRS[1])],
+		RedditLane::Tor => {
+			let origin = lane.auth_origin();
+			[Some((origin.base, origin.host)), None]
+		}
+	}
+}
+
+fn canonical_head_is_edge_rejected(status: u16, retry_after_present: bool, quota_headers_present: bool) -> bool {
+	matches!(
+		classify_throttle_response(status, retry_after_present, quota_headers_present),
+		Some(ThrottleKind::Edge)
+	)
+}
+
+fn should_retry_canonical_on_tor(lane: RedditLane, tor_ready: bool) -> bool {
+	lane == RedditLane::Direct && tor_ready
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum OauthTransportProfile {
 	Chrome140Android,
@@ -1918,28 +1953,57 @@ fn build_emulated_client_with_profile(
 /// `Location` header. An `Err(String)` is returned if Reddit responds with a
 /// 429, or if we were unable to decode the value in the `Location` header.
 #[cached(size = 1024, time = 600, result = true)]
-#[async_recursion::async_recursion]
 pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, String> {
+	let lane = preferred_api_lane(Instant::now());
+	match canonical_path_on_lane(path.clone(), tries, lane).await {
+		Err(CanonicalPathError::RetryOnTor(_)) if should_retry_canonical_on_tor(lane, tor_fallback_ready()) => {
+			info!("Retrying Reddit share-link resolution on the Tor lane");
+			canonical_path_on_lane(path, tries, RedditLane::Tor)
+				.await
+				.map_err(CanonicalPathError::into_message)
+		}
+		Ok(path) => Ok(path),
+		Err(error) => Err(error.into_message()),
+	}
+}
+
+#[async_recursion::async_recursion]
+async fn canonical_path_on_lane(path: String, tries: i8, lane: RedditLane) -> Result<Option<String>, CanonicalPathError> {
 	if tries == 0 {
 		return Ok(None);
 	}
 
-	// for each URL pair, try the HEAD request
-	let res = {
-		// for url base and host in URL_PAIRS, try reddit_short_head(path.clone(), true, url_base, url_base_host) and if it succeeds, set res. else, res = None
-		let mut res = None;
-		for (url_base, url_base_host) in URL_PAIRS {
-			res = reddit_short_head(path.clone(), true, url_base, url_base_host).await.ok();
-			if let Some(res) = &res {
-				if !res.status().is_client_error() {
+	let mut res = None;
+	let mut request_failed = false;
+	let mut edge_rejected = false;
+	let mut non_client_response = false;
+	for (url_base, url_base_host) in canonical_head_origins(lane).into_iter().flatten() {
+		match reddit_short_head(path.clone(), true, url_base, url_base_host, lane).await {
+			Ok(response) => {
+				let status = response.status().as_u16();
+				let retry_after_present = response.headers().get(wreq_header::RETRY_AFTER).is_some();
+				let quota_headers_present = response.headers().get("x-ratelimit-remaining").is_some()
+					|| response.headers().get("x-ratelimit-reset").is_some()
+					|| response.headers().get("x-ratelimit-used").is_some();
+				edge_rejected |= canonical_head_is_edge_rejected(status, retry_after_present, quota_headers_present);
+				let client_error = response.status().is_client_error();
+				res = Some(response);
+				if !client_error {
+					non_client_response = true;
 					break;
 				}
 			}
+			Err(_) => request_failed = true,
 		}
-		res
-	};
+	}
 
-	let res = res.ok_or_else(|| "Unable to make HEAD request to Reddit.".to_string())?;
+	if !non_client_response && (edge_rejected || res.is_none() && request_failed) {
+		return Err(CanonicalPathError::RetryOnTor(
+			"Unable to resolve Reddit share link on the current lane.".to_string(),
+		));
+	}
+
+	let res = res.ok_or_else(|| CanonicalPathError::Terminal("Unable to make HEAD request to Reddit.".to_string()))?;
 	let status = res.status().as_u16();
 	let policy_error = res.headers().get(wreq_header::RETRY_AFTER).is_some();
 
@@ -1951,7 +2015,7 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 		301 => match res.headers().get(wreq_header::LOCATION) {
 			Some(val) => {
 				let Ok(original) = val.to_str() else {
-					return Err("Unable to decode Location header.".to_string());
+					return Err(CanonicalPathError::Terminal("Unable to decode Location header.".to_string()));
 				};
 
 				// We need to strip the .json suffix from the original path.
@@ -1968,7 +2032,7 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 				let uri = format_url(stripped_uri);
 
 				// Decrement tries and try again
-				canonical_path(uri, tries - 1).await
+				canonical_path_on_lane(uri, tries - 1, lane).await
 			}
 			None => Ok(None),
 		},
@@ -1978,10 +2042,10 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 		300..=399 => Ok(None),
 
 		// Rate limiting
-		429 => Err("Too many requests.".to_string()),
+		429 => Err(CanonicalPathError::Terminal("Too many requests.".to_string())),
 
 		// Special condition rate limiting - https://github.com/redlib-org/redlib/issues/229
-		403 if policy_error => Err("Too many requests.".to_string()),
+		403 if policy_error => Err(CanonicalPathError::Terminal("Too many requests.".to_string())),
 
 		_ => Ok(
 			res
@@ -2105,13 +2169,13 @@ async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, at
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
-fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str, lane: RedditLane) -> Boxed<Result<WreqResponse, String>> {
 	CANONICAL_HEAD_SENDS.fetch_add(1, Ordering::Relaxed);
 	maybe_log_traffic_summary();
-	let Some(oauth_client) = oauth_client(RedditLane::Direct) else {
+	let Some(oauth_client) = oauth_client(lane) else {
 		return async { Err(oauth_startup_error()) }.boxed();
 	};
-	request_once(&Method::HEAD, path, quarantine, base_path, host, oauth_client, RedditLane::Direct)
+	request_once(&Method::HEAD, path, quarantine, base_path, host, oauth_client, lane)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -4465,6 +4529,29 @@ mod tests {
 		assert_eq!(select_preferred_api_lane(true, true, false), RedditLane::Direct);
 		assert_eq!(select_preferred_api_lane(true, true, true), RedditLane::Tor);
 		assert_eq!(select_preferred_api_lane(true, false, true), RedditLane::Direct);
+	}
+
+	#[test]
+	fn test_share_link_resolution_uses_lane_specific_origins() {
+		assert_eq!(
+			canonical_head_origins(RedditLane::Direct),
+			[
+				Some((ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST)),
+				Some((REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST)),
+			]
+		);
+		let tor_origin = RedditLane::Tor.auth_origin();
+		assert_eq!(canonical_head_origins(RedditLane::Tor), [Some((tor_origin.base, tor_origin.host)), None]);
+	}
+
+	#[test]
+	fn test_share_link_resolution_retries_only_direct_edge_failures_on_ready_tor() {
+		assert!(canonical_head_is_edge_rejected(403, true, false));
+		assert!(!canonical_head_is_edge_rejected(403, true, true));
+		assert!(!canonical_head_is_edge_rejected(403, false, false));
+		assert!(should_retry_canonical_on_tor(RedditLane::Direct, true));
+		assert!(!should_retry_canonical_on_tor(RedditLane::Direct, false));
+		assert!(!should_retry_canonical_on_tor(RedditLane::Tor, true));
 	}
 
 	#[test]

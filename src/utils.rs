@@ -1156,6 +1156,17 @@ fn is_reddit_image_domain(domain: &str) -> bool {
 	domain == "i.redd.it" || canonical_reddit_onion_host(domain).is_some_and(|canonical| canonical == "i.redd.it")
 }
 
+fn normalize_reddit_onion_urls(input: &str) -> String {
+	let mut normalized = input.to_string();
+	for (onion, canonical) in REDDIT_ONION_HOST_ALIASES {
+		normalized = normalized.replace(&format!("://{onion}/"), &format!("://{canonical}/"));
+	}
+	normalized.replace(
+		&format!("://{REDDIT_STATIC_ONION_HOST}/"),
+		"://www.redditstatic.com/",
+	)
+}
+
 /// Direct urls to proxy if proxy is enabled
 pub fn format_url(url: &str) -> String {
 	if url.is_empty() || url == "self" || url == "default" || url == "nsfw" || url == "spoiler" {
@@ -1246,9 +1257,10 @@ static REDLIB_PREVIEW_TEXT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(
 
 /// Rewrite Reddit links to Redlib in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
+	let normalized = normalize_reddit_onion_urls(input_text);
 	let mut text1 =
 		// Rewrite Reddit links to Redlib
-		REDDIT_REGEX.replace_all(input_text, r#"href="/"#).to_string();
+		REDDIT_REGEX.replace_all(&normalized, r#"href="/"#).to_string();
 
 	loop {
 		let Some(reddit_static_url) = REDDIT_EMOJI_REGEX.find(&text1).map(|matched| matched.as_str()) else {
@@ -1724,6 +1736,18 @@ mod tests {
 				"<a href=\"https://www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/r/rust/\">Rust</a> <img src=\"https://www.reddittic34i5gtjcnm2fb7fv2eyop4vbxquuc36prnbs7d2kp3saoqd.onion/icon.png\">"
 			),
 			"<a href=\"/r/rust/\">Rust</a> <img src=\"/static/icon.png\">"
+		);
+	}
+
+	#[test]
+	fn rewrite_urls_normalizes_visible_reddit_onion_share_links() {
+		let onion = "www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion";
+		let input = format!(
+			"<a href=\"https://{onion}/r/Addons4Kodi/s/oAQidw0e6Z\">https://{onion}/r/Addons4Kodi/s/oAQidw0e6Z</a>"
+		);
+		assert_eq!(
+			rewrite_urls(&input),
+			"<a href=\"/r/Addons4Kodi/s/oAQidw0e6Z\">https://www.reddit.com/r/Addons4Kodi/s/oAQidw0e6Z</a>"
 		);
 	}
 
