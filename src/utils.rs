@@ -1161,10 +1161,7 @@ fn normalize_reddit_onion_urls(input: &str) -> String {
 	for (onion, canonical) in REDDIT_ONION_HOST_ALIASES {
 		normalized = normalized.replace(&format!("://{onion}/"), &format!("://{canonical}/"));
 	}
-	normalized.replace(
-		&format!("://{REDDIT_STATIC_ONION_HOST}/"),
-		"://www.redditstatic.com/",
-	)
+	normalized.replace(&format!("://{REDDIT_STATIC_ONION_HOST}/"), "://www.redditstatic.com/")
 }
 
 /// Direct urls to proxy if proxy is enabled
@@ -1742,9 +1739,7 @@ mod tests {
 	#[test]
 	fn rewrite_urls_normalizes_visible_reddit_onion_share_links() {
 		let onion = "www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion";
-		let input = format!(
-			"<a href=\"https://{onion}/r/Addons4Kodi/s/oAQidw0e6Z\">https://{onion}/r/Addons4Kodi/s/oAQidw0e6Z</a>"
-		);
+		let input = format!("<a href=\"https://{onion}/r/Addons4Kodi/s/oAQidw0e6Z\">https://{onion}/r/Addons4Kodi/s/oAQidw0e6Z</a>");
 		assert_eq!(
 			rewrite_urls(&input),
 			"<a href=\"/r/Addons4Kodi/s/oAQidw0e6Z\">https://www.reddit.com/r/Addons4Kodi/s/oAQidw0e6Z</a>"

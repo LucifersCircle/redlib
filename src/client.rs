@@ -1724,10 +1724,7 @@ fn canonical_head_origins(lane: RedditLane) -> [Option<(&'static str, &'static s
 }
 
 fn canonical_head_is_edge_rejected(status: u16, retry_after_present: bool, quota_headers_present: bool) -> bool {
-	matches!(
-		classify_throttle_response(status, retry_after_present, quota_headers_present),
-		Some(ThrottleKind::Edge)
-	)
+	matches!(classify_throttle_response(status, retry_after_present, quota_headers_present), Some(ThrottleKind::Edge))
 }
 
 fn should_retry_canonical_on_tor(lane: RedditLane, tor_ready: bool) -> bool {
@@ -1958,9 +1955,7 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 	match canonical_path_on_lane(path.clone(), tries, lane).await {
 		Err(CanonicalPathError::RetryOnTor(_)) if should_retry_canonical_on_tor(lane, tor_fallback_ready()) => {
 			info!("Retrying Reddit share-link resolution on the Tor lane");
-			canonical_path_on_lane(path, tries, RedditLane::Tor)
-				.await
-				.map_err(CanonicalPathError::into_message)
+			canonical_path_on_lane(path, tries, RedditLane::Tor).await.map_err(CanonicalPathError::into_message)
 		}
 		Ok(path) => Ok(path),
 		Err(error) => Err(error.into_message()),
@@ -1998,9 +1993,7 @@ async fn canonical_path_on_lane(path: String, tries: i8, lane: RedditLane) -> Re
 	}
 
 	if !non_client_response && (edge_rejected || res.is_none() && request_failed) {
-		return Err(CanonicalPathError::RetryOnTor(
-			"Unable to resolve Reddit share link on the current lane.".to_string(),
-		));
+		return Err(CanonicalPathError::RetryOnTor("Unable to resolve Reddit share link on the current lane.".to_string()));
 	}
 
 	let res = res.ok_or_else(|| CanonicalPathError::Terminal("Unable to make HEAD request to Reddit.".to_string()))?;
