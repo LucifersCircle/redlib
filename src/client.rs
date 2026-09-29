@@ -1043,10 +1043,7 @@ enum ThrottleKind {
 #[derive(Debug)]
 enum ApiRequestError {
 	Deferred { message: String, edge_rejected: bool },
-	TorQuotaRefreshWait {
-		message: String,
-		ticket: QuotaRefreshWaitTicket,
-	},
+	TorQuotaRefreshWait { message: String, ticket: QuotaRefreshWaitTicket },
 	Upstream(String),
 }
 
@@ -1714,7 +1711,9 @@ fn reserve_redirect_hop(
 						source: "quota_reserve",
 					},
 					Some(guard.quota.epoch),
-					allow_quota_refresh.then(|| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency)).flatten(),
+					allow_quota_refresh
+						.then(|| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency))
+						.flatten(),
 				),
 				QuotaReserveError::StaleGeneration => (
 					AdmissionDenied {
@@ -1728,8 +1727,8 @@ fn reserve_redirect_hop(
 					None,
 				),
 			};
-			let refresh_was_in_progress = attempt.lane == RedditLane::Tor
-				&& denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
+			let refresh_was_in_progress =
+				attempt.lane == RedditLane::Tor && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
 			drop(guard);
 			let emergency_started = emergency_ticket
 				.filter(|_| is_current_oauth_generation(attempt.lane, generation))
@@ -2709,16 +2708,8 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 	let mut tor_refresh = TorQuotaRefreshRetryState::default();
 	loop {
 		let timeout_override = (transport_retries > 0 || cooldown_waits > 0).then_some(TRANSPORT_RETRY_TIMEOUT);
-		let (result, tor_retry_reason, recovery_reason) = json_uncached_on_lane_with_options(
-			path.clone(),
-			quarantine,
-			lane,
-			AdmissionRetryMode::Bounded,
-			timeout_override,
-			None,
-			&mut tor_refresh,
-		)
-		.await;
+		let (result, tor_retry_reason, recovery_reason) =
+			json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None, &mut tor_refresh).await;
 		let delay = match recovery_reason {
 			LaneRecoveryReason::TorQuotaRefreshWait(ticket) => {
 				if !tor_refresh.claim_redirect_replay(lane, ticket, Instant::now()) {
@@ -3462,7 +3453,10 @@ mod tests {
 			Some(Duration::from_millis(50))
 		);
 		assert_eq!(local_quota_retry_delay(&denied, 0, TOR_QUOTA_REFRESH_RETRY_BUDGET, AdmissionRetryMode::Bounded, true), None);
-		assert_eq!(local_quota_retry_delay(&denied, MAX_TOR_QUOTA_REFRESH_RETRIES, Duration::ZERO, AdmissionRetryMode::Bounded, true), None);
+		assert_eq!(
+			local_quota_retry_delay(&denied, MAX_TOR_QUOTA_REFRESH_RETRIES, Duration::ZERO, AdmissionRetryMode::Bounded, true),
+			None
+		);
 		assert_eq!(local_quota_retry_delay(&denied, 0, Duration::ZERO, AdmissionRetryMode::Immediate, true), None);
 
 		// A failed/finished refresh, another generation, or another quota window
