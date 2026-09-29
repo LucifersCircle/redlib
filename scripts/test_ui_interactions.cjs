@@ -34,6 +34,7 @@ class Element extends Events {
     constructor(tag = 'div', attributes = {}) {
         super();
         this.tag = tag;
+        this.tagName = tag.toUpperCase();
         this.attributes = { ...attributes };
         this.dataset = {};
         this.children = [];
@@ -63,6 +64,7 @@ class Element extends Events {
         };
         this.clientWidth = 0;
         this.getBoundingClientRect = () => ({ width: this.clientWidth, height: 0 });
+        this.getClientRects = () => [this.getBoundingClientRect()];
         for (const [name, value] of Object.entries(attributes)) {
             if (name.startsWith('data-')) this.dataset[this.dataKey(name)] = value;
         }
@@ -70,6 +72,10 @@ class Element extends Events {
 
     dataKey(name) {
         return name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+    }
+
+    get isConnected() {
+        return this.tag === 'body' || Boolean(this.parentElement && this.parentElement.isConnected);
     }
 
     removeAttribute(name) {
@@ -87,9 +93,11 @@ class Element extends Events {
 
     matches(selector) {
         if (selector.startsWith('.')) return this.classList.contains(selector.slice(1));
-        const match = selector.match(/^(\w+)?(?:\[([^\]]+)\])?$/);
+        const match = selector.match(/^(\w+)?(?:\.([\w-]+))?(?:\[([^\]]+)\])?$/);
         assert.ok(match, `Unsupported test selector: ${selector}`);
-        return (!match[1] || match[1] === this.tag) && (!match[2] || match[2] in this.attributes);
+        return (!match[1] || match[1] === this.tag)
+            && (!match[2] || this.classList.contains(match[2]))
+            && (!match[3] || match[3] in this.attributes);
     }
 
     querySelectorAll(selector) {
@@ -120,6 +128,7 @@ function browser({ coarse = false, readyState = 'complete', intersection = false
     document.body = new Element('body');
     document.readyState = readyState;
     document.querySelectorAll = selector => document.body.querySelectorAll(selector);
+    document.querySelector = selector => document.body.querySelector(selector);
     window.matchMedia = () => ({ matches: coarse });
     window.innerHeight = 1000;
     if (visualViewportHeight > 0) window.visualViewport = { height: visualViewportHeight };
@@ -716,4 +725,161 @@ test('unrelated and non-element click targets are left alone', () => {
     const env = spoilerFixture({ coarse: true });
     assert.equal(env.tap(new Element('a')).defaultPrevented, false);
     assert.equal(env.tap({}).defaultPrevented, false);
+});
+
+function commentFixture({ previousTop = -2400, finalTop = -2400, navbarBottom = 0, viewportTop = 0 } = {}) {
+    const env = browser();
+    const comment = new Element('div', { class: 'comment' });
+    const details = new Element('details', { class: 'comment_right' });
+    const summary = new Element('summary', { class: 'comment_data' });
+    const rail = new Element('div', { class: 'comment_collapse' });
+    const author = new Element('a');
+    details.open = true;
+    summary.append(author, rail);
+    details.append(summary);
+    comment.append(details);
+    env.document.body.append(comment);
+    if (navbarBottom) {
+        const navbar = new Element('nav', { class: 'fixed_navbar' });
+        navbar.getBoundingClientRect = () => ({ bottom: navbarBottom });
+        env.document.body.append(navbar);
+    }
+    env.window.visualViewport = { offsetTop: viewportTop, height: 600 };
+    env.window.scrollX = 17;
+    env.window.scrollY = 3000;
+    const scrolls = [];
+    env.window.scrollTo = (x, y) => {
+        scrolls.push({ x, y });
+        env.window.scrollX = x;
+        env.window.scrollY = y;
+    };
+    summary.getBoundingClientRect = () => ({
+        top: (details.open ? previousTop : finalTop) - (env.window.scrollY - 3000),
+        height: 25,
+    });
+    env.run('comments.js');
+    function activate(target = rail, properties = {}) {
+        const event = env.document.emit('click', { target, detail: 1, button: 0, ...properties });
+        // Explicitly model the native default action, which the doubles lack.
+        // The script must not toggle the disclosure or consume the click itself.
+        assert.equal(details.open, true);
+        if (!event.defaultPrevented) details.open = false;
+        return event;
+    }
+    return { ...env, comment, details, summary, rail, author, scrolls, activate };
+}
+
+test('collapsing a long comment rail restores its parent heading and keeps horizontal position', () => {
+    const env = commentFixture();
+    const event = env.activate();
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(event.propagationStopped, false);
+    assert.equal(env.scrolls.length, 0);
+    assert.equal(env.flushFrames(), 1);
+    assert.equal(env.details.open, false);
+    assert.equal(env.summary.getBoundingClientRect().top, 8);
+    assert.deepEqual(env.scrolls, [{ x: 17, y: 592 }]);
+    assert.equal(env.flushFrames(), 0);
+});
+
+test('collapse anchoring preserves a visible heading and corrects native scroll adjustment', () => {
+    const unchanged = commentFixture({ previousTop: 140, finalTop: 140 });
+    unchanged.activate();
+    unchanged.flushFrames();
+    assert.deepEqual(unchanged.scrolls, []);
+
+    const adjusted = commentFixture({ previousTop: 140, finalTop: 320 });
+    adjusted.activate();
+    adjusted.flushFrames();
+    assert.equal(adjusted.summary.getBoundingClientRect().top, 140);
+    assert.deepEqual(adjusted.scrolls, [{ x: 17, y: 3180 }]);
+});
+
+test('collapse anchoring measures fixed navigation and the mobile visual viewport', () => {
+    for (const [navbarBottom, viewportTop, expectedTop] of [[94, 0, 102], [94, 120, 128], [0, 28, 36]]) {
+        const env = commentFixture({ previousTop: -1000, finalTop: -600, navbarBottom, viewportTop });
+        env.activate();
+        env.flushFrames();
+        assert.equal(env.summary.getBoundingClientRect().top, expectedTop);
+    }
+    const fallback = commentFixture();
+    delete fallback.window.visualViewport;
+    fallback.activate();
+    fallback.flushFrames();
+    assert.equal(fallback.summary.getBoundingClientRect().top, 8);
+});
+
+test('clicking a nested rail anchors only its direct parent, not an ancestor', () => {
+    const env = commentFixture();
+    const parent = new Element('details', { class: 'comment_right' });
+    parent.open = true;
+    parent.append(env.comment);
+    env.document.body.append(parent);
+    env.activate();
+    env.flushFrames();
+    assert.equal(parent.open, true);
+    assert.equal(env.details.open, false);
+    assert.equal(env.summary.getBoundingClientRect().top, 8);
+});
+
+test('expansion, keyboard summary activation, links and unrelated disclosures do not anchor', () => {
+    const env = commentFixture();
+    for (const target of [env.summary, env.author, new Element('summary'), {}]) {
+        const event = env.document.emit('click', { target, detail: 1, button: 0 });
+        assert.equal(event.defaultPrevented, false);
+    }
+    env.document.emit('click', { target: env.summary, detail: 0, button: 0 });
+    env.details.open = false;
+    const expansion = env.document.emit('click', { target: env.rail, detail: 1, button: 0 });
+    assert.equal(expansion.defaultPrevented, false);
+    env.details.open = true;
+    assert.equal(env.flushFrames(), 0);
+    assert.deepEqual(env.scrolls, []);
+});
+
+test('canceled or non-primary rail clicks do not schedule collapse correction', () => {
+    const env = commentFixture();
+    for (const properties of [{ defaultPrevented: true }, { button: 1 }, { button: 2 }, { detail: 0 }]) {
+        env.document.emit('click', { target: env.rail, detail: 1, button: 0, ...properties });
+    }
+    assert.equal(env.flushFrames(), 0);
+    assert.equal(env.details.open, true);
+
+    const canceled = env.activate();
+    canceled.preventDefault();
+    env.flushFrames();
+    assert.deepEqual(env.scrolls, []);
+});
+
+test('stale collapse frames cannot scroll reopened, detached or ancestor-hidden comments', () => {
+    for (const state of ['reopened', 'detached', 'hidden']) {
+        const env = commentFixture();
+        env.activate();
+        if (state === 'reopened') env.details.open = true;
+        if (state === 'detached') env.comment.parentElement = null;
+        if (state === 'hidden') env.summary.getClientRects = () => [];
+        env.flushFrames();
+        assert.deepEqual(env.scrolls, [], state);
+    }
+});
+
+test('a newer rail collapse supersedes pending anchoring from a previous click', () => {
+    const env = commentFixture();
+    env.activate();
+    // Reopen and collapse again before the first animation frame can run.
+    env.details.open = true;
+    env.activate();
+    assert.equal(env.flushFrames(), 2);
+    assert.equal(env.scrolls.length, 1);
+    assert.equal(env.summary.getBoundingClientRect().top, 8);
+});
+
+test('touch dragging along a rail does not trigger collapse anchoring', () => {
+    const env = commentFixture();
+    env.document.emit('pointerdown', { target: env.rail, pointerType: 'touch', clientY: 250 });
+    env.document.emit('pointermove', { target: env.rail, pointerType: 'touch', clientY: 50 });
+    env.document.emit('pointerup', { target: env.rail, pointerType: 'touch', clientY: 50 });
+    assert.equal(env.details.open, true);
+    assert.equal(env.flushFrames(), 0);
+    assert.deepEqual(env.scrolls, []);
 });
