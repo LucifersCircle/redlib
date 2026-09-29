@@ -49,6 +49,11 @@ const MAX_CONFIGURED_API_REQUESTS: usize = 64;
 const FAILURE_WINDOW: Duration = Duration::from_secs(10);
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 const FAILURE_THRESHOLD: u8 = 3;
+const MAX_TRANSPORT_RETRIES: u8 = 2;
+const TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const TRANSPORT_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_UPSTREAM_COOLDOWN_WAITS: u8 = 1;
+const UPSTREAM_RECOVERY_BUDGET: Duration = Duration::from_secs(15);
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
@@ -152,6 +157,13 @@ enum TorRetryReason {
 	None,
 	EdgeRejected,
 	QuotaReserve(QuotaSpilloverTicket),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LaneRecoveryReason {
+	None,
+	TransportFailure,
+	UpstreamCooldown(Duration),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2515,7 +2527,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 		TorRetryReason::QuotaReserve(ticket) => {
 			TOR_QUOTA_SPILLOVER_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 			info!("Trying one bounded Tor request after direct quota reserve exhaustion: endpoint={}", endpoint_class(&path));
-			let (tor_result, _) = json_uncached_on_lane_with_options(
+			let (tor_result, _, _) = json_uncached_on_lane_with_options(
 				path.clone(),
 				quarantine,
 				RedditLane::Tor,
@@ -2554,12 +2566,77 @@ fn should_retry_on_tor(lane: RedditLane, reason: TorRetryReason, tor_ready: bool
 	}
 }
 
-fn request_timeout_is_transport_failure(timeout_override: Option<Duration>) -> bool {
-	timeout_override.is_none()
+fn transport_retry_delay(retry_count: u8) -> Option<Duration> {
+	(retry_count < MAX_TRANSPORT_RETRIES).then(|| TRANSPORT_RETRY_BASE_DELAY.saturating_mul(1_u32 << retry_count))
+}
+
+fn upstream_cooldown_retry_delay(delay: Duration, wait_count: u8, elapsed: Duration) -> Option<Duration> {
+	if wait_count >= MAX_UPSTREAM_COOLDOWN_WAITS || elapsed >= UPSTREAM_RECOVERY_BUDGET {
+		return None;
+	}
+	let remaining = UPSTREAM_RECOVERY_BUDGET.saturating_sub(elapsed);
+	(delay <= remaining).then_some(delay)
+}
+
+fn request_timeout_is_transport_failure(quota_spillover: bool) -> bool {
+	!quota_spillover
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
-	json_uncached_on_lane_with_options(path, quarantine, lane, AdmissionRetryMode::Bounded, None, None).await
+	let recovery_started = Instant::now();
+	let mut transport_retries = 0;
+	let mut cooldown_waits = 0;
+	loop {
+		let timeout_override = (transport_retries > 0 || cooldown_waits > 0).then_some(TRANSPORT_RETRY_TIMEOUT);
+		let (result, tor_retry_reason, recovery_reason) =
+			json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None).await;
+		let delay = match recovery_reason {
+			LaneRecoveryReason::TransportFailure => {
+				let Some(delay) = transport_retry_delay(transport_retries) else {
+					return (result, tor_retry_reason);
+				};
+				transport_retries = transport_retries.saturating_add(1);
+				warn!(
+					"Retrying transient Reddit transport failure on the same lane: lane={} endpoint={} retry={}/{} delay_milliseconds={}",
+					lane.label(),
+					endpoint_class(&path),
+					transport_retries,
+					MAX_TRANSPORT_RETRIES,
+					delay.as_millis(),
+				);
+				delay
+			}
+			LaneRecoveryReason::UpstreamCooldown(delay) => {
+				let elapsed = Instant::now().saturating_duration_since(recovery_started);
+				let Some(delay) = upstream_cooldown_retry_delay(delay, cooldown_waits, elapsed) else {
+					return (result, tor_retry_reason);
+				};
+				cooldown_waits = cooldown_waits.saturating_add(1);
+				info!(
+					"Waiting through transient Reddit upstream cooldown before retrying server-side: lane={} endpoint={} wait={}/{} delay_milliseconds={}",
+					lane.label(),
+					endpoint_class(&path),
+					cooldown_waits,
+					MAX_UPSTREAM_COOLDOWN_WAITS,
+					delay.as_millis(),
+				);
+				delay
+			}
+			LaneRecoveryReason::None => {
+				if result.is_ok() && (transport_retries > 0 || cooldown_waits > 0) {
+					info!(
+						"Server-side Reddit transport recovery succeeded: lane={} endpoint={} transport_retries={} cooldown_waits={}",
+						lane.label(),
+						endpoint_class(&path),
+						transport_retries,
+						cooldown_waits,
+					);
+				}
+				return (result, tor_retry_reason);
+			}
+		};
+		tokio::time::sleep(delay).await;
+	}
 }
 
 async fn json_uncached_on_lane_with_options(
@@ -2569,7 +2646,7 @@ async fn json_uncached_on_lane_with_options(
 	admission_mode: AdmissionRetryMode,
 	timeout_override: Option<Duration>,
 	quota_spillover_ticket: Option<QuotaSpilloverTicket>,
-) -> (Result<Value, String>, TorRetryReason) {
+) -> (Result<Value, String>, TorRetryReason, LaneRecoveryReason) {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
@@ -2581,20 +2658,36 @@ async fn json_uncached_on_lane_with_options(
 	let _permit = if quota_spillover_ticket.is_some() {
 		match api_concurrency(lane).try_acquire() {
 			Ok(permit) => permit,
-			Err(_) => return (Err("Tor quota spillover skipped while transport capacity was busy".to_string()), TorRetryReason::None),
+			Err(_) => {
+				return (
+					Err("Tor quota spillover skipped while transport capacity was busy".to_string()),
+					TorRetryReason::None,
+					LaneRecoveryReason::None,
+				)
+			}
 		}
 	} else {
 		match tokio::time::timeout_at(request_deadline, api_concurrency(lane).acquire()).await {
 			Ok(Ok(permit)) => permit,
-			Ok(Err(_)) => return (Err("Reddit request limiter is unavailable".to_string()), TorRetryReason::None),
-			Err(_) => return (Err("Reddit API request timed out while waiting for transport capacity".to_string()), TorRetryReason::None),
+			Ok(Err(_)) => return (Err("Reddit request limiter is unavailable".to_string()), TorRetryReason::None, LaneRecoveryReason::None),
+			Err(_) => {
+				return (
+					Err("Reddit API request timed out while waiting for transport capacity".to_string()),
+					TorRetryReason::None,
+					LaneRecoveryReason::None,
+				)
+			}
 		}
 	};
 	if let Some(ticket) = quota_spillover_ticket {
 		debug_assert_eq!(lane, RedditLane::Tor);
 		debug_assert_eq!(admission_mode, AdmissionRetryMode::Immediate);
 		if !direct_quota_spillover_valid(ticket, Instant::now()) {
-			return (Err("Tor quota spillover skipped because direct-lane state changed".to_string()), TorRetryReason::None);
+			return (
+				Err("Tor quota spillover skipped because direct-lane state changed".to_string()),
+				TorRetryReason::None,
+				LaneRecoveryReason::None,
+			);
 		}
 	}
 
@@ -2609,7 +2702,12 @@ async fn json_uncached_on_lane_with_options(
 			} else {
 				denied.quota_spillover.map_or(TorRetryReason::None, TorRetryReason::QuotaReserve)
 			};
-			return (Err(denied.message), retry_reason);
+			let recovery_reason = denied
+				.admission
+				.as_ref()
+				.filter(|admission| admission.reason == CooldownReason::UpstreamFailures)
+				.map_or(LaneRecoveryReason::None, |admission| LaneRecoveryReason::UpstreamCooldown(admission.delay));
+			return (Err(denied.message), retry_reason, recovery_reason);
 		}
 	};
 	let request_generation = oauth_client.generation;
@@ -2618,6 +2716,7 @@ async fn json_uncached_on_lane_with_options(
 	record_admitted_json(&path);
 	let timeout_path = path.clone();
 	let mut retry_reason = TorRetryReason::None;
+	let mut recovery_reason = LaneRecoveryReason::None;
 
 	// Fetch the url...
 	let result = tokio::time::timeout_at(request_deadline, async {
@@ -2799,7 +2898,10 @@ async fn json_uncached_on_lane_with_options(
 						}
 					}
 					Err(e) => {
-					record_upstream_failure(lane, "body_transport", Some(status.as_u16()), &path, request_generation);
+						record_upstream_failure(lane, "body_transport", Some(status.as_u16()), &path, request_generation);
+						if quota_spillover_ticket.is_none() {
+							recovery_reason = LaneRecoveryReason::TransportFailure;
+						}
 						err("Failed receiving body from Reddit", e.to_string(), path)
 					}
 				}
@@ -2814,7 +2916,10 @@ async fn json_uncached_on_lane_with_options(
 				Err(message)
 			}
 			Err(ApiRequestError::Upstream(error)) => {
-			record_upstream_failure(lane, "request_transport", None, &path, request_generation);
+				record_upstream_failure(lane, "request_transport", None, &path, request_generation);
+				if quota_spillover_ticket.is_none() {
+					recovery_reason = LaneRecoveryReason::TransportFailure;
+				}
 				err("Couldn't send request to Reddit", error, path)
 			}
 		}
@@ -2824,15 +2929,16 @@ async fn json_uncached_on_lane_with_options(
 	let result = match result {
 		Ok(result) => result,
 		Err(_) => {
-			if request_timeout_is_transport_failure(timeout_override) {
+			if request_timeout_is_transport_failure(quota_spillover_ticket.is_some()) {
 				record_upstream_failure(lane, "request_timeout", None, &timeout_path, request_generation);
+				recovery_reason = LaneRecoveryReason::TransportFailure;
 			} else {
 				info!("Bounded Tor quota spillover reached its latency budget: endpoint={}", endpoint_class(&timeout_path));
 			}
 			Err(format!("Reddit API request timed out after {} seconds", request_timeout.as_secs()))
 		}
 	};
-	(result, retry_reason)
+	(result, retry_reason, recovery_reason)
 }
 
 async fn self_check_on_lane(sub: &str, lane: RedditLane) -> Result<(), String> {
@@ -3281,8 +3387,30 @@ mod tests {
 	#[test]
 	fn test_quota_spillover_keeps_total_local_wait_bounded() {
 		assert_eq!(LOCAL_QUOTA_RETRY_BUDGET + TOR_QUOTA_SPILLOVER_TIMEOUT, Duration::from_secs(5));
-		assert!(request_timeout_is_transport_failure(None));
-		assert!(!request_timeout_is_transport_failure(Some(TOR_QUOTA_SPILLOVER_TIMEOUT)));
+		assert!(request_timeout_is_transport_failure(false));
+		assert!(!request_timeout_is_transport_failure(true));
+	}
+
+	#[test]
+	fn test_transport_retries_are_short_and_bounded() {
+		assert_eq!(transport_retry_delay(0), Some(Duration::from_millis(250)));
+		assert_eq!(transport_retry_delay(1), Some(Duration::from_millis(500)));
+		assert_eq!(transport_retry_delay(MAX_TRANSPORT_RETRIES), None);
+		assert!(TRANSPORT_RETRY_TIMEOUT < RedditLane::Tor.request_timeout());
+	}
+
+	#[test]
+	fn test_upstream_cooldown_wait_is_server_side_and_bounded() {
+		assert_eq!(
+			upstream_cooldown_retry_delay(Duration::from_secs(12), 0, Duration::from_secs(1)),
+			Some(Duration::from_secs(12))
+		);
+		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(15), 0, Duration::from_secs(1)), None);
+		assert_eq!(
+			upstream_cooldown_retry_delay(Duration::from_secs(1), MAX_UPSTREAM_COOLDOWN_WAITS, Duration::ZERO),
+			None
+		);
+		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), 0, UPSTREAM_RECOVERY_BUDGET), None);
 	}
 
 	#[test]
