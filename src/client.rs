@@ -64,6 +64,10 @@ const QUOTA_SAFETY_RESERVE: u16 = 5;
 const LOCAL_QUOTA_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const LOCAL_QUOTA_RETRY_INTERVAL: Duration = Duration::from_millis(650);
 const MAX_LOCAL_QUOTA_RETRIES: u8 = 3;
+// Tor token creation can take several seconds. Extend only a wait owned by an
+// active quota refresh; ordinary quota resets still use the short local budget.
+const TOR_QUOTA_REFRESH_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const MAX_TOR_QUOTA_REFRESH_RETRIES: u8 = 16;
 const TOR_QUOTA_SPILLOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const EMERGENCY_QUOTA_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const OAUTH_STARTUP_RETRY: Duration = Duration::from_secs(5);
@@ -164,6 +168,7 @@ enum LaneRecoveryReason {
 	None,
 	TransportFailure,
 	UpstreamCooldown(Duration),
+	TorQuotaRefreshWait(QuotaRefreshWaitTicket),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1038,6 +1043,10 @@ enum ThrottleKind {
 #[derive(Debug)]
 enum ApiRequestError {
 	Deferred { message: String, edge_rejected: bool },
+	TorQuotaRefreshWait {
+		message: String,
+		ticket: QuotaRefreshWaitTicket,
+	},
 	Upstream(String),
 }
 
@@ -1432,6 +1441,40 @@ struct BeginAttemptDenied {
 	message: String,
 	edge_deferred: bool,
 	quota_spillover: Option<QuotaSpilloverTicket>,
+	tor_quota_refresh: Option<QuotaRefreshWaitTicket>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct QuotaRefreshWaitTicket {
+	generation: u64,
+	quota_epoch: u64,
+}
+
+// Shared by admission and the one permitted redirect replay. A transport retry
+// must not silently start another ten-second refresh wait or refresh identity.
+#[derive(Debug, Default)]
+struct TorQuotaRefreshRetryState {
+	owner: Option<QuotaRefreshWaitTicket>,
+	started: Option<Instant>,
+	timed_retries: u8,
+	redirect_replayed: bool,
+}
+
+impl TorQuotaRefreshRetryState {
+	fn claim_redirect_replay(&mut self, lane: RedditLane, ticket: QuotaRefreshWaitTicket, now: Instant) -> bool {
+		if lane != RedditLane::Tor
+			|| self.redirect_replayed
+			|| self.owner.is_some_and(|owner| owner != ticket)
+			|| self.started.is_some_and(|started| now.saturating_duration_since(started) >= TOR_QUOTA_REFRESH_RETRY_BUDGET)
+			|| self.timed_retries >= MAX_TOR_QUOTA_REFRESH_RETRIES
+		{
+			return false;
+		}
+		self.owner.get_or_insert(ticket);
+		self.started.get_or_insert(now);
+		self.redirect_replayed = true;
+		true
+	}
 }
 
 fn quota_spillover_ticket(lane: RedditLane, denial: AdmissionDenied, short_refresh_retry: bool, generation: u64, quota_epoch: Option<u64>) -> Option<QuotaSpilloverTicket> {
@@ -1446,15 +1489,31 @@ enum AdmissionRetryMode {
 	Immediate,
 }
 
-fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed: Duration, mode: AdmissionRetryMode) -> Option<Duration> {
+fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed: Duration, mode: AdmissionRetryMode, tor_refresh_wait: bool) -> Option<Duration> {
 	if mode == AdmissionRetryMode::Immediate {
 		return None;
 	}
 	let admission = denied.admission.as_ref()?;
-	if !admission.local_quota_retry || retry_count >= MAX_LOCAL_QUOTA_RETRIES || elapsed >= LOCAL_QUOTA_RETRY_BUDGET {
+	let (budget, max_retries) = if tor_refresh_wait {
+		(TOR_QUOTA_REFRESH_RETRY_BUDGET, MAX_TOR_QUOTA_REFRESH_RETRIES)
+	} else {
+		(LOCAL_QUOTA_RETRY_BUDGET, MAX_LOCAL_QUOTA_RETRIES)
+	};
+	if !admission.local_quota_retry || retry_count >= max_retries || elapsed >= budget {
 		return None;
 	}
-	Some(admission.delay.min(LOCAL_QUOTA_RETRY_INTERVAL).min(LOCAL_QUOTA_RETRY_BUDGET.saturating_sub(elapsed)))
+	Some(admission.delay.min(LOCAL_QUOTA_RETRY_INTERVAL).min(budget.saturating_sub(elapsed)))
+}
+
+fn matching_tor_quota_refresh_wait(lane: RedditLane, owner: &mut Option<QuotaRefreshWaitTicket>, denied: &BeginAttemptDenied) -> bool {
+	if lane != RedditLane::Tor || !denied.admission.is_some_and(|admission| admission.source == "quota_reserve" && admission.reserve_exhausted) {
+		return false;
+	}
+	let Some(ticket) = denied.tor_quota_refresh else {
+		return false;
+	};
+	// Never restart the budget or adopt another identity's refresh mid-wait.
+	*owner.get_or_insert(ticket) == ticket
 }
 
 fn local_quota_retry_count_after_wait(retry_count: u8, timer_elapsed: bool) -> u8 {
@@ -1489,11 +1548,15 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> R
 		message: oauth_startup_error(),
 		edge_deferred: false,
 		quota_spillover: None,
+		tor_quota_refresh: None,
 	})?;
 	let generation = oauth_client.generation;
 	let now = Instant::now();
 	let result = guard.try_admit(now, generation);
 	let denied_quota_epoch = result.as_ref().err().filter(|denial| denial.reserve_exhausted).map(|_| guard.quota.epoch);
+	// Capture ownership with the denied generation still locked. A refresh can
+	// install its replacement between dropping this guard and formatting denial.
+	let refresh_was_in_progress = lane == RedditLane::Tor && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(lane, generation, quota_epoch));
 	let emergency_ticket = allow_quota_refresh
 		.then(|| {
 			result
@@ -1509,7 +1572,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> R
 			.filter(|_| is_current_oauth_generation(lane, generation))
 			.is_some_and(spawn_rate_limit_refresh);
 		let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(lane, generation, quota_epoch));
-		let short_refresh_retry = emergency_started || matching_refresh_in_progress;
+		let short_refresh_retry = emergency_started || refresh_was_in_progress || matching_refresh_in_progress;
 		if emergency_started {
 			let reset_remaining = denial.delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
 			warn!(
@@ -1524,17 +1587,24 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> R
 			message,
 			admission: Some(denial),
 			quota_spillover,
+			tor_quota_refresh: denied_quota_epoch
+				.filter(|_| lane == RedditLane::Tor && short_refresh_retry)
+				.map(|quota_epoch| QuotaRefreshWaitTicket { generation, quota_epoch }),
 		}
 	})
 }
 
-async fn begin_upstream_attempt(lane: RedditLane, mode: AdmissionRetryMode) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
+async fn begin_upstream_attempt(
+	lane: RedditLane,
+	mode: AdmissionRetryMode,
+	tor_refresh: &mut TorQuotaRefreshRetryState,
+) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
 	let started = Instant::now();
 	let mut retry_count = 0;
 	let mut retry_source = "none";
 	loop {
 		let quota_changed = quota_notify(lane).notified();
-		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded) {
+		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded && tor_refresh.owner.is_none()) {
 			Ok(attempt) => {
 				if retry_count > 0 {
 					info!(
@@ -1548,8 +1618,20 @@ async fn begin_upstream_attempt(lane: RedditLane, mode: AdmissionRetryMode) -> R
 				return Ok(attempt);
 			}
 			Err(denied) => {
-				let elapsed = Instant::now().saturating_duration_since(started);
-				let Some(delay) = local_quota_retry_delay(&denied, retry_count, elapsed, mode) else {
+				let now = Instant::now();
+				let elapsed = now.saturating_duration_since(started);
+				let tor_refresh_wait = matching_tor_quota_refresh_wait(lane, &mut tor_refresh.owner, &denied);
+				let (budget_retries, budget_elapsed) = if tor_refresh_wait {
+					if tor_refresh.started.is_none() {
+						tor_refresh.started = Some(started);
+						tor_refresh.timed_retries = retry_count;
+					}
+					let wait_started = tor_refresh.started.unwrap_or(started);
+					(tor_refresh.timed_retries, now.saturating_duration_since(wait_started))
+				} else {
+					(retry_count, elapsed)
+				};
+				let Some(delay) = local_quota_retry_delay(&denied, budget_retries, budget_elapsed, mode, tor_refresh_wait) else {
 					if let Some(admission) = denied.admission {
 						record_local_denial(admission.reason);
 						if retry_count > 0 {
@@ -1567,6 +1649,9 @@ async fn begin_upstream_attempt(lane: RedditLane, mode: AdmissionRetryMode) -> R
 				retry_source = denied.admission.as_ref().map_or("unknown", |admission| admission.source);
 				let timer_elapsed = wait_for_local_quota_retry(quota_changed, delay).await;
 				retry_count = local_quota_retry_count_after_wait(retry_count, timer_elapsed);
+				if tor_refresh_wait {
+					tor_refresh.timed_retries = local_quota_retry_count_after_wait(tor_refresh.timed_retries, timer_elapsed);
+				}
 			}
 		}
 	}
@@ -1594,7 +1679,13 @@ fn confirm_headerless_quota(attempt: &UpstreamAttempt) {
 	quota_notify(lane).notify_waiters();
 }
 
-fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remaining: Option<u16>, reset: Option<Duration>) -> Result<(), ApiRequestError> {
+fn reserve_redirect_hop(
+	attempt: &mut UpstreamAttempt,
+	generation: u64,
+	remaining: Option<u16>,
+	reset: Option<Duration>,
+	allow_quota_refresh: bool,
+) -> Result<(), ApiRequestError> {
 	let now = Instant::now();
 	let mut guard = upstream_guard(attempt.lane);
 	let continue_headerless_discovery = attempt.discovery_probe && remaining.is_none() && reset.is_none();
@@ -1623,7 +1714,7 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 						source: "quota_reserve",
 					},
 					Some(guard.quota.epoch),
-					guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency),
+					allow_quota_refresh.then(|| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency)).flatten(),
 				),
 				QuotaReserveError::StaleGeneration => (
 					AdmissionDenied {
@@ -1637,12 +1728,14 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 					None,
 				),
 			};
+			let refresh_was_in_progress = attempt.lane == RedditLane::Tor
+				&& denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
 			drop(guard);
 			let emergency_started = emergency_ticket
 				.filter(|_| is_current_oauth_generation(attempt.lane, generation))
 				.is_some_and(spawn_rate_limit_refresh);
 			let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
-			let short_refresh_retry = emergency_started || matching_refresh_in_progress;
+			let short_refresh_retry = emergency_started || refresh_was_in_progress || matching_refresh_in_progress;
 			if emergency_started {
 				let reset_remaining = denial.delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
 				warn!(
@@ -1651,7 +1744,14 @@ fn reserve_redirect_hop(attempt: &mut UpstreamAttempt, generation: u64, remainin
 				);
 			}
 			record_local_denial(CooldownReason::RateLimit);
-			return Err(ApiRequestError::deferred(local_admission_message(denial, short_refresh_retry), CooldownReason::RateLimit));
+			let message = local_admission_message(denial, short_refresh_retry);
+			if let Some(quota_epoch) = denied_quota_epoch.filter(|_| attempt.lane == RedditLane::Tor && short_refresh_retry) {
+				return Err(ApiRequestError::TorQuotaRefreshWait {
+					message,
+					ticket: QuotaRefreshWaitTicket { generation, quota_epoch },
+				});
+			}
+			return Err(ApiRequestError::deferred(message, CooldownReason::RateLimit));
 		}
 	};
 	let quota_consumption_watermark = guard.quota.headerless_consumption;
@@ -2124,7 +2224,13 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
-async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, attempt: &mut UpstreamAttempt) -> Result<WreqResponse, ApiRequestError> {
+async fn reddit_get(
+	path: String,
+	quarantine: bool,
+	oauth_client: Arc<Oauth>,
+	attempt: &mut UpstreamAttempt,
+	allow_quota_refresh: bool,
+) -> Result<WreqResponse, ApiRequestError> {
 	let lane = attempt.lane;
 	let origin = lane.api_origin();
 	let generation = oauth_client.generation;
@@ -2166,7 +2272,7 @@ async fn reddit_get(path: String, quarantine: bool, oauth_client: Arc<Oauth>, at
 			.get("x-ratelimit-reset")
 			.and_then(|value| value.to_str().ok())
 			.and_then(|value| parse_delay_seconds(Some(value)));
-		reserve_redirect_hop(attempt, generation, remaining, reset)?;
+		reserve_redirect_hop(attempt, generation, remaining, reset, allow_quota_refresh)?;
 		path = next_path;
 	}
 
@@ -2527,6 +2633,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 		TorRetryReason::QuotaReserve(ticket) => {
 			TOR_QUOTA_SPILLOVER_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 			info!("Trying one bounded Tor request after direct quota reserve exhaustion: endpoint={}", endpoint_class(&path));
+			let mut tor_refresh = TorQuotaRefreshRetryState::default();
 			let (tor_result, _, _) = json_uncached_on_lane_with_options(
 				path.clone(),
 				quarantine,
@@ -2534,6 +2641,7 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 				AdmissionRetryMode::Immediate,
 				Some(TOR_QUOTA_SPILLOVER_TIMEOUT),
 				Some(ticket),
+				&mut tor_refresh,
 			)
 			.await;
 			match tor_result {
@@ -2582,15 +2690,46 @@ fn request_timeout_is_transport_failure(quota_spillover: bool) -> bool {
 	!quota_spillover
 }
 
+fn quota_refresh_launch_allowed(mode: AdmissionRetryMode, quota_spillover: bool, refresh_owned: bool) -> bool {
+	mode == AdmissionRetryMode::Bounded && !quota_spillover && !refresh_owned
+}
+
+fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quota_spillover: bool, ticket: QuotaRefreshWaitTicket) -> LaneRecoveryReason {
+	if lane == RedditLane::Tor && mode == AdmissionRetryMode::Bounded && !quota_spillover {
+		LaneRecoveryReason::TorQuotaRefreshWait(ticket)
+	} else {
+		LaneRecoveryReason::None
+	}
+}
+
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
 	let recovery_started = Instant::now();
 	let mut transport_retries = 0;
 	let mut cooldown_waits = 0;
+	let mut tor_refresh = TorQuotaRefreshRetryState::default();
 	loop {
 		let timeout_override = (transport_retries > 0 || cooldown_waits > 0).then_some(TRANSPORT_RETRY_TIMEOUT);
-		let (result, tor_retry_reason, recovery_reason) =
-			json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None).await;
+		let (result, tor_retry_reason, recovery_reason) = json_uncached_on_lane_with_options(
+			path.clone(),
+			quarantine,
+			lane,
+			AdmissionRetryMode::Bounded,
+			timeout_override,
+			None,
+			&mut tor_refresh,
+		)
+		.await;
 		let delay = match recovery_reason {
+			LaneRecoveryReason::TorQuotaRefreshWait(ticket) => {
+				if !tor_refresh.claim_redirect_replay(lane, ticket, Instant::now()) {
+					return (result, tor_retry_reason);
+				}
+				info!("Joining active Tor quota refresh before one full GET replay: endpoint={}", endpoint_class(&path));
+				// The previous attempt and permit are already dropped. Re-enter
+				// admission so token, transport, quota and edge guards are selected
+				// atomically; never swap identities halfway through a redirect chain.
+				continue;
+			}
 			LaneRecoveryReason::TransportFailure => {
 				let Some(delay) = transport_retry_delay(transport_retries) else {
 					return (result, tor_retry_reason);
@@ -2646,6 +2785,7 @@ async fn json_uncached_on_lane_with_options(
 	admission_mode: AdmissionRetryMode,
 	timeout_override: Option<Duration>,
 	quota_spillover_ticket: Option<QuotaSpilloverTicket>,
+	tor_refresh: &mut TorQuotaRefreshRetryState,
 ) -> (Result<Value, String>, TorRetryReason, LaneRecoveryReason) {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
@@ -2694,7 +2834,7 @@ async fn json_uncached_on_lane_with_options(
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
-	let (oauth_client, mut upstream_attempt) = match begin_upstream_attempt(lane, admission_mode).await {
+	let (oauth_client, mut upstream_attempt) = match begin_upstream_attempt(lane, admission_mode, tor_refresh).await {
 		Ok(attempt) => attempt,
 		Err(denied) => {
 			let retry_reason = if denied.edge_deferred {
@@ -2717,10 +2857,11 @@ async fn json_uncached_on_lane_with_options(
 	let timeout_path = path.clone();
 	let mut retry_reason = TorRetryReason::None;
 	let mut recovery_reason = LaneRecoveryReason::None;
+	let allow_quota_refresh = quota_refresh_launch_allowed(admission_mode, quota_spillover_ticket.is_some(), tor_refresh.owner.is_some());
 
 	// Fetch the url...
 	let result = tokio::time::timeout_at(request_deadline, async {
-		match reddit_get(path.clone(), quarantine, oauth_client, &mut upstream_attempt).await {
+		match reddit_get(path.clone(), quarantine, oauth_client, &mut upstream_attempt, allow_quota_refresh).await {
 			Ok(response) => {
 				let status = response.status();
 				let status_code = status.as_u16();
@@ -2913,6 +3054,10 @@ async fn json_uncached_on_lane_with_options(
 				if deferred_edge_rejected {
 					retry_reason = TorRetryReason::EdgeRejected;
 				}
+				Err(message)
+			}
+			Err(ApiRequestError::TorQuotaRefreshWait { message, ticket }) => {
+				recovery_reason = tor_redirect_refresh_recovery(lane, admission_mode, quota_spillover_ticket.is_some(), ticket);
 				Err(message)
 			}
 			Err(ApiRequestError::Upstream(error)) => {
@@ -3250,21 +3395,22 @@ mod tests {
 			message: "retry".to_string(),
 			edge_deferred: false,
 			quota_spillover: None,
+			tor_quota_refresh: None,
 		};
 		assert_eq!(
-			local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded),
+			local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded, false),
 			Some(LOCAL_QUOTA_RETRY_INTERVAL)
 		);
 		assert_eq!(
-			local_quota_retry_delay(&retryable, 2, LOCAL_QUOTA_RETRY_BUDGET - Duration::from_millis(50), AdmissionRetryMode::Bounded,),
+			local_quota_retry_delay(&retryable, 2, LOCAL_QUOTA_RETRY_BUDGET - Duration::from_millis(50), AdmissionRetryMode::Bounded, false),
 			Some(Duration::from_millis(50))
 		);
 		assert_eq!(
-			local_quota_retry_delay(&retryable, MAX_LOCAL_QUOTA_RETRIES, Duration::ZERO, AdmissionRetryMode::Bounded),
+			local_quota_retry_delay(&retryable, MAX_LOCAL_QUOTA_RETRIES, Duration::ZERO, AdmissionRetryMode::Bounded, false),
 			None
 		);
-		assert_eq!(local_quota_retry_delay(&retryable, 0, LOCAL_QUOTA_RETRY_BUDGET, AdmissionRetryMode::Bounded), None);
-		assert_eq!(local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Immediate), None);
+		assert_eq!(local_quota_retry_delay(&retryable, 0, LOCAL_QUOTA_RETRY_BUDGET, AdmissionRetryMode::Bounded, false), None);
+		assert_eq!(local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Immediate, false), None);
 		assert_eq!(local_quota_retry_count_after_wait(2, false), 2);
 		assert_eq!(local_quota_retry_count_after_wait(2, true), 3);
 
@@ -3276,12 +3422,183 @@ mod tests {
 			message: "stop".to_string(),
 			edge_deferred: true,
 			quota_spillover: None,
+			tor_quota_refresh: None,
 		};
-		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded), None);
+		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded, false), None);
 		assert_eq!(
 			local_admission_message(retryable.admission.unwrap(), true),
 			"Refreshing the anonymous Reddit session. Retry in 2 seconds"
 		);
+	}
+
+	#[test]
+	fn test_tor_quota_refresh_wait_is_scoped_and_bounded() {
+		let ticket = QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 };
+		let mut denied = BeginAttemptDenied {
+			admission: Some(AdmissionDenied {
+				delay: Duration::from_secs(60),
+				reason: CooldownReason::RateLimit,
+				reserve_exhausted: true,
+				local_quota_retry: true,
+				source: "quota_reserve",
+			}),
+			message: "refreshing".to_string(),
+			edge_deferred: false,
+			quota_spillover: None,
+			tor_quota_refresh: Some(ticket),
+		};
+		let mut owner = None;
+		assert!(!matching_tor_quota_refresh_wait(RedditLane::Direct, &mut owner, &denied));
+		assert_eq!(owner, None);
+		assert!(matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied));
+		assert_eq!(owner, Some(ticket));
+		assert_eq!(
+			local_quota_retry_delay(&denied, 3, Duration::from_secs(2), AdmissionRetryMode::Bounded, true),
+			Some(LOCAL_QUOTA_RETRY_INTERVAL)
+		);
+		assert_eq!(local_quota_retry_delay(&denied, 3, Duration::from_secs(2), AdmissionRetryMode::Bounded, false), None);
+		assert_eq!(
+			local_quota_retry_delay(&denied, 15, TOR_QUOTA_REFRESH_RETRY_BUDGET - Duration::from_millis(50), AdmissionRetryMode::Bounded, true),
+			Some(Duration::from_millis(50))
+		);
+		assert_eq!(local_quota_retry_delay(&denied, 0, TOR_QUOTA_REFRESH_RETRY_BUDGET, AdmissionRetryMode::Bounded, true), None);
+		assert_eq!(local_quota_retry_delay(&denied, MAX_TOR_QUOTA_REFRESH_RETRIES, Duration::ZERO, AdmissionRetryMode::Bounded, true), None);
+		assert_eq!(local_quota_retry_delay(&denied, 0, Duration::ZERO, AdmissionRetryMode::Immediate, true), None);
+
+		// A failed/finished refresh, another generation, or another quota window
+		// cannot renew the extended wait. The original owner is never replaced.
+		denied.tor_quota_refresh = None;
+		assert!(!matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied));
+		denied.tor_quota_refresh = Some(QuotaRefreshWaitTicket { generation: 8, ..ticket });
+		assert!(!matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied));
+		denied.tor_quota_refresh = Some(QuotaRefreshWaitTicket { quota_epoch: 5, ..ticket });
+		assert!(!matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied));
+		assert_eq!(owner, Some(ticket));
+
+		denied.tor_quota_refresh = Some(ticket);
+		denied.admission.as_mut().unwrap().source = "active_cooldown";
+		assert!(!matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied));
+		denied.admission.as_mut().unwrap().source = "stale_generation";
+		assert!(!matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied));
+	}
+
+	#[tokio::test]
+	async fn test_tor_quota_refresh_wait_wakes_after_short_budget() {
+		let notify = Arc::new(Notify::new());
+		let ready = Arc::new(AtomicBool::new(false));
+		let ready_after_refresh = ready.clone();
+		let notify_after_refresh = notify.clone();
+		let completed = tokio::spawn(async move {
+			tokio::time::sleep(LOCAL_QUOTA_RETRY_BUDGET + Duration::from_millis(200)).await;
+			ready_after_refresh.store(true, Ordering::SeqCst);
+			notify_after_refresh.notify_waiters();
+		});
+		let denied = BeginAttemptDenied {
+			admission: Some(AdmissionDenied {
+				delay: Duration::from_secs(60),
+				reason: CooldownReason::RateLimit,
+				reserve_exhausted: true,
+				local_quota_retry: true,
+				source: "quota_reserve",
+			}),
+			message: "refreshing".to_string(),
+			edge_deferred: false,
+			quota_spillover: None,
+			tor_quota_refresh: Some(QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 }),
+		};
+		let started = Instant::now();
+		let mut owner = None;
+		let mut timed_retries = 0;
+		loop {
+			let changed = notify.notified();
+			if ready.load(Ordering::SeqCst) {
+				break;
+			}
+			let extended = matching_tor_quota_refresh_wait(RedditLane::Tor, &mut owner, &denied);
+			let delay = local_quota_retry_delay(&denied, timed_retries, started.elapsed(), AdmissionRetryMode::Bounded, extended)
+				.expect("an active Tor refresh must survive the ordinary two-second budget");
+			let timer_elapsed = wait_for_local_quota_retry(changed, delay).await;
+			timed_retries = local_quota_retry_count_after_wait(timed_retries, timer_elapsed);
+		}
+		completed.await.unwrap();
+		assert!(started.elapsed() >= LOCAL_QUOTA_RETRY_BUDGET);
+		assert_eq!(owner, denied.tor_quota_refresh);
+	}
+
+	#[test]
+	fn test_tor_quota_refresh_redirect_replay_is_once_and_lane_scoped() {
+		let now = Instant::now();
+		let ticket = QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 };
+		let mut state = TorQuotaRefreshRetryState::default();
+		assert!(!state.claim_redirect_replay(RedditLane::Direct, ticket, now));
+		assert_eq!(state.owner, None);
+		assert_eq!(state.started, None);
+		assert!(state.claim_redirect_replay(RedditLane::Tor, ticket, now));
+		assert_eq!(state.owner, Some(ticket));
+		assert_eq!(state.started, Some(now));
+		assert!(state.redirect_replayed);
+		assert!(!state.claim_redirect_replay(RedditLane::Tor, ticket, now + Duration::from_secs(1)));
+		assert!(!state.claim_redirect_replay(RedditLane::Tor, QuotaRefreshWaitTicket { generation: 8, ..ticket }, now));
+
+		assert_eq!(
+			tor_redirect_refresh_recovery(RedditLane::Tor, AdmissionRetryMode::Bounded, false, ticket),
+			LaneRecoveryReason::TorQuotaRefreshWait(ticket)
+		);
+		assert_eq!(
+			tor_redirect_refresh_recovery(RedditLane::Direct, AdmissionRetryMode::Bounded, false, ticket),
+			LaneRecoveryReason::None
+		);
+		assert_eq!(
+			tor_redirect_refresh_recovery(RedditLane::Tor, AdmissionRetryMode::Immediate, false, ticket),
+			LaneRecoveryReason::None
+		);
+		assert_eq!(
+			tor_redirect_refresh_recovery(RedditLane::Tor, AdmissionRetryMode::Bounded, true, ticket),
+			LaneRecoveryReason::None
+		);
+	}
+
+	#[test]
+	fn test_tor_quota_refresh_redirect_launch_requires_unowned_bounded_request() {
+		assert!(quota_refresh_launch_allowed(AdmissionRetryMode::Bounded, false, false));
+		assert!(!quota_refresh_launch_allowed(AdmissionRetryMode::Immediate, false, false));
+		assert!(!quota_refresh_launch_allowed(AdmissionRetryMode::Immediate, true, false));
+		assert!(!quota_refresh_launch_allowed(AdmissionRetryMode::Bounded, true, false));
+		assert!(!quota_refresh_launch_allowed(AdmissionRetryMode::Bounded, false, true));
+	}
+
+	#[test]
+	fn test_tor_quota_refresh_redirect_replay_preserves_owner_and_budget() {
+		let started = Instant::now();
+		let ticket = QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 };
+		let mut state = TorQuotaRefreshRetryState {
+			owner: Some(ticket),
+			started: Some(started),
+			timed_retries: 4,
+			redirect_replayed: false,
+		};
+		let now = started + Duration::from_secs(3);
+		assert!(!state.claim_redirect_replay(RedditLane::Tor, QuotaRefreshWaitTicket { generation: 8, ..ticket }, now));
+		assert!(!state.claim_redirect_replay(RedditLane::Tor, QuotaRefreshWaitTicket { quota_epoch: 5, ..ticket }, now));
+		assert_eq!(state.owner, Some(ticket));
+		assert!(!state.redirect_replayed);
+		assert!(state.claim_redirect_replay(RedditLane::Tor, ticket, now));
+		assert_eq!(state.started, Some(started));
+		assert_eq!(state.timed_retries, 4);
+
+		let mut expired = TorQuotaRefreshRetryState {
+			owner: Some(ticket),
+			started: Some(started),
+			..TorQuotaRefreshRetryState::default()
+		};
+		assert!(!expired.claim_redirect_replay(RedditLane::Tor, ticket, started + TOR_QUOTA_REFRESH_RETRY_BUDGET));
+		assert_eq!(expired.started, Some(started));
+		let mut retries_used = TorQuotaRefreshRetryState {
+			timed_retries: MAX_TOR_QUOTA_REFRESH_RETRIES,
+			..TorQuotaRefreshRetryState::default()
+		};
+		assert!(!retries_used.claim_redirect_replay(RedditLane::Tor, ticket, started));
+		assert_eq!(retries_used.owner, None);
 	}
 
 	#[test]

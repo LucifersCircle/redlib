@@ -31,6 +31,7 @@ jobs:
           node --check static/gallery.js
           node --check static/spoilers.js
           node --check static/downloadGallery.js
+          node --check static/comments.js
           node --test scripts/test_ui_interactions.cjs
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -56,6 +57,7 @@ jobs:
           cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
           cargo test --locked --lib test_quota_admission_uses_remaining_allowance_near_reset
           cargo test --locked --lib test_local_quota_retries_are_attempt_and_time_bounded
+          cargo test --locked --lib test_tor_quota_refresh_
           cargo test --locked --lib test_quota_notifications_do_not_consume_timed_retries
           cargo test --locked --lib test_quota_spillover_requires_current_direct_reserve_without_cooldown
           cargo test --locked --lib test_only_direct_local_reserve_denial_creates_spillover_ticket
