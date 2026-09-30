@@ -1070,8 +1070,15 @@ enum ThrottleKind {
 
 #[derive(Debug)]
 enum ApiRequestError {
-	Deferred { message: String, edge_rejected: bool, recovery: LaneRecoveryReason },
-	TorQuotaRefreshWait { message: String, ticket: QuotaRefreshWaitTicket },
+	Deferred {
+		message: String,
+		edge_rejected: bool,
+		recovery: LaneRecoveryReason,
+	},
+	TorQuotaRefreshWait {
+		message: String,
+		ticket: QuotaRefreshWaitTicket,
+	},
 	Upstream(String),
 }
 
@@ -1692,7 +1699,11 @@ async fn begin_upstream_attempt(
 	}
 }
 
-async fn acquire_attempt_capacity(lane: RedditLane, mode: AdmissionRetryMode, deadline: tokio::time::Instant) -> Result<(SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
+async fn acquire_attempt_capacity(
+	lane: RedditLane,
+	mode: AdmissionRetryMode,
+	deadline: tokio::time::Instant,
+) -> Result<(SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
 	let denied = || BeginAttemptDenied {
 		message: "Reddit API request timed out while waiting for transport capacity".to_string(),
 		edge_deferred: false,
@@ -2799,7 +2810,10 @@ struct RecoveryBudget {
 
 impl RecoveryBudget {
 	fn new(now: tokio::time::Instant, initial_budget: Duration) -> Self {
-		Self { initial_deadline: now + initial_budget, started: None }
+		Self {
+			initial_deadline: now + initial_budget,
+			started: None,
+		}
 	}
 
 	fn begin(&mut self, now: tokio::time::Instant) -> Duration {
@@ -2838,7 +2852,11 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 	let mut cooldown_waits = 0;
 	let mut tor_refresh = TorQuotaRefreshRetryState::default();
 	loop {
-		let timeout_override = Some(if budget.started.is_some() { TRANSPORT_RETRY_TIMEOUT } else { lane.request_timeout().min(Duration::from_secs(30)) });
+		let timeout_override = Some(if budget.started.is_some() {
+			TRANSPORT_RETRY_TIMEOUT
+		} else {
+			lane.request_timeout().min(Duration::from_secs(30))
+		});
 		let attempt_budget = budget.remaining(tokio::time::Instant::now());
 		let attempt = json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None, &mut tor_refresh);
 		let (result, tor_retry_reason, recovery_reason) = match tokio::time::timeout(attempt_budget, attempt).await {
@@ -2950,9 +2968,7 @@ async fn json_uncached_on_lane_with_options(
 			let recovery_reason = denied.admission.as_ref().map_or(LaneRecoveryReason::None, |admission| {
 				if admission.reason == CooldownReason::UpstreamFailures {
 					LaneRecoveryReason::UpstreamCooldown(admission.delay)
-				} else if admission.reason == CooldownReason::RateLimit
-					&& (lane == RedditLane::Tor || admission.source == "active_cooldown")
-					&& denied.tor_quota_refresh.is_none() {
+				} else if admission.reason == CooldownReason::RateLimit && (lane == RedditLane::Tor || admission.source == "active_cooldown") && denied.tor_quota_refresh.is_none() {
 					LaneRecoveryReason::QuotaCooldown(admission.delay)
 				} else {
 					LaneRecoveryReason::None
@@ -3847,7 +3863,10 @@ mod tests {
 			upstream_cooldown_retry_delay(Duration::from_secs(12), 0, Duration::from_secs(1)),
 			Some(Duration::from_secs(12))
 		);
-		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), 1, Duration::from_secs(12)), Some(Duration::from_secs(1)));
+		assert_eq!(
+			upstream_cooldown_retry_delay(Duration::from_secs(1), 1, Duration::from_secs(12)),
+			Some(Duration::from_secs(1))
+		);
 		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(15), 0, Duration::from_secs(31)), None);
 		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), MAX_UPSTREAM_COOLDOWN_WAITS, Duration::ZERO), None);
 		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), 0, UPSTREAM_RECOVERY_BUDGET), None);
@@ -3940,7 +3959,10 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::new(RedditLane::Tor);
 		guard.install_oauth_generation(7, true);
-		guard.quota.window = QuotaWindow::Known { available: 50, reset_at: now + Duration::from_secs(120) };
+		guard.quota.window = QuotaWindow::Known {
+			available: 50,
+			reset_at: now + Duration::from_secs(120),
+		};
 		let mut attempt = guard.try_admit(now, 7).unwrap();
 		guard.reconcile_quota(now + Duration::from_secs(1), &mut attempt, None, None, true);
 		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 0, reset_at } if reset_at == now + Duration::from_secs(120)));
@@ -3963,7 +3985,10 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
 		guard.quota.generation = 2;
-		guard.edge_state = EdgeCircuitState::HalfOpen { epoch: 1, expires_at: now + Duration::from_secs(90) };
+		guard.edge_state = EdgeCircuitState::HalfOpen {
+			epoch: 1,
+			expires_at: now + Duration::from_secs(90),
+		};
 		guard.upstream_failure_blocked_until = Some(now - Duration::from_secs(1));
 		assert!(guard.record_generation_success(now, 1, EdgeAttempt { epoch: 1, half_open: true }).is_none());
 		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
@@ -5243,8 +5268,12 @@ mod tests {
 		assert!(matches!(deferred(CooldownReason::EdgeThrottle), ApiRequestError::Deferred { edge_rejected: true, .. }));
 		assert!(matches!(deferred(CooldownReason::RateLimit), ApiRequestError::Deferred { edge_rejected: false, .. }));
 		assert!(matches!(deferred(CooldownReason::UpstreamFailures), ApiRequestError::Deferred { edge_rejected: false, .. }));
-		assert!(matches!(deferred(CooldownReason::RateLimit), ApiRequestError::Deferred { recovery: LaneRecoveryReason::QuotaCooldown(delay), .. } if delay == Duration::from_secs(1)));
-		assert!(matches!(deferred(CooldownReason::UpstreamFailures), ApiRequestError::Deferred { recovery: LaneRecoveryReason::UpstreamCooldown(delay), .. } if delay == Duration::from_secs(1)));
+		assert!(
+			matches!(deferred(CooldownReason::RateLimit), ApiRequestError::Deferred { recovery: LaneRecoveryReason::QuotaCooldown(delay), .. } if delay == Duration::from_secs(1))
+		);
+		assert!(
+			matches!(deferred(CooldownReason::UpstreamFailures), ApiRequestError::Deferred { recovery: LaneRecoveryReason::UpstreamCooldown(delay), .. } if delay == Duration::from_secs(1))
+		);
 	}
 
 	#[test]
