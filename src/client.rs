@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{watch, Mutex as AsyncMutex, Notify, Semaphore};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify, Semaphore, SemaphorePermit};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Proxy, Response as WreqResponse};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
@@ -52,8 +52,11 @@ const FAILURE_THRESHOLD: u8 = 3;
 const MAX_TRANSPORT_RETRIES: u8 = 2;
 const TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const TRANSPORT_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_UPSTREAM_COOLDOWN_WAITS: u8 = 1;
-const UPSTREAM_RECOVERY_BUDGET: Duration = Duration::from_secs(15);
+const MAX_UPSTREAM_COOLDOWN_WAITS: u8 = 16;
+const UPSTREAM_RECOVERY_BUDGET: Duration = Duration::from_secs(45);
+const CAPACITY_WAIT_BUDGET: Duration = Duration::from_secs(15);
+static DIRECT_RECOVERY_PROBE: Semaphore = Semaphore::const_new(1);
+static TOR_RECOVERY_PROBE: Semaphore = Semaphore::const_new(1);
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
@@ -168,6 +171,7 @@ enum LaneRecoveryReason {
 	None,
 	TransportFailure,
 	UpstreamCooldown(Duration),
+	QuotaCooldown(Duration),
 	TorQuotaRefreshWait(QuotaRefreshWaitTicket),
 }
 
@@ -407,11 +411,16 @@ impl QuotaGovernor {
 
 		let reset_at = reset.map(|delay| now + delay.min(MAX_RATE_LIMIT_COOLDOWN));
 		if quota_exhausted {
+			// Missing headers are not evidence that an observed window ends sooner.
+			let known_reset = match self.window {
+				QuotaWindow::Known { reset_at, .. } if reset_at > now => Some(reset_at),
+				_ => None,
+			};
 			self.rollover_reserve = 0;
 			self.headerless_consumption = 0;
 			self.window = QuotaWindow::Known {
 				available: 0,
-				reset_at: reset_at.unwrap_or(now + DEFAULT_RATE_LIMIT_COOLDOWN),
+				reset_at: reset_at.or(known_reset).unwrap_or(now + DEFAULT_RATE_LIMIT_COOLDOWN),
 			};
 			return true;
 		}
@@ -890,6 +899,13 @@ impl UpstreamGuard {
 	fn record_api_success(&mut self, now: Instant, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
 		self.reset_failure_window();
 		let closes_probe = matches!(self.edge_state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
+		// A success cannot end a cooldown extended by another in-flight failure.
+		if self.upstream_failure_blocked_until.is_some_and(|until| now >= until) {
+			self.upstream_failure_blocked_until = None;
+		}
+		if self.rate_limit_blocked_until.is_some_and(|until| now >= until) {
+			self.rate_limit_blocked_until = None;
+		}
 		let current_closed_attempt = matches!(self.edge_state, EdgeCircuitState::Closed) && attempt.epoch == self.edge_epoch;
 		let recovery = closes_probe.then(|| EdgeRecovery {
 			consecutive_failures: self.edge_throttle_failures,
@@ -907,6 +923,15 @@ impl UpstreamGuard {
 			self.edge_episode_started_at = None;
 		}
 		recovery
+	}
+
+	fn record_generation_success(&mut self, now: Instant, generation: u64, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
+		if self.quota.generation == generation {
+			self.record_api_success(now, attempt)
+		} else {
+			self.abandon_edge_probe(now, attempt);
+			None
+		}
 	}
 
 	fn record_edge_throttle(&mut self, now: Instant, attempt: EdgeAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
@@ -1003,7 +1028,10 @@ fn rate_limit_delay(retry_after: Option<&str>, reset: Option<&str>) -> Duration 
 }
 
 fn rate_limit_base_delay(retry_after: Option<&str>, reset: Option<&str>) -> (Duration, bool) {
-	let server_delay = match (parse_retry_after(retry_after, SystemTime::now()), parse_delay_seconds(reset)) {
+	let server_delay = match (
+		parse_retry_after(retry_after, SystemTime::now()).filter(|delay| !delay.is_zero()),
+		parse_delay_seconds(reset).filter(|delay| !delay.is_zero()),
+	) {
 		(Some(retry), Some(reset)) => Some(retry.max(reset)),
 		(Some(delay), None) | (None, Some(delay)) => Some(delay),
 		(None, None) => None,
@@ -1042,16 +1070,21 @@ enum ThrottleKind {
 
 #[derive(Debug)]
 enum ApiRequestError {
-	Deferred { message: String, edge_rejected: bool },
+	Deferred { message: String, edge_rejected: bool, recovery: LaneRecoveryReason },
 	TorQuotaRefreshWait { message: String, ticket: QuotaRefreshWaitTicket },
 	Upstream(String),
 }
 
 impl ApiRequestError {
-	fn deferred(message: String, reason: CooldownReason) -> Self {
+	fn deferred(message: String, reason: CooldownReason, delay: Duration) -> Self {
 		Self::Deferred {
 			message,
 			edge_rejected: reason == CooldownReason::EdgeThrottle,
+			recovery: match reason {
+				CooldownReason::UpstreamFailures => LaneRecoveryReason::UpstreamCooldown(delay),
+				CooldownReason::RateLimit => LaneRecoveryReason::QuotaCooldown(delay),
+				CooldownReason::EdgeThrottle => LaneRecoveryReason::None,
+			},
 		}
 	}
 }
@@ -1595,12 +1628,14 @@ async fn begin_upstream_attempt(
 	lane: RedditLane,
 	mode: AdmissionRetryMode,
 	tor_refresh: &mut TorQuotaRefreshRetryState,
-) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
+) -> Result<(Arc<Oauth>, UpstreamAttempt, SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
 	let started = Instant::now();
+	let capacity_deadline = tokio::time::Instant::now() + CAPACITY_WAIT_BUDGET;
 	let mut retry_count = 0;
 	let mut retry_source = "none";
 	loop {
 		let quota_changed = quota_notify(lane).notified();
+		let (permit, probe) = acquire_attempt_capacity(lane, mode, capacity_deadline).await?;
 		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded && tor_refresh.owner.is_none()) {
 			Ok(attempt) => {
 				if retry_count > 0 {
@@ -1612,9 +1647,12 @@ async fn begin_upstream_attempt(
 						Instant::now().saturating_duration_since(started).as_millis(),
 					);
 				}
-				return Ok(attempt);
+				return Ok((attempt.0, attempt.1, permit, probe));
 			}
 			Err(denied) => {
+				// Admission sleeps never occupy transport slots or the recovery probe.
+				drop(permit);
+				drop(probe);
 				let now = Instant::now();
 				let elapsed = now.saturating_duration_since(started);
 				let tor_refresh_wait = matching_tor_quota_refresh_wait(lane, &mut tor_refresh.owner, &denied);
@@ -1652,6 +1690,73 @@ async fn begin_upstream_attempt(
 			}
 		}
 	}
+}
+
+async fn acquire_attempt_capacity(lane: RedditLane, mode: AdmissionRetryMode, deadline: tokio::time::Instant) -> Result<(SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
+	let denied = || BeginAttemptDenied {
+		message: "Reddit API request timed out while waiting for transport capacity".to_string(),
+		edge_deferred: false,
+		quota_spillover: None,
+		tor_quota_refresh: None,
+		admission: Some(AdmissionDenied {
+			delay: TRANSPORT_RETRY_BASE_DELAY,
+			reason: CooldownReason::UpstreamFailures,
+			reserve_exhausted: false,
+			local_quota_retry: false,
+			source: "transport_capacity",
+		}),
+	};
+	// Serialize recovery probes, including requests that arrived during cooldown.
+	// RAII releases the probe on cancellation. Recheck after acquiring it because
+	// a preceding probe may already have restored normal service.
+	let recovery = || {
+		let guard = upstream_guard(lane);
+		guard.upstream_failure_blocked_until.is_some() || guard.rate_limit_blocked_until.is_some()
+	};
+	let gate = match lane {
+		RedditLane::Direct => &DIRECT_RECOVERY_PROBE,
+		RedditLane::Tor => &TOR_RECOVERY_PROBE,
+	};
+	if mode == AdmissionRetryMode::Immediate {
+		return acquire_immediate_recovery_capacity(api_concurrency(lane), gate, recovery).map_err(|_| denied());
+	}
+	acquire_recovery_capacity(api_concurrency(lane), gate, deadline, recovery).await.map_err(|_| denied())
+}
+
+fn acquire_immediate_recovery_capacity<'a>(
+	capacity: &'a Semaphore,
+	gate: &'a Semaphore,
+	recovery: impl Fn() -> bool,
+) -> Result<(SemaphorePermit<'a>, Option<SemaphorePermit<'a>>), ()> {
+	let probe = if recovery() { Some(gate.try_acquire().map_err(|_| ())?) } else { None };
+	let permit = capacity.try_acquire().map_err(|_| ())?;
+	if probe.is_none() && recovery() {
+		return Err(());
+	}
+	Ok((permit, probe))
+}
+
+async fn acquire_recovery_capacity<'a>(
+	capacity: &'a Semaphore,
+	gate: &'a Semaphore,
+	deadline: tokio::time::Instant,
+	recovery: impl Fn() -> bool,
+) -> Result<(SemaphorePermit<'a>, Option<SemaphorePermit<'a>>), ()> {
+	let mut probe = None;
+	if recovery() {
+		let permit = tokio::time::timeout_at(deadline, gate.acquire()).await.map_err(|_| ())?.map_err(|_| ())?;
+		if recovery() {
+			probe = Some(permit);
+		}
+	}
+	let permit = tokio::time::timeout_at(deadline, capacity.acquire()).await.map_err(|_| ())?.map_err(|_| ())?;
+	if probe.is_none() && recovery() {
+		// Recovery may have started while we queued for normal capacity. Return
+		// to admission without sending; the next attempt must join the probe gate.
+		drop(permit);
+		return Err(());
+	}
+	Ok((permit, probe))
 }
 
 fn block_for_rate_limit(lane: RedditLane, generation: u64, retry_after: Option<&str>, reset: Option<&str>) -> (Duration, bool) {
@@ -1696,6 +1801,7 @@ fn reserve_redirect_hop(
 		return Err(ApiRequestError::deferred(
 			format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(delay)),
 			reason,
+			delay,
 		));
 	}
 	let (quota_epoch, request_id, discovery_probe) = match guard.quota.reserve(now, generation) {
@@ -1750,7 +1856,7 @@ fn reserve_redirect_hop(
 					ticket: QuotaRefreshWaitTicket { generation, quota_epoch },
 				});
 			}
-			return Err(ApiRequestError::deferred(message, CooldownReason::RateLimit));
+			return Err(ApiRequestError::deferred(message, CooldownReason::RateLimit, denial.delay));
 		}
 	};
 	let quota_consumption_watermark = guard.quota.headerless_consumption;
@@ -1790,7 +1896,8 @@ fn record_upstream_failure(lane: RedditLane, kind: &str, status: Option<u16>, pa
 }
 
 fn record_upstream_success(attempt: &mut UpstreamAttempt, path: &str) {
-	if let Some(recovery) = upstream_guard(attempt.lane).record_api_success(Instant::now(), attempt.edge) {
+	let recovery = upstream_guard(attempt.lane).record_generation_success(Instant::now(), attempt.generation, attempt.edge);
+	if let Some(recovery) = recovery {
 		info!(
 			"Reddit edge circuit recovered: lane={} endpoint={} consecutive_failures={} episode_seconds={} request_generation={} current_generation={} current_identity_age_seconds={}",
 			attempt.lane.label(),
@@ -2685,6 +2792,27 @@ fn upstream_cooldown_retry_delay(delay: Duration, wait_count: u8, elapsed: Durat
 	(delay <= remaining).then_some(delay)
 }
 
+struct RecoveryBudget {
+	initial_deadline: tokio::time::Instant,
+	started: Option<tokio::time::Instant>,
+}
+
+impl RecoveryBudget {
+	fn new(now: tokio::time::Instant, initial_budget: Duration) -> Self {
+		Self { initial_deadline: now + initial_budget, started: None }
+	}
+
+	fn begin(&mut self, now: tokio::time::Instant) -> Duration {
+		now.saturating_duration_since(*self.started.get_or_insert(now))
+	}
+
+	fn remaining(&self, now: tokio::time::Instant) -> Duration {
+		self.started.map_or(self.initial_deadline.saturating_duration_since(now), |started| {
+			UPSTREAM_RECOVERY_BUDGET.saturating_sub(now.saturating_duration_since(started))
+		})
+	}
+}
+
 fn request_timeout_is_transport_failure(quota_spillover: bool) -> bool {
 	!quota_spillover
 }
@@ -2702,14 +2830,21 @@ fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quo
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
-	let recovery_started = Instant::now();
+	let mut budget = RecoveryBudget::new(
+		tokio::time::Instant::now(),
+		CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + lane.request_timeout().min(Duration::from_secs(30)),
+	);
 	let mut transport_retries = 0;
 	let mut cooldown_waits = 0;
 	let mut tor_refresh = TorQuotaRefreshRetryState::default();
 	loop {
-		let timeout_override = (transport_retries > 0 || cooldown_waits > 0).then_some(TRANSPORT_RETRY_TIMEOUT);
-		let (result, tor_retry_reason, recovery_reason) =
-			json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None, &mut tor_refresh).await;
+		let timeout_override = Some(if budget.started.is_some() { TRANSPORT_RETRY_TIMEOUT } else { lane.request_timeout().min(Duration::from_secs(30)) });
+		let attempt_budget = budget.remaining(tokio::time::Instant::now());
+		let attempt = json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None, &mut tor_refresh);
+		let (result, tor_retry_reason, recovery_reason) = match tokio::time::timeout(attempt_budget, attempt).await {
+			Ok(result) => result,
+			Err(_) => return (Err("Reddit API request timed out after bounded server-side recovery".to_string()), TorRetryReason::None),
+		};
 		let delay = match recovery_reason {
 			LaneRecoveryReason::TorQuotaRefreshWait(ticket) => {
 				if !tor_refresh.claim_redirect_replay(lane, ticket, Instant::now()) {
@@ -2722,6 +2857,7 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 				continue;
 			}
 			LaneRecoveryReason::TransportFailure => {
+				budget.begin(tokio::time::Instant::now());
 				let Some(delay) = transport_retry_delay(transport_retries) else {
 					return (result, tor_retry_reason);
 				};
@@ -2736,8 +2872,8 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 				);
 				delay
 			}
-			LaneRecoveryReason::UpstreamCooldown(delay) => {
-				let elapsed = Instant::now().saturating_duration_since(recovery_started);
+			LaneRecoveryReason::UpstreamCooldown(delay) | LaneRecoveryReason::QuotaCooldown(delay) => {
+				let elapsed = budget.begin(tokio::time::Instant::now());
 				let Some(delay) = upstream_cooldown_retry_delay(delay, cooldown_waits, elapsed) else {
 					return (result, tor_retry_reason);
 				};
@@ -2765,6 +2901,9 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 				return (result, tor_retry_reason);
 			}
 		};
+		if delay >= budget.remaining(tokio::time::Instant::now()) {
+			return (result, tor_retry_reason);
+		}
 		tokio::time::sleep(delay).await;
 	}
 }
@@ -2785,31 +2924,6 @@ async fn json_uncached_on_lane_with_options(
 	};
 
 	let request_timeout = timeout_override.unwrap_or_else(|| lane.request_timeout());
-	let request_deadline = tokio::time::Instant::now() + request_timeout;
-	let _permit = if quota_spillover_ticket.is_some() {
-		match api_concurrency(lane).try_acquire() {
-			Ok(permit) => permit,
-			Err(_) => {
-				return (
-					Err("Tor quota spillover skipped while transport capacity was busy".to_string()),
-					TorRetryReason::None,
-					LaneRecoveryReason::None,
-				)
-			}
-		}
-	} else {
-		match tokio::time::timeout_at(request_deadline, api_concurrency(lane).acquire()).await {
-			Ok(Ok(permit)) => permit,
-			Ok(Err(_)) => return (Err("Reddit request limiter is unavailable".to_string()), TorRetryReason::None, LaneRecoveryReason::None),
-			Err(_) => {
-				return (
-					Err("Reddit API request timed out while waiting for transport capacity".to_string()),
-					TorRetryReason::None,
-					LaneRecoveryReason::None,
-				)
-			}
-		}
-	};
 	if let Some(ticket) = quota_spillover_ticket {
 		debug_assert_eq!(lane, RedditLane::Tor);
 		debug_assert_eq!(admission_mode, AdmissionRetryMode::Immediate);
@@ -2825,7 +2939,7 @@ async fn json_uncached_on_lane_with_options(
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
-	let (oauth_client, mut upstream_attempt) = match begin_upstream_attempt(lane, admission_mode, tor_refresh).await {
+	let (oauth_client, mut upstream_attempt, _permit, _probe) = match begin_upstream_attempt(lane, admission_mode, tor_refresh).await {
 		Ok(attempt) => attempt,
 		Err(denied) => {
 			let retry_reason = if denied.edge_deferred {
@@ -2833,14 +2947,22 @@ async fn json_uncached_on_lane_with_options(
 			} else {
 				denied.quota_spillover.map_or(TorRetryReason::None, TorRetryReason::QuotaReserve)
 			};
-			let recovery_reason = denied
-				.admission
-				.as_ref()
-				.filter(|admission| admission.reason == CooldownReason::UpstreamFailures)
-				.map_or(LaneRecoveryReason::None, |admission| LaneRecoveryReason::UpstreamCooldown(admission.delay));
+			let recovery_reason = denied.admission.as_ref().map_or(LaneRecoveryReason::None, |admission| {
+				if admission.reason == CooldownReason::UpstreamFailures {
+					LaneRecoveryReason::UpstreamCooldown(admission.delay)
+				} else if admission.reason == CooldownReason::RateLimit
+					&& (lane == RedditLane::Tor || admission.source == "active_cooldown")
+					&& denied.tor_quota_refresh.is_none() {
+					LaneRecoveryReason::QuotaCooldown(admission.delay)
+				} else {
+					LaneRecoveryReason::None
+				}
+			});
 			return (Err(denied.message), retry_reason, recovery_reason);
 		}
 	};
+	// Queueing and admission have separate bounds; neither consumes network time.
+	let request_deadline = tokio::time::Instant::now() + request_timeout;
 	let request_generation = oauth_client.generation;
 	// Admission atomically selects the OAuth client and owns its quota
 	// reservation and edge half-open probe.
@@ -2874,7 +2996,7 @@ async fn json_uncached_on_lane_with_options(
 					reset_duration,
 					matches!(throttle_kind, Some(ThrottleKind::Quota)) || parsed_remaining == Some(0),
 				);
-				if !matches!(throttle_kind, Some(ThrottleKind::Edge)) {
+				if throttle_kind.is_none() {
 					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path);
 				}
 				trace!(
@@ -2895,6 +3017,9 @@ async fn json_uncached_on_lane_with_options(
 				match throttle_kind {
 					Some(ThrottleKind::Quota) => {
 						let (delay, response_is_current) = block_for_rate_limit(lane, request_generation, retry_after, reset);
+						if response_is_current {
+							recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
+						}
 						warn!(
 							"Reddit quota response: status={} endpoint={} retry_after_seconds={} remaining_present={} reset_seconds={} used_present={} current_generation={response_is_current}",
 							status,
@@ -3041,9 +3166,14 @@ async fn json_uncached_on_lane_with_options(
 			Err(ApiRequestError::Deferred {
 				message,
 				edge_rejected: deferred_edge_rejected,
+				recovery,
 			}) => {
 				if deferred_edge_rejected {
 					retry_reason = TorRetryReason::EdgeRejected;
+				} else if admission_mode == AdmissionRetryMode::Bounded && quota_spillover_ticket.is_none() {
+					// Preserve the denial even if its cooldown expires before handling.
+					// Replayed GET admission rechecks any intervening extension.
+					recovery_reason = recovery;
 				}
 				Err(message)
 			}
@@ -3270,6 +3400,7 @@ mod tests {
 
 	#[test]
 	fn test_rate_limit_delay_adds_margin_and_respects_cap() {
+		assert_eq!(rate_limit_base_delay(Some("0"), None), (Duration::from_secs(12), false));
 		assert_eq!(rate_limit_base_delay(Some("1"), None), (Duration::from_secs(3), true));
 		assert_eq!(rate_limit_base_delay(None, Some("20")), (Duration::from_secs(22), true));
 		assert_eq!(rate_limit_base_delay(Some("0"), Some("120")), (Duration::from_secs(122), true));
@@ -3716,9 +3847,127 @@ mod tests {
 			upstream_cooldown_retry_delay(Duration::from_secs(12), 0, Duration::from_secs(1)),
 			Some(Duration::from_secs(12))
 		);
-		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(15), 0, Duration::from_secs(1)), None);
+		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), 1, Duration::from_secs(12)), Some(Duration::from_secs(1)));
+		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(15), 0, Duration::from_secs(31)), None);
 		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), MAX_UPSTREAM_COOLDOWN_WAITS, Duration::ZERO), None);
 		assert_eq!(upstream_cooldown_retry_delay(Duration::from_secs(1), 0, UPSTREAM_RECOVERY_BUDGET), None);
+	}
+
+	#[tokio::test]
+	async fn test_recovery_capacity_serializes_probes_and_releases_on_cancel() {
+		let capacity = Semaphore::new(4);
+		let gate = Semaphore::new(1);
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+		let first = acquire_recovery_capacity(&capacity, &gate, deadline, || true).await.unwrap();
+		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, || true));
+		assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
+		assert_eq!(capacity.available_permits(), 3, "waiting followers must not occupy transport capacity");
+		drop(follower);
+		drop(first);
+		assert_eq!(capacity.available_permits(), 4);
+		assert_eq!(gate.available_permits(), 1);
+		let next = acquire_recovery_capacity(&capacity, &gate, deadline, || true).await.unwrap();
+		assert!(next.1.is_some());
+	}
+
+	#[test]
+	fn test_recovery_capacity_immediate_spillover_cannot_bypass_probe() {
+		let capacity = Semaphore::new(4);
+		let gate = Semaphore::new(1);
+		let probe = acquire_immediate_recovery_capacity(&capacity, &gate, || true).unwrap();
+		assert!(acquire_immediate_recovery_capacity(&capacity, &gate, || true).is_err());
+		assert_eq!(capacity.available_permits(), 3);
+		drop(probe);
+		assert_eq!(gate.available_permits(), 1);
+		assert!(acquire_immediate_recovery_capacity(&capacity, &gate, || true).is_ok());
+		let checked = AtomicBool::new(false);
+		assert!(acquire_immediate_recovery_capacity(&capacity, &gate, || checked.swap(true, Ordering::SeqCst)).is_err());
+		assert_eq!(capacity.available_permits(), 4);
+	}
+
+	#[test]
+	fn test_recovery_budget_starts_at_failure_and_cannot_be_rearmed() {
+		let now = tokio::time::Instant::now();
+		let mut budget = RecoveryBudget::new(now, Duration::from_secs(100));
+		let failure = now + Duration::from_secs(90);
+		assert_eq!(budget.begin(failure), Duration::ZERO);
+		assert_eq!(budget.remaining(failure), UPSTREAM_RECOVERY_BUDGET);
+		let extended = failure + Duration::from_secs(12);
+		assert_eq!(budget.begin(extended), Duration::from_secs(12));
+		assert_eq!(budget.remaining(extended), Duration::from_secs(33));
+		assert_eq!(budget.begin(extended + Duration::from_secs(20)), Duration::from_secs(32));
+		assert_eq!(budget.remaining(failure + UPSTREAM_RECOVERY_BUDGET), Duration::ZERO);
+		assert_eq!(budget.remaining(failure + UPSTREAM_RECOVERY_BUDGET + Duration::from_secs(1)), Duration::ZERO);
+	}
+
+	#[tokio::test]
+	async fn test_recovery_budget_cancels_capacity_wait_without_leaking_probe() {
+		let capacity = Semaphore::new(0);
+		let gate = Semaphore::new(1);
+		let now = tokio::time::Instant::now();
+		let mut budget = RecoveryBudget::new(now, Duration::from_secs(100));
+		budget.begin(now - UPSTREAM_RECOVERY_BUDGET);
+		let future = acquire_recovery_capacity(&capacity, &gate, now + CAPACITY_WAIT_BUDGET, || true);
+		assert!(tokio::time::timeout(budget.remaining(now), future).await.is_err());
+		assert_eq!(gate.available_permits(), 1);
+		assert_eq!(capacity.available_permits(), 0);
+	}
+
+	#[tokio::test]
+	async fn test_recovery_capacity_rechecks_after_queue_and_success() {
+		let capacity = Semaphore::new(1);
+		let gate = Semaphore::new(1);
+		let recovering = AtomicBool::new(false);
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+		let busy = capacity.acquire().await.unwrap();
+		let mut queued = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, || recovering.load(Ordering::SeqCst)));
+		assert!(futures_lite::future::poll_once(queued.as_mut()).await.is_none());
+		recovering.store(true, Ordering::SeqCst);
+		drop(busy);
+		assert!(queued.await.is_err(), "a pre-cooldown waiter must not bypass recovery serialization");
+		assert_eq!(capacity.available_permits(), 1);
+		let probe = gate.acquire().await.unwrap();
+		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, || recovering.load(Ordering::SeqCst)));
+		assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
+		recovering.store(false, Ordering::SeqCst);
+		drop(probe);
+		let resumed = follower.await.unwrap();
+		assert!(resumed.1.is_none(), "normal concurrency resumes after a successful probe");
+	}
+
+	#[test]
+	fn test_headerless_quota_response_preserves_known_reset() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		guard.quota.window = QuotaWindow::Known { available: 50, reset_at: now + Duration::from_secs(120) };
+		let mut attempt = guard.try_admit(now, 7).unwrap();
+		guard.reconcile_quota(now + Duration::from_secs(1), &mut attempt, None, None, true);
+		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 0, reset_at } if reset_at == now + Duration::from_secs(120)));
+	}
+
+	#[test]
+	fn test_recovery_success_does_not_clear_extended_cooldown() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let attempt = guard.begin_attempt(now).unwrap();
+		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(12));
+		guard.record_api_success(now + Duration::from_secs(11), attempt);
+		assert!(guard.upstream_failure_blocked_until.is_some());
+		guard.record_api_success(now + Duration::from_secs(13), attempt);
+		assert!(guard.upstream_failure_blocked_until.is_none());
+	}
+
+	#[test]
+	fn test_recovery_stale_success_releases_probe_without_clearing_cooldown() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		guard.quota.generation = 2;
+		guard.edge_state = EdgeCircuitState::HalfOpen { epoch: 1, expires_at: now + Duration::from_secs(90) };
+		guard.upstream_failure_blocked_until = Some(now - Duration::from_secs(1));
+		assert!(guard.record_generation_success(now, 1, EdgeAttempt { epoch: 1, half_open: true }).is_none());
+		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
+		assert!(guard.upstream_failure_blocked_until.is_some());
 	}
 
 	#[test]
@@ -4990,10 +5239,12 @@ mod tests {
 
 	#[test]
 	fn test_only_edge_redirect_deferrals_qualify_for_tor_retry() {
-		let deferred = |reason| ApiRequestError::deferred("deferred".to_string(), reason);
+		let deferred = |reason| ApiRequestError::deferred("deferred".to_string(), reason, Duration::from_secs(1));
 		assert!(matches!(deferred(CooldownReason::EdgeThrottle), ApiRequestError::Deferred { edge_rejected: true, .. }));
 		assert!(matches!(deferred(CooldownReason::RateLimit), ApiRequestError::Deferred { edge_rejected: false, .. }));
 		assert!(matches!(deferred(CooldownReason::UpstreamFailures), ApiRequestError::Deferred { edge_rejected: false, .. }));
+		assert!(matches!(deferred(CooldownReason::RateLimit), ApiRequestError::Deferred { recovery: LaneRecoveryReason::QuotaCooldown(delay), .. } if delay == Duration::from_secs(1)));
+		assert!(matches!(deferred(CooldownReason::UpstreamFailures), ApiRequestError::Deferred { recovery: LaneRecoveryReason::UpstreamCooldown(delay), .. } if delay == Duration::from_secs(1)));
 	}
 
 	#[test]

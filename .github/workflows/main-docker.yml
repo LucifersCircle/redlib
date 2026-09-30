@@ -120,6 +120,11 @@ jobs:
           cargo test --locked --lib gallery_
           cargo test --locked --lib thumbnail_
           cargo test --locked --lib test_identical_cache_misses_are_coalesced
+          cargo test --locked --lib test_recovery_capacity_
+          cargo test --locked --lib test_recovery_budget_
+          cargo test --locked --lib test_headerless_quota_response_preserves_known_reset
+          cargo test --locked --lib test_recovery_success_does_not_clear_extended_cooldown
+          cargo test --locked --lib test_recovery_stale_success_releases_probe_without_clearing_cooldown
           cargo test --locked --lib test_transient_coalesced_errors_are_not_cached
           cargo test --locked --lib test_panicked_coalesced_request_is_removed_and_retryable
           cargo test --locked --lib test_comment_search_parameters_stay_local
