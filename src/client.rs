@@ -4141,7 +4141,13 @@ mod tests {
 		assert!(guard.completed_quota_rotation_still_valid(completed_at, ticket));
 		assert!(!guard.completed_quota_rotation_still_valid(reset_at, ticket));
 		assert!(!guard.completed_quota_rotation_still_valid(now, QuotaRotationTicket { generation: 6, ..ticket }));
-		assert!(!guard.completed_quota_rotation_still_valid(now, QuotaRotationTicket { quota_epoch: ticket.quota_epoch + 1, ..ticket }));
+		assert!(!guard.completed_quota_rotation_still_valid(
+			now,
+			QuotaRotationTicket {
+				quota_epoch: ticket.quota_epoch + 1,
+				..ticket
+			}
+		));
 
 		guard.rate_limit_blocked_until = Some(now + Duration::from_secs(60));
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
@@ -4151,7 +4157,9 @@ mod tests {
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
 		guard.upstream_failure_blocked_until = None;
-		guard.edge_state = EdgeCircuitState::Open { until: now + Duration::from_secs(60) };
+		guard.edge_state = EdgeCircuitState::Open {
+			until: now + Duration::from_secs(60),
+		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
 	}
