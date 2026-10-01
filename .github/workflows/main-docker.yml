@@ -66,6 +66,7 @@ jobs:
           cargo test --locked --lib test_upstream_cooldown_wait_is_server_side_and_bounded
           cargo test --locked --lib test_tor_spillover_admission_respects_tor_guard
           cargo test --locked --lib test_quota_rotation_requires_known_exhausted_current_generation
+          cargo test --locked --lib test_tor_early_rotation_
           cargo test --locked --lib test_emergency_quota_rotation_requires_reserve_exhaustion_and_long_wait
           cargo test --locked --lib test_completed_quota_rotation_can_cross_launch_threshold
           cargo test --locked --lib test_emergency_quota_rotation_claim_survives_stable_refresh_but_not_new_epoch

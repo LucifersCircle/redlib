@@ -63,6 +63,10 @@ const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
 const LOW_RATE_LIMIT_THRESHOLD: u16 = 10;
 const QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(120);
 const EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(30);
+// Leave enough allowance to serve through a slow Tor OAuth refresh. Only
+// preserve the current Tor identity when the reset is genuinely imminent.
+const TOR_LOW_RATE_LIMIT_THRESHOLD: u16 = 30;
+const TOR_QUOTA_ROTATION_MIN_RESET_REMAINING: Duration = Duration::from_secs(5);
 const QUOTA_SAFETY_RESERVE: u16 = 5;
 const LOCAL_QUOTA_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const LOCAL_QUOTA_RETRY_INTERVAL: Duration = Duration::from_millis(650);
@@ -614,6 +618,21 @@ impl UpstreamGuard {
 		true
 	}
 
+	fn low_rate_limit_threshold(&self) -> u16 {
+		match self.lane {
+			RedditLane::Direct => LOW_RATE_LIMIT_THRESHOLD,
+			RedditLane::Tor => TOR_LOW_RATE_LIMIT_THRESHOLD,
+		}
+	}
+
+	fn quota_rotation_min_reset_remaining(&self, mode: QuotaRotationMode) -> Duration {
+		match (self.lane, mode) {
+			(RedditLane::Tor, _) => TOR_QUOTA_ROTATION_MIN_RESET_REMAINING,
+			(RedditLane::Direct, QuotaRotationMode::Proactive) => QUOTA_ROTATION_MIN_RESET_REMAINING,
+			(RedditLane::Direct, QuotaRotationMode::Emergency) => EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+		}
+	}
+
 	fn quota_rotation_window_matches(&self, now: Instant, mode: QuotaRotationMode) -> bool {
 		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
 			return false;
@@ -621,9 +640,12 @@ impl UpstreamGuard {
 		let Some(remaining) = reset_at.checked_duration_since(now) else {
 			return false;
 		};
+		if remaining <= self.quota_rotation_min_reset_remaining(mode) {
+			return false;
+		}
 		match mode {
-			QuotaRotationMode::Proactive => available < LOW_RATE_LIMIT_THRESHOLD && remaining > QUOTA_ROTATION_MIN_RESET_REMAINING,
-			QuotaRotationMode::Emergency => available <= QUOTA_SAFETY_RESERVE && remaining > EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING,
+			QuotaRotationMode::Proactive => available < self.low_rate_limit_threshold(),
+			QuotaRotationMode::Emergency => available <= QUOTA_SAFETY_RESERVE,
 		}
 	}
 
@@ -673,7 +695,7 @@ impl UpstreamGuard {
 			return false;
 		}
 		match ticket.mode {
-			QuotaRotationMode::Proactive => available < LOW_RATE_LIMIT_THRESHOLD,
+			QuotaRotationMode::Proactive => available < self.low_rate_limit_threshold(),
 			QuotaRotationMode::Emergency => available <= QUOTA_SAFETY_RESERVE,
 		}
 	}
@@ -694,7 +716,7 @@ impl UpstreamGuard {
 			return None;
 		};
 		let reset_remaining = reset_at.saturating_duration_since(now);
-		if available >= LOW_RATE_LIMIT_THRESHOLD || reset_remaining > QUOTA_ROTATION_MIN_RESET_REMAINING {
+		if available >= self.low_rate_limit_threshold() || reset_remaining > self.quota_rotation_min_reset_remaining(QuotaRotationMode::Proactive) {
 			return None;
 		}
 		self.quota_wait_logged_epoch = Some(self.quota.epoch);
@@ -778,7 +800,7 @@ impl UpstreamGuard {
 			return;
 		}
 		let applied = self.quota.reconcile(now, attempt, remaining, reset, quota_exhausted);
-		if applied && !quota_exhausted && remaining.is_some_and(|remaining| remaining >= LOW_RATE_LIMIT_THRESHOLD) {
+		if applied && !quota_exhausted && remaining.is_some_and(|remaining| remaining >= self.low_rate_limit_threshold()) {
 			self.quota_rotation_armed = true;
 		}
 		attempt.quota_reconciled = true;
@@ -1157,7 +1179,8 @@ fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<
 
 	if let Some((available, reset_remaining)) = short_reset {
 		info!(
-			"Reddit request budget is low but resets soon: remaining={} effective_available={} used={} reset_seconds={} endpoint={}; preserving the current anonymous OAuth identity",
+			"Reddit request budget is low but resets soon: lane={} remaining={} effective_available={} used={} reset_seconds={} endpoint={}; preserving the current anonymous OAuth identity",
+			lane.label(),
 			remaining.map_or(0, u16::from),
 			available,
 			used.map_or(0, u16::from),
@@ -4016,6 +4039,129 @@ mod tests {
 		let denial = tor.try_admit(now, 9).unwrap_err();
 		assert_eq!(denial.source, "active_cooldown");
 		assert_eq!(denial.reason, CooldownReason::RateLimit);
+	}
+
+	#[test]
+	fn test_tor_early_rotation_keeps_current_allowance_admitted() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		guard.quota_rotation_armed = true;
+		guard.quota.window = QuotaWindow::Known {
+			available: 30,
+			reset_at: now + Duration::from_secs(600),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+		let mut attempt = guard.try_admit(now, 7).unwrap();
+		let ticket = guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive).unwrap();
+		assert!(guard.claim_quota_rotation(now, ticket));
+		assert_eq!(ticket.lane, RedditLane::Tor);
+		assert_eq!(guard.quota_rotation_candidate(now, 6, QuotaRotationMode::Proactive), None);
+		// Preparing the replacement must not consume or disable the old session.
+		assert_eq!(guard.quota.generation, 7);
+		guard.reconcile_quota(now, &mut attempt, Some(29), Some(Duration::from_secs(600)), false);
+		let mut follower = guard.try_admit(now, 7).unwrap();
+		assert!(guard.quota_rotation_still_needed(now, ticket));
+		guard.reconcile_quota(now, &mut follower, Some(28), Some(Duration::from_secs(600)), false);
+		follower.completed = true;
+		attempt.completed = true;
+
+		guard.lane = RedditLane::Direct;
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+	}
+
+	#[test]
+	fn test_tor_early_rotation_avoids_long_near_reset_pause() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		guard.quota_rotation_armed = true;
+		for seconds in [600, 120, 30, 29, 6] {
+			guard.quota.window = QuotaWindow::Known {
+				available: 29,
+				reset_at: now + Duration::from_secs(seconds),
+			};
+			assert!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive).is_some());
+			assert_eq!(guard.take_short_reset_notice(now, 7), None);
+		}
+		guard.quota.window = QuotaWindow::Known {
+			available: 29,
+			reset_at: now + Duration::from_secs(5),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+		assert_eq!(guard.take_short_reset_notice(now, 7), Some((29, Duration::from_secs(5))));
+		assert_eq!(guard.take_short_reset_notice(now, 7), None);
+
+		guard.quota.window = QuotaWindow::Known {
+			available: 0,
+			reset_at: now + Duration::from_secs(29),
+		};
+		let ticket = guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency).unwrap();
+		assert!(guard.try_admit(now, 7).unwrap_err().reserve_exhausted);
+		assert!(guard.claim_quota_rotation(now, ticket));
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+		guard.emergency_rotation_claimed_epoch = None;
+		guard.quota.window = QuotaWindow::Known {
+			available: 0,
+			reset_at: now + Duration::from_secs(5),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+		assert_eq!(guard.quota_rotation_candidate(now + Duration::from_secs(5), 7, QuotaRotationMode::Proactive), None);
+	}
+
+	#[test]
+	fn test_tor_early_rotation_requires_healthy_discovery() {
+		let now = Instant::now();
+		for remaining in [0, 9, 29, 30, 99] {
+			let mut guard = UpstreamGuard::new(RedditLane::Tor);
+			guard.install_oauth_generation(7, true);
+			let mut attempt = guard.try_admit(now, 7).unwrap();
+			guard.reconcile_quota(now, &mut attempt, Some(remaining), Some(Duration::from_secs(600)), false);
+			assert_eq!(guard.quota_rotation_armed, remaining >= 30);
+			if remaining < 30 {
+				assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+				assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Emergency), None);
+			}
+			attempt.completed = true;
+		}
+	}
+
+	#[test]
+	fn test_tor_early_rotation_completion_respects_reset_and_cooldowns() {
+		let now = Instant::now();
+		let reset_at = now + Duration::from_secs(6);
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		guard.quota_rotation_armed = true;
+		guard.quota.window = QuotaWindow::Known { available: 29, reset_at };
+		let ticket = guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive).unwrap();
+		assert!(guard.claim_quota_rotation(now, ticket));
+		let completed_at = now + Duration::from_secs(2);
+		assert!(!guard.quota_rotation_still_needed(completed_at, ticket));
+		assert!(guard.completed_quota_rotation_still_valid(completed_at, ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(reset_at, ticket));
+		assert!(!guard.completed_quota_rotation_still_valid(now, QuotaRotationTicket { generation: 6, ..ticket }));
+		assert!(!guard.completed_quota_rotation_still_valid(
+			now,
+			QuotaRotationTicket {
+				quota_epoch: ticket.quota_epoch + 1,
+				..ticket
+			}
+		));
+
+		guard.rate_limit_blocked_until = Some(now + Duration::from_secs(60));
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
+		guard.rate_limit_blocked_until = None;
+		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(60));
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
+		guard.upstream_failure_blocked_until = None;
+		guard.edge_state = EdgeCircuitState::Open {
+			until: now + Duration::from_secs(60),
+		};
+		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
+		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
 	}
 
 	#[test]
