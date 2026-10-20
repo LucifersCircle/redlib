@@ -6,10 +6,13 @@ use scraper::{node::Node, ElementRef, Html, Selector};
 use serde_json::{json, Value};
 use std::{
 	collections::HashMap,
-	sync::{LazyLock, Mutex},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		LazyLock, Mutex,
+	},
 	time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use wreq::EmulationFactory;
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -36,7 +39,12 @@ impl ThreadPath {
 		if !valid_id(id) || tail.len() > 2 || !path.starts_with('/') || path.starts_with("//") {
 			return None;
 		}
-		let mut website_path = format!("{prefix}/{id}/_/");
+		let slug = tail
+			.first()
+			.copied()
+			.filter(|slug| slug.len() <= 512 && slug.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+			.unwrap_or("_");
+		let mut website_path = format!("{prefix}/{id}/{slug}/");
 		if let [_, comment] = tail {
 			if !valid_id(comment) {
 				return None;
@@ -71,6 +79,8 @@ struct Session {
 	client: wreq::Client,
 	capacity: Semaphore,
 	cooldown: Mutex<Option<Instant>>,
+	ready_logged: AtomicBool,
+	bootstrap: OnceCell<()>,
 }
 
 static DIRECT: LazyLock<Result<Session, String>> = LazyLock::new(|| Session::new(RedditLane::Direct));
@@ -96,6 +106,8 @@ impl Session {
 			client: builder.build().map_err(|_| WAIT.to_string())?,
 			capacity: Semaphore::new(4),
 			cooldown: Mutex::new(None),
+			ready_logged: AtomicBool::new(false),
+			bootstrap: OnceCell::new(),
 		})
 	}
 }
@@ -122,12 +134,26 @@ pub(crate) async fn fetch(thread: &ThreadPath, lane: RedditLane) -> Result<Value
 		let mut until = session.cooldown.lock().unwrap();
 		let next = Instant::now() + Duration::from_secs(5);
 		*until = Some(until.map_or(next, |old| old.max(next)));
+	} else if !session.ready_logged.swap(true, Ordering::Relaxed) {
+		log::info!("Anonymous Reddit website comments are ready: lane={} backend=website_html", lane.label());
 	}
 	result
 }
 
 async fn fetch_inner(session: &Session, thread: &ThreadPath, lane: RedditLane) -> Result<Value, String> {
 	let origin = lane.auth_origin();
+	// The homepage establishes a fresh logged-out website session. Never copy
+	// visitor cookies or OAuth credentials into this separate cookie jar.
+	session
+		.bootstrap
+		.get_or_try_init(|| async {
+			let response = session.client.get(format!("{}/", origin.base)).send().await.map_err(|_| WAIT.to_string())?;
+			if !response.status().is_success() && !response.status().is_redirection() {
+				return Err(WAIT.to_string());
+			}
+			Ok(())
+		})
+		.await?;
 	let mut url = url::Url::parse(&format!("{}{}", origin.base, thread.website_path)).map_err(|_| WAIT.to_string())?;
 	for _ in 0..4 {
 		let response = session.client.get(url.as_str()).send().await.map_err(|_| WAIT.to_string())?;
@@ -137,6 +163,11 @@ async fn fetch_inner(session: &Session, thread: &ThreadPath, lane: RedditLane) -
 			continue;
 		}
 		if !response.status().is_success() {
+			log::warn!(
+				"Anonymous Reddit website request rejected: lane={} backend=website_html status={}",
+				lane.label(),
+				response.status().as_u16()
+			);
 			if matches!(response.status().as_u16(), 403 | 429 | 503) {
 				let delay = response
 					.headers()
@@ -167,7 +198,10 @@ async fn fetch_inner(session: &Session, thread: &ThreadPath, lane: RedditLane) -
 		return tokio::task::spawn_blocking(move || parse_comments(&html, &id))
 			.await
 			.map_err(|_| WAIT.to_string())?
-			.map_err(|_| WAIT.to_string());
+			.map_err(|reason| {
+				log::warn!("Anonymous Reddit website response incomplete: lane={} backend=website_html reason={reason}", lane.label());
+				WAIT.to_string()
+			});
 	}
 	Err(WAIT.to_string())
 }
@@ -362,12 +396,39 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "requires explicit isolated Tor access to a public Reddit thread"]
 	async fn live_anonymous_comments_html() {
-		let path = ThreadPath::parse("/r/codex/comments/1xaomu1.json?sort=new").unwrap();
+		let _ = pretty_env_logger::try_init();
+		let path = ThreadPath::parse("/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?sort=new").unwrap();
 		let result = fetch(&path, RedditLane::Tor).await.expect("anonymous website comments must load");
 		let roots = result["data"]["children"].as_array().expect("comment listing");
 		assert!(!roots.is_empty(), "the supplied public thread has comments");
 		assert!(roots.iter().all(|c| c["data"]["body_html"].as_str().is_some_and(|body| !body.is_empty())));
 		println!("ANONYMOUS_HTML_ADAPTER root_comments={} tree_valid=true", roots.len());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "requires explicit isolated Tor access and an anonymous OAuth session"]
+	async fn live_anonymous_comments_page() {
+		let _ = pretty_env_logger::try_init();
+		assert_eq!(std::env::var("REDLIB_REDDIT_PRIMARY_LANE").as_deref(), Ok("tor"));
+		let oauth = tokio::time::timeout(Duration::from_secs(60), crate::oauth::Oauth::new(RedditLane::Tor))
+			.await
+			.expect("anonymous Tor OAuth startup");
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		for query in ["", "?sort=new"] {
+			let path = format!("/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/{query}");
+			let request = hyper::Request::builder().uri(&path).body(hyper::Body::empty()).unwrap();
+			let response = tokio::time::timeout(Duration::from_secs(75), crate::post::item(request))
+				.await
+				.expect("page budget")
+				.expect("rendered page");
+			assert_eq!(response.status(), 200, "page must load without the recovery screen");
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let body = String::from_utf8(body.to_vec()).unwrap();
+			assert!(body.contains("Why is my Dot mad at me?"));
+			assert!(body.contains("class=\"comment\""), "page must contain real comments");
+			assert!(!body.contains("Still trying to load your page"));
+			println!("ANONYMOUS_COMMENTS_PAGE sorted={} status=200 post_visible=true comments_visible=true", !query.is_empty());
+		}
 	}
 
 	fn page(comments: &str) -> String {

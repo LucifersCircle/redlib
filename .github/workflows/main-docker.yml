@@ -12,6 +12,7 @@ jobs:
     timeout-minutes: 15
     env:
       REDLIB_TOR_FALLBACK: "on"
+      REDLIB_REDDIT_PRIMARY_LANE: tor
       REDLIB_TOR_PROXY: socks5h://127.0.0.1:19050
     steps:
       - uses: actions/checkout@v4
@@ -40,4 +41,6 @@ jobs:
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
       - name: Verify the anonymous comments HTML adapter
-        run: cargo test --locked --lib live_anonymous_comments_html -- --ignored --nocapture
+        run: |
+          cargo test --locked --lib live_anonymous_comments_html -- --ignored --nocapture
+          cargo test --locked --lib live_anonymous_comments_page -- --ignored --nocapture
