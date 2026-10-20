@@ -137,7 +137,11 @@ pub(crate) async fn fetch(thread: &ThreadPath, lane: RedditLane) -> Result<Value
 		.await
 		.map_err(|_| WAIT.to_string())?
 		.map_err(|_| WAIT.to_string())?;
-	let result = tokio::time::timeout(Duration::from_secs(25), fetch_inner(session, thread, lane))
+	let budget = match lane {
+		RedditLane::Tor => Duration::from_secs(35),
+		RedditLane::Direct => Duration::from_secs(10),
+	};
+	let result = tokio::time::timeout(budget, fetch_inner(session, thread, lane))
 		.await
 		.unwrap_or_else(|_| Err(WAIT.to_string()));
 	drop(permit);
@@ -551,12 +555,27 @@ fn safe_link(value: &str) -> bool {
 mod tests {
 	use super::*;
 
+	async fn live_fetch(path: &ThreadPath) -> Value {
+		for attempt in 1..=3 {
+			match fetch(path, RedditLane::Tor).await {
+				Ok(value) => return value,
+				Err(error) if attempt < 3 => {
+					println!("ANONYMOUS_HTML_RECOVERY attempt={attempt}");
+					tokio::time::sleep(Duration::from_secs(6)).await;
+					drop(error);
+				}
+				Err(error) => panic!("anonymous website recovery exhausted: {error}"),
+			}
+		}
+		unreachable!()
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "requires explicit isolated Tor access to a public Reddit thread"]
 	async fn live_anonymous_comments_html() {
 		let _ = pretty_env_logger::try_init();
 		let path = ThreadPath::parse("/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?sort=new").unwrap();
-		let result = fetch(&path, RedditLane::Tor).await.expect("anonymous website comments must load");
+		let result = live_fetch(&path).await;
 		let roots = result["data"]["children"].as_array().expect("comment listing");
 		assert!(!roots.is_empty(), "the supplied public thread has comments");
 		assert!(roots.iter().all(|c| c["data"]["body_html"].as_str().is_some_and(|body| !body.is_empty())));
@@ -604,10 +623,11 @@ mod tests {
 			}
 			None
 		}
-		let initial = replies(&result, &target).unwrap();
+		let baseline = parse_comments(&html, "1xaomu1").unwrap();
+		let initial = replies(&baseline, &target).unwrap();
 		let id = target.strip_prefix("t1_").unwrap();
 		let path = ThreadPath::parse(&format!("/r/codex/comments/1xaomu1/_/{id}.json")).unwrap();
-		let expanded = fetch(&path, RedditLane::Tor).await.expect("anonymous reply continuation");
+		let expanded = live_fetch(&path).await;
 		let after = replies(&expanded, &target).unwrap();
 		assert!(after > initial, "the continuation must load additional real replies");
 		println!("ANONYMOUS_REPLY_EXPANSION initial_replies={initial} expanded_replies={after}");
