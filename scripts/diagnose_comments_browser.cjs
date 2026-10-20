@@ -1,4 +1,21 @@
 const { chromium } = require('playwright');
+const { spawn } = require('node:child_process');
+async function anonymousCookieTokenProbe(context, base, proxyServer) {
+  const cookie=(await context.cookies()).find(c=>c.name==='token_v2');
+  if(!cookie) return {available:false};
+  const token=decodeURIComponent(cookie.value);
+  const args=['--silent','--show-error','--max-time','35','--max-filesize','8388608','--write-out','\n%{http_code}','--config','-'];
+  if(proxyServer) args.push('--proxy',proxyServer.replace('socks5://','socks5h://'));
+  args.push(base.replace('https://www.','https://oauth.')+'/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1');
+  return new Promise(resolve=>{
+    const child=spawn('curl',args);let output='';
+    child.stdout.on('data',d=>{if(output.length<8388608)output+=d.toString()});
+    child.stderr.resume();
+    child.on('error',()=>resolve({available:true,transportError:true}));
+    child.on('close',code=>{const cut=output.lastIndexOf('\n');const text=output.slice(0,cut);let json;try{json=JSON.parse(text)}catch{}resolve({available:true,exit:code,status:Number(output.slice(cut+1)),array:Array.isArray(json),listings:Array.isArray(json)?json.map(x=>({kind:x.kind,children:x.data?.children?.length})):null,blocked:/blocked by network security/i.test(text)})});
+    child.stdin.end('header = '+JSON.stringify('Authorization: Bearer '+token)+'\nheader = "Accept: application/json"\nheader = "User-Agent: linux:LucifersCircle.redlib:0.36.0 (https://github.com/LucifersCircle/redlib)"\n');
+  });
+}
 async function inspect(label, base, proxyServer) {
   const options = {executablePath:process.env.REDLIB_DIAGNOSTIC_BROWSER || '/usr/bin/chromium',headless:process.env.REDLIB_DIAGNOSTIC_HEADED !== 'on'};
   if (proxyServer) options.proxy = {server:proxyServer};
@@ -37,6 +54,7 @@ async function inspect(label, base, proxyServer) {
       },suffix);
       console.log(JSON.stringify({lane:label,probe:'anonymous_html_fetch',...await get('')}));
       console.log(JSON.stringify({lane:label,probe:'anonymous_html_sort_new',...await get('?sort=new')}));
+      console.log(JSON.stringify({lane:label,probe:'anonymous_web_token_comments',...await anonymousCookieTokenProbe(context,base,proxyServer)}));
       const sortButton=page.locator('#comment-sort-button');
       if(await sortButton.count()) {
         await sortButton.first().click({timeout:5000});
