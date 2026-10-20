@@ -841,6 +841,77 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "manual anonymous website HTML compatibility comparison"]
+	async fn live_anonymous_html_comments_diagnostic() {
+		use hyper::body::HttpBody;
+		use wreq::EmulationFactory;
+		let emulation = wreq_util::EmulationOption::builder()
+			.emulation(wreq_util::Emulation::Chrome145)
+			.emulation_os(wreq_util::EmulationOS::Windows)
+			.build()
+			.emulation();
+		let proxy = wreq::Proxy::all(std::env::var("REDLIB_TOR_PROXY").expect("diagnostic Tor proxy")).unwrap();
+		let client = wreq::Client::builder()
+			.emulation(emulation)
+			.proxy(proxy)
+			.redirect(wreq::redirect::Policy::none())
+			.build()
+			.unwrap();
+		let base = RedditLane::Tor.auth_origin().base;
+		let mut cookies = std::collections::BTreeMap::new();
+		for (probe, path) in [
+			("home", "/"),
+			("thread", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/"),
+			("sorted_thread", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/?sort=new"),
+		] {
+			let result = timeout(Duration::from_secs(60), async {
+				let mut request = client.get(format!("{base}{path}"));
+				if !cookies.is_empty() {
+					request = request.header("Cookie", cookies.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join("; "));
+				}
+				let response = request.send().await.ok()?;
+				let status = response.status().as_u16();
+				let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_owned();
+				for value in response.headers().get_all("set-cookie") {
+					if let Ok(value) = value.to_str() {
+						if let Ok(cookie) = cookie::Cookie::parse(value.to_owned()) {
+							cookies.insert(cookie.name().to_owned(), cookie.value().to_owned());
+						}
+					}
+				}
+				let mut stream = hyper::Body::wrap_stream(response.bytes_stream());
+				let mut bytes = Vec::new();
+				while let Some(Ok(chunk)) = stream.data().await {
+					if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
+						return None;
+					}
+					bytes.extend_from_slice(&chunk);
+				}
+				let text = String::from_utf8_lossy(&bytes);
+				Some((
+					status,
+					content,
+					text.matches("<shreddit-comment ").count(),
+					text.contains("Why is my Dot mad at me?"),
+					text.contains("blocked by network security"),
+				))
+			})
+			.await;
+			match result {
+				Ok(Some((status, content, comments, has_post, blocked))) => {
+					println!(
+						"HTML_COMMENTS_DIAGNOSTIC probe={probe} status={status} content={content} comments={comments} has_post={has_post} blocked={blocked} cookie_names={:?}",
+						cookies.keys().collect::<Vec<_>>()
+					);
+					if status == 429 {
+						break;
+					}
+				}
+				_ => println!("HTML_COMMENTS_DIAGNOSTIC probe={probe} transport_or_body_failed=true"),
+			}
+		}
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "manual anonymous OAuth grant comparison"]

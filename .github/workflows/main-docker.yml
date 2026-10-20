@@ -18,9 +18,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install Tor and browser driver
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends tor xvfb xauth
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends tor xvfb xauth cmake pkg-config libclang-dev
           npm install --prefix "$RUNNER_TEMP/comments-browser" playwright
           google-chrome --version
       - name: Start isolated diagnostic Tor
@@ -44,3 +46,5 @@ jobs:
           REDLIB_DIAGNOSTIC_TOR: "on"
           REDLIB_DIAGNOSTIC_HEADED: "on"
         run: xvfb-run --auto-servernum node scripts/diagnose_comments_browser.cjs
+      - name: Compare anonymous HTML using the Rust HTTP transport
+        run: cargo test --locked --lib live_anonymous_html_comments_diagnostic -- --ignored --nocapture
