@@ -626,6 +626,43 @@ mod tests {
 		let baseline = parse_comments(&html, "1xaomu1").unwrap();
 		let initial = replies(&baseline, &target).unwrap();
 		let id = target.strip_prefix("t1_").unwrap();
+		let paths = reply_paths(&html, "1xaomu1", id, RedditLane::Tor).unwrap();
+		for path in paths.iter().take(1) {
+			let url = url::Url::parse(path).unwrap();
+			println!(
+				"ANONYMOUS_REPLY_SOURCE target={target} query={:?}",
+				url
+					.query_pairs()
+					.filter(|(key, _)| matches!(key.as_ref(), "sort" | "startingDepth" | "commentParentPositions"))
+					.collect::<Vec<_>>()
+			);
+			for mode in ["default", "fetch"] {
+				let mut request = session.client.get(path);
+				if mode == "fetch" {
+					request = request
+						.header("Accept", "text/vnd.reddit.partial+html")
+						.header("Sec-Fetch-Dest", "empty")
+						.header("Sec-Fetch-Mode", "cors")
+						.header("Sec-Fetch-Site", "same-origin")
+						.header(
+							"Referer",
+							format!("{}/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/", RedditLane::Tor.auth_origin().base),
+						);
+				}
+				let response = request.send().await.unwrap();
+				let status = response.status().as_u16();
+				let kind = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+				let body = response.text().await.unwrap();
+				let doc = Html::parse_document(&body);
+				println!(
+					"ANONYMOUS_REPLY_RESPONSE mode={mode} status={status} content_type={kind} comments={} target_reply={} contains_tag={} first_tag={:?}",
+					doc.select(&selector("shreddit-comment")).count(),
+					has_replies_to(&body, "1xaomu1", id),
+					body.contains("<shreddit-comment"),
+					doc.root_element().value().name()
+				);
+			}
+		}
 		let path = ThreadPath::parse(&format!("/r/codex/comments/1xaomu1/_/{id}.json")).unwrap();
 		let expanded = live_fetch(&path).await;
 		let after = replies(&expanded, &target).unwrap();
