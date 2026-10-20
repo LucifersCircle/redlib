@@ -1,6 +1,6 @@
 const { chromium } = require('playwright');
 async function inspect(label, base, proxyServer) {
-  const options = {executablePath:process.env.REDLIB_DIAGNOSTIC_BROWSER || '/usr/bin/chromium',headless:true};
+  const options = {executablePath:process.env.REDLIB_DIAGNOSTIC_BROWSER || '/usr/bin/chromium',headless:process.env.REDLIB_DIAGNOSTIC_HEADED !== 'on'};
   if (proxyServer) options.proxy = {server:proxyServer};
   const browser = await chromium.launch(options);
   const context = await browser.newContext();
