@@ -40,11 +40,7 @@ impl ThreadPath {
 		if !valid_id(id) || tail.len() > 2 || !path.starts_with('/') || path.starts_with("//") {
 			return None;
 		}
-		let slug = tail
-			.first()
-			.copied()
-			.filter(|slug| slug.len() <= 512 && slug.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
-			.unwrap_or("_");
+		let slug = tail.first().copied().filter(|slug| valid_slug(slug)).unwrap_or("_");
 		let mut website_path = format!("{prefix}/{id}/{slug}/");
 		if let [_, comment] = tail {
 			if !valid_id(comment) {
@@ -74,6 +70,15 @@ fn valid_id(id: &str) -> bool {
 }
 fn valid_sub(sub: &str) -> bool {
 	!sub.is_empty() && sub.len() <= 32 && sub.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn valid_slug(slug: &str) -> bool {
+	if slug.is_empty() || slug.len() > 512 {
+		return false;
+	}
+	percent_encoding::percent_decode_str(slug)
+		.decode_utf8()
+		.is_ok_and(|value| value != "." && value != ".." && !value.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | '?' | '#')))
 }
 
 struct Session {
@@ -528,6 +533,16 @@ mod tests {
 
 	#[test]
 	fn comments_html_paths_keep_thread_context_and_allowlisted_queries() {
+		assert_eq!(
+			ThreadPath::parse("/r/codex/comments/abc123/日本語/.json").unwrap().website_path,
+			"/r/codex/comments/abc123/日本語/"
+		);
+		assert_eq!(
+			ThreadPath::parse("/r/codex/comments/abc123/%E6%97%A5/.json").unwrap().website_path,
+			"/r/codex/comments/abc123/%E6%97%A5/"
+		);
+		assert!(!valid_slug("%2f%2fevil.example"));
+		assert!(!valid_slug("%2e%2e"));
 		assert_eq!(
 			ThreadPath::parse("/r/codex/comments/abc123/title/.json").unwrap().website_path,
 			"/r/codex/comments/abc123/title/"
