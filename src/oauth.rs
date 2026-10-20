@@ -841,6 +841,65 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "manual live endpoint diagnosis; performs one authentication per lane"]
+	async fn live_comments_endpoint_diagnostic() {
+		use hyper::body::HttpBody;
+		let profile = OauthTransportProfile::Firefox143Android;
+		for lane in [RedditLane::Direct, RedditLane::Tor] {
+			let client = client_for_oauth_profile(lane, profile).expect("diagnostic transport");
+			let mut backend = MobileSpoofAuth::new(lane);
+			let oauth = match Oauth::authenticate_with_backend(&mut backend, client, profile).await {
+				Ok(oauth) => oauth,
+				Err(error) => {
+					println!("ENDPOINT_DIAGNOSTIC lane={} auth_failed={error}", lane.label());
+					continue;
+				}
+			};
+			println!("ENDPOINT_DIAGNOSTIC lane={} auth=ok", lane.label());
+			for (label, path) in [
+				("listing", "/r/codex/hot.json?limit=1&raw_json=1"),
+				("current_comments", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1"),
+				("documented_comments", "/comments/1xaomu1?depth=1&limit=1&raw_json=1"),
+				("scoped_comments", "/r/codex/comments/1xaomu1?depth=1&limit=1&raw_json=1"),
+				("full_comments", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?depth=1&limit=1&raw_json=1"),
+			] {
+				let result = timeout(Duration::from_secs(30), async {
+					let origin = lane.api_origin();
+					let mut request = oauth.http_client.get(format!("{}{path}", origin.base)).header("Host", origin.host).header("Cookie", "");
+					for (key, value) in &oauth.headers_map {
+						request = request.header(key, value);
+					}
+					let response = request.send().await?;
+					let status = response.status().as_u16();
+					let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_string();
+					let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_string();
+					let mut body = response.into_hyper_response().into_body();
+					let mut bytes = Vec::new();
+					while let Some(Ok(chunk)) = body.data().await {
+						let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
+						bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+						if bytes.len() >= 256 * 1024 {
+							break;
+						}
+					}
+					let json_array = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| value.is_array());
+					let network_block = String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("blocked by network security");
+					println!(
+						"ENDPOINT_DIAGNOSTIC lane={} route={label} status={status} content={content} retry_after={retry} bytes={} json_array={json_array} network_block={network_block}",
+						lane.label(),
+						bytes.len()
+					);
+					Ok::<(), wreq::Error>(())
+				})
+				.await;
+				if !matches!(result, Ok(Ok(()))) {
+					println!("ENDPOINT_DIAGNOSTIC lane={} route={label} transport_or_timeout=true", lane.label());
+				}
+				tokio::time::sleep(Duration::from_secs(2)).await;
+			}
+		}
+	}
 	use super::*;
 	use crate::client::OAUTH_CLIENT;
 
