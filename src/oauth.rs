@@ -920,12 +920,11 @@ mod tests {
 		let mut backend = MobileSpoofAuth::new(RedditLane::Tor);
 		if let Ok(Ok(auth)) = timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(&api_client)).await {
 			for post_path in ["/api/info.json?id=t3_1xaomu1&raw_json=1", "/by_id/t3_1xaomu1.json?raw_json=1"] {
-				if let Ok(Ok(response)) = timeout(
-					Duration::from_secs(45),
-					api_client.get(format!("{}{post_path}", RedditLane::Tor.api_origin().base)).bearer_auth(&auth.token).send(),
-				)
-				.await
-				{
+				let mut request = api_client.get(format!("{}{post_path}", RedditLane::Tor.api_origin().base)).bearer_auth(&auth.token);
+				for (key, value) in backend.get_headers().into_iter().chain(auth.additional_headers.clone()) {
+					request = request.header(key, value);
+				}
+				if let Ok(Ok(response)) = timeout(Duration::from_secs(45), request.send()).await {
 					let status = response.status().as_u16();
 					let value = response.json::<serde_json::Value>().await.unwrap_or_default();
 					println!(
