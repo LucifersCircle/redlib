@@ -859,31 +859,37 @@ mod tests {
 			println!("ENDPOINT_DIAGNOSTIC lane={} auth=ok", lane.label());
 			for (label, path, public) in [
 				("baseline", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("json_accept", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("api_headers", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("root_api_headers", "/comments/1xaomu1?depth=1&limit=1&raw_json=1", false),
-				(
-					"public_authenticated",
-					"/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?depth=1&limit=1&raw_json=1",
-					true,
-				),
-				(
-					"public_api_headers",
-					"/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?depth=1&limit=1&raw_json=1",
-					true,
-				),
+				("minimal_oauth", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("minimal_descriptive_ua", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("minimal_session", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("mobile_no_retry", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("mobile_no_cookie", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
 			] {
 				let result = timeout(Duration::from_secs(30), async {
 					let origin = if public { lane.auth_origin() } else { lane.api_origin() };
-					let mut request = oauth.http_client.get(format!("{}{path}", origin.base)).header("Host", origin.host).header("Cookie", "");
-					if label.contains("api_headers") {
-						request = request.default_headers(false);
-					}
-					if label != "baseline" {
-						request = request.header("Accept", "application/json");
+					let mut request = oauth.http_client.get(format!("{}{path}", origin.base)).header("Host", origin.host);
+					if label == "baseline" {
+						request = request.header("Cookie", "");
+					} else {
+						request = request.default_headers(false).header("Accept", "application/json");
 					}
 					for (key, value) in &oauth.headers_map {
+						let lower = key.to_ascii_lowercase();
+						let essential = matches!(lower.as_str(), "authorization" | "user-agent");
+						let session = matches!(lower.as_str(), "x-reddit-loid" | "x-reddit-session");
+						if matches!(label, "minimal_oauth" | "minimal_descriptive_ua") && !essential {
+							continue;
+						}
+						if label == "minimal_session" && !(essential || session) {
+							continue;
+						}
+						if label == "mobile_no_retry" && lower == "x-reddit-retry" {
+							continue;
+						}
 						request = request.header(key, value);
+					}
+					if label == "minimal_descriptive_ua" {
+						request = request.header("User-Agent", "linux:LucifersCircle.redlib:0.36.0 (https://github.com/LucifersCircle/redlib)");
 					}
 					let response = request.send().await?;
 					let status = response.status().as_u16();
