@@ -47,3 +47,8 @@ jobs:
         run: |
           cargo test --locked --lib live_anonymous_comments_html -- --ignored --nocapture
           cargo test --locked --lib live_anonymous_comments_page -- --ignored --nocapture
+      - name: Capture actual anonymous browser reply request
+        if: always()
+        env:
+          NODE_PATH: ${{ runner.temp }}/comments-browser/node_modules
+        run: xvfb-run --auto-servernum node scripts/diagnose_replies_browser.cjs

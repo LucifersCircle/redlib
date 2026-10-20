@@ -654,6 +654,15 @@ mod tests {
 				let kind = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
 				let body = response.text().await.unwrap();
 				let doc = Html::parse_document(&body);
+				let encoded = body.contains("&lt;shreddit-comment") || body.contains("\\u003cshreddit-comment") || body.contains("&amp;lt;shreddit-comment");
+				let keys = serde_json::from_str::<Value>(&body)
+					.ok()
+					.and_then(|v| v.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()));
+				let mut tags = std::collections::BTreeMap::new();
+				for e in doc.select(&selector("*")) {
+					*tags.entry(e.value().name().to_owned()).or_insert(0) += 1;
+				}
+				println!("ANONYMOUS_REPLY_SHAPE mode={mode} bytes={} encoded={encoded} json_keys={keys:?} tags={tags:?}", body.len());
 				println!(
 					"ANONYMOUS_REPLY_RESPONSE mode={mode} status={status} content_type={kind} comments={} target_reply={} contains_tag={} first_tag={:?}",
 					doc.select(&selector("shreddit-comment")).count(),
