@@ -874,7 +874,7 @@ mod tests {
 					let status = response.status().as_u16();
 					let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_string();
 					let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_string();
-					let mut body = response.into_hyper_response().into_body();
+					let mut body = hyper::Body::wrap_stream(response.bytes_stream());
 					let mut bytes = Vec::new();
 					while let Some(Ok(chunk)) = body.data().await {
 						let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
