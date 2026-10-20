@@ -20,8 +20,6 @@ jobs:
       - name: Install build dependencies and Tor
         run: |
           sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev tor
-          npm install --prefix "$RUNNER_TEMP/comments-browser" playwright
-          google-chrome --version
       - name: Start isolated diagnostic Tor
         run: |
           mkdir -p "$RUNNER_TEMP/comments-tor"
@@ -36,13 +34,7 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
-      - name: Compare the documented anonymous grant
+      - name: Compare Tor routing to the clearnet comments API
         run: |
           cargo fmt --all
-          cargo test --locked --lib live_comments_grant_diagnostic -- --ignored --nocapture
-      - name: Inspect home-first anonymous browser session
-        env:
-          NODE_PATH: ${{ runner.temp }}/comments-browser/node_modules
-          REDLIB_DIAGNOSTIC_BROWSER: /usr/bin/google-chrome
-          REDLIB_DIAGNOSTIC_TOR: "on"
-        run: node scripts/diagnose_comments_browser.cjs
+          cargo test --locked --lib live_tor_clearnet_comments_diagnostic -- --ignored --nocapture

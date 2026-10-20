@@ -952,6 +952,63 @@ mod tests {
 		}
 	}
 
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "manual Tor clearnet versus onion routing comparison"]
+	async fn live_tor_clearnet_comments_diagnostic() {
+		use hyper::body::HttpBody;
+		let profile = OauthTransportProfile::Firefox143Android;
+		let client = client_for_oauth_profile(RedditLane::Tor, profile).expect("isolated Tor transport");
+		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
+		let oauth = match Oauth::authenticate_with_backend(&mut backend, client, profile).await {
+			Ok(oauth) => oauth,
+			Err(error) => {
+				println!("TOR_CLEARNET_DIAGNOSTIC auth_failed={error}");
+				return;
+			}
+		};
+		println!("TOR_CLEARNET_DIAGNOSTIC auth=ok");
+		for mode in ["mobile", "minimal"] {
+			let mut request = oauth
+				.http_client
+				.get("https://oauth.reddit.com/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1")
+				.header("Host", "oauth.reddit.com");
+			if mode == "minimal" {
+				request = request.default_headers(false).header("Accept", "application/json");
+			}
+			for (key, value) in &oauth.headers_map {
+				if mode == "minimal" && !key.eq_ignore_ascii_case("authorization") && !key.eq_ignore_ascii_case("user-agent") {
+					continue;
+				}
+				request = request.header(key, value);
+			}
+			let response = match timeout(Duration::from_secs(45), request.send()).await {
+				Ok(Ok(response)) => response,
+				_ => {
+					println!("TOR_CLEARNET_DIAGNOSTIC mode={mode} transport_or_timeout=true");
+					continue;
+				}
+			};
+			let status = response.status().as_u16();
+			let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_owned();
+			let mut body = hyper::Body::wrap_stream(response.bytes_stream());
+			let mut bytes = Vec::new();
+			while let Some(Ok(chunk)) = body.data().await {
+				let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
+				bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+				if bytes.len() >= 256 * 1024 {
+					break;
+				}
+			}
+			let json_array = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.is_array());
+			let network_block = String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("blocked by network security");
+			println!("TOR_CLEARNET_DIAGNOSTIC mode={mode} status={status} content={content} json_array={json_array} network_block={network_block}");
+			if status == 429 {
+				break;
+			}
+			tokio::time::sleep(Duration::from_secs(2)).await;
+		}
+	}
+
 	use super::*;
 	use crate::client::OAUTH_CLIENT;
 
