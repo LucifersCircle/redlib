@@ -858,29 +858,31 @@ mod tests {
 			};
 			println!("ENDPOINT_DIAGNOSTIC lane={} auth=ok", lane.label());
 			for (label, path, public) in [
-				("listing_all", "/r/all/hot.json?limit=1&raw_json=1", false),
-				("listing_all_next", "/r/all/hot.json?after=t3_1xay0pv&raw_json=1&sort=hot&t=", false),
-				("listing_all_next_minimal", "/r/all/hot.json?after=t3_1xay0pv&limit=1&raw_json=1", false),
+				("baseline", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("json_accept", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("api_headers", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
+				("root_api_headers", "/comments/1xaomu1?depth=1&limit=1&raw_json=1", false),
 				(
-					"public_comments",
+					"public_authenticated",
 					"/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?depth=1&limit=1&raw_json=1",
 					true,
 				),
-				("public_listing_next", "/r/all/hot.json?after=t3_1xay0pv&limit=1&raw_json=1", true),
 				(
-					"public_comments_browser",
+					"public_api_headers",
 					"/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?depth=1&limit=1&raw_json=1",
 					true,
 				),
-				("public_listing_next_browser", "/r/all/hot.json?after=t3_1xay0pv&limit=1&raw_json=1", true),
 			] {
 				let result = timeout(Duration::from_secs(30), async {
 					let origin = if public { lane.auth_origin() } else { lane.api_origin() };
 					let mut request = oauth.http_client.get(format!("{}{path}", origin.base)).header("Host", origin.host).header("Cookie", "");
+					if label.contains("api_headers") {
+						request = request.default_headers(false);
+					}
+					if label != "baseline" {
+						request = request.header("Accept", "application/json");
+					}
 					for (key, value) in &oauth.headers_map {
-						if label.ends_with("_browser") || public && key.eq_ignore_ascii_case("authorization") {
-							continue;
-						}
 						request = request.header(key, value);
 					}
 					let response = request.send().await?;
