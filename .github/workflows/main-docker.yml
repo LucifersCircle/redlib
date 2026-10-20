@@ -155,7 +155,8 @@ jobs:
           cargo test --locked --lib each_lane_has_matching_origins_and_redirect_allowlist
 
   publish:
-    if: github.event_name != 'pull_request'
+    # Verification-only run of merged application code; never publish an image.
+    if: false
     needs: verify
     runs-on: ubuntu-latest
     steps:
