@@ -959,23 +959,29 @@ mod tests {
 		let profile = OauthTransportProfile::Firefox143Android;
 		let client = client_for_oauth_profile(RedditLane::Tor, profile).expect("isolated Tor transport");
 		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
-		let oauth = match Oauth::authenticate_with_backend(&mut backend, client, profile).await {
-			Ok(oauth) => oauth,
-			Err(error) => {
+		let response = match timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(client.as_ref())).await {
+			Ok(Ok(response)) => response,
+			Ok(Err(error)) => {
 				println!("TOR_CLEARNET_DIAGNOSTIC auth_failed={error}");
 				return;
 			}
+			Err(_) => {
+				println!("TOR_CLEARNET_DIAGNOSTIC auth_timeout_seconds={}", TOR_OAUTH_TIMEOUT.as_secs());
+				return;
+			}
 		};
+		let mut headers = backend.get_headers();
+		headers.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
+		headers.extend(response.additional_headers);
 		println!("TOR_CLEARNET_DIAGNOSTIC auth=ok");
 		for mode in ["mobile", "minimal"] {
-			let mut request = oauth
-				.http_client
+			let mut request = client
 				.get("https://oauth.reddit.com/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1")
 				.header("Host", "oauth.reddit.com");
 			if mode == "minimal" {
 				request = request.default_headers(false).header("Accept", "application/json");
 			}
-			for (key, value) in &oauth.headers_map {
+			for (key, value) in &headers {
 				if mode == "minimal" && !key.eq_ignore_ascii_case("authorization") && !key.eq_ignore_ascii_case("user-agent") {
 					continue;
 				}
