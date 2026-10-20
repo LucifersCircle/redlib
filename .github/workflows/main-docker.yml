@@ -15,10 +15,14 @@ jobs:
       REDLIB_TOR_PROXY: socks5h://127.0.0.1:19050
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install build dependencies and Tor
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev tor
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Tor and browser driver
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends tor
+          npm install --prefix "$RUNNER_TEMP/comments-browser" playwright
+          google-chrome --version
       - name: Start isolated diagnostic Tor
         run: |
           mkdir -p "$RUNNER_TEMP/comments-tor"
@@ -33,7 +37,9 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
-      - name: Check formatting and compare live API routes
-        run: |
-          cargo fmt --all
-          cargo test --locked --lib live_comments_endpoint_diagnostic -- --ignored --nocapture
+      - name: Inspect anonymous browser comments responses
+        env:
+          NODE_PATH: ${{ runner.temp }}/comments-browser/node_modules
+          REDLIB_DIAGNOSTIC_BROWSER: /usr/bin/google-chrome
+          REDLIB_DIAGNOSTIC_TOR: "on"
+        run: node scripts/diagnose_comments_browser.cjs
