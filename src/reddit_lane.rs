@@ -41,7 +41,23 @@ pub(crate) static TOR_FALLBACK_CONFIG: LazyLock<Result<Option<TorFallbackConfig>
 	TorFallbackConfig::parse(enabled.as_deref(), proxy.as_deref())
 });
 
+pub(crate) static PRIMARY_REDDIT_LANE: LazyLock<RedditLane> = LazyLock::new(|| match RedditLane::parse_primary(env::var("REDLIB_REDDIT_PRIMARY_LANE").ok().as_deref()) {
+	Ok(lane) => lane,
+	Err(error) => {
+		log::warn!("{error}; using direct-first routing");
+		RedditLane::Direct
+	}
+});
+
 impl RedditLane {
+	fn parse_primary(value: Option<&str>) -> Result<Self, &'static str> {
+		match value {
+			None | Some("direct") => Ok(Self::Direct),
+			Some("tor") => Ok(Self::Tor),
+			_ => Err("REDLIB_REDDIT_PRIMARY_LANE must be direct or tor"),
+		}
+	}
+
 	pub(crate) fn label(self) -> &'static str {
 		match self {
 			Self::Direct => "direct",
@@ -117,6 +133,14 @@ impl TorFallbackConfig {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn primary_lane_is_explicit_and_defaults_to_direct() {
+		assert_eq!(RedditLane::parse_primary(None), Ok(RedditLane::Direct));
+		assert_eq!(RedditLane::parse_primary(Some("direct")), Ok(RedditLane::Direct));
+		assert_eq!(RedditLane::parse_primary(Some("tor")), Ok(RedditLane::Tor));
+		assert!(RedditLane::parse_primary(Some("invalid")).is_err());
+	}
 
 	#[test]
 	fn tor_fallback_requires_explicit_valid_socks5h_proxy() {

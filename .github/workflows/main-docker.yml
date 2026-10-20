@@ -47,6 +47,11 @@ jobs:
         run: cargo check --locked --all-targets
       - name: Run deterministic resilience tests
         run: |
+          cargo test --locked --lib primary_lane_is_explicit_and_defaults_to_direct
+          cargo test --locked --lib test_tor_first_
+          cargo test --locked --lib test_endpoint_edge_
+          cargo test --locked --lib test_credential_rejection_
+          cargo test --locked --lib test_rejection_
           cargo test --locked --lib test_parse_max_concurrency
           cargo test --locked --lib test_parse_delay_seconds
           cargo test --locked --lib test_parse_rate_limit_count_rejects_invalid_values
@@ -110,7 +115,7 @@ jobs:
           cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
           cargo test --locked --lib test_json_cache_policy_is_narrow
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
-          cargo test --locked --lib temporary_errors_use_service_unavailable_retry_metadata
+          cargo test --locked --lib temporary_errors_
           cargo test --locked --lib rewrite_urls_rewrites_reddit_onion_content
           cargo test --locked --lib rewrite_urls_normalizes_visible_reddit_onion_share_links
           cargo test --locked --lib rewrite_urls_preserves_distinct_onion_static_paths
