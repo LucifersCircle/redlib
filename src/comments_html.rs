@@ -483,6 +483,49 @@ mod tests {
 		let replies = target(&value[1]).expect("requested comment must be present");
 		assert!(replies > 0, "requested comment has replies");
 		println!("ANONYMOUS_COMMENT_PERMALINK total_comments={} target_replies={replies}", count(&value[1]));
+		let session = TOR.as_ref().unwrap();
+		let origin = RedditLane::Tor.auth_origin();
+		let html = session
+			.client
+			.get(format!("{}/r/codex/comments/1xaomu1/comment/phv7x54/?context=3", origin.base))
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		let (paths, seen) = {
+			let doc = Html::parse_document(&html);
+			let target = doc.select(&selector("shreddit-comment")).find(|e| e.value().attr("thingid") == Some("t1_phv7x54")).unwrap();
+			let paths = target
+				.select(&selector("faceplate-partial[src]"))
+				.filter_map(|e| e.value().attr("src"))
+				.filter(|p| p.starts_with("/svc/shreddit/more-comments/"))
+				.map(str::to_owned)
+				.collect::<Vec<_>>();
+			let seen = doc
+				.select(&selector("shreddit-comment"))
+				.filter_map(|e| e.value().attr("thingid"))
+				.map(str::to_owned)
+				.collect::<Vec<_>>();
+			(paths, seen)
+		};
+		for path in paths.into_iter().take(2) {
+			let r = session.client.get(format!("{}{path}", origin.base)).send().await.unwrap();
+			let status = r.status().as_u16();
+			let html = r.text().await.unwrap();
+			let doc = Html::parse_document(&html);
+			let ids = doc.select(&selector("shreddit-comment")).filter_map(|e| e.value().attr("thingid")).collect::<Vec<_>>();
+			let parents = doc
+				.select(&selector("shreddit-comment"))
+				.filter_map(|e| e.value().attr("parentid"))
+				.collect::<std::collections::HashSet<_>>();
+			println!(
+				"ANONYMOUS_MORE_REPLIES status={status} comments={} duplicates={} parents={parents:?}",
+				ids.len(),
+				ids.iter().filter(|id| seen.iter().any(|prior| prior == *id)).count()
+			);
+		}
 	}
 
 	#[test]
