@@ -13,6 +13,7 @@ jobs:
     env:
       REDLIB_TOR_FALLBACK: "on"
       REDLIB_REDDIT_PRIMARY_LANE: tor
+      RUST_LOG: redlib=info
       REDLIB_TOR_PROXY: socks5h://127.0.0.1:19050
     steps:
       - uses: actions/checkout@v4

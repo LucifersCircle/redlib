@@ -29,7 +29,8 @@ pub(crate) struct ThreadPath {
 impl ThreadPath {
 	pub(crate) fn parse(path: &str) -> Option<Self> {
 		let (base, query) = path.split_once('?').unwrap_or((path, ""));
-		let base = base.trim_end_matches('/').strip_suffix(".json").unwrap_or(base.trim_end_matches('/'));
+		let base = base.trim_end_matches('/');
+		let base = base.strip_suffix(".json").unwrap_or(base).trim_end_matches('/');
 		let parts: Vec<_> = base.trim_start_matches('/').split('/').collect();
 		let (prefix, id, tail) = match parts.as_slice() {
 			["r", sub, "comments", id, tail @ ..] if valid_sub(sub) => (format!("/r/{sub}/comments"), *id, tail),
@@ -257,16 +258,22 @@ pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'stati
 			.ok_or("missing comment body")?;
 		let timestamp = element.value().attr("created").and_then(parse_timestamp).ok_or("missing timestamp")?;
 		let body_html = render_body(body, 0);
-		let mut data = json!({"id":id,"name":fullname,"parent_id":parent,"link_id":post_fullname,"author":element.value().attr("author").unwrap_or("[deleted]"),"body":body.text().collect::<String>(),"body_html":body_html,"created_utc":timestamp,"score":element.value().attr("score").and_then(|v|v.parse::<i64>().ok()).unwrap_or(0),"score_hidden":element.value().attr("score").is_none(),"replies":"","all_awardings":[]});
+		let mut data = json!({"id":id,"name":fullname,"parent_id":parent,"link_id":post_fullname,"author":element.value().attr("author").unwrap_or("[deleted]"),"body":body.text().collect::<String>(),"body_html":body_html,"created_utc":timestamp,"score":element.value().attr("score").and_then(|v|v.parse::<i64>().ok()).unwrap_or(0),"score_hidden":element.value().attr("score").and_then(|v|v.parse::<i64>().ok()).is_none(),"replies":"","all_awardings":[]});
 		// Preserve Reddit's permalink to deeper replies using the existing more
 		// comment renderer. No tracking or signed continuation URL leaves Redlib.
-		if element.select(&selector("[slot=more-comments-permalink]")).any(|e| {
+		if let Some(more) = element.select(&selector("[slot=more-comments-permalink]")).find(|e| {
 			e.ancestors()
 				.filter_map(ElementRef::wrap)
 				.find(|p| p.value().name() == "shreddit-comment")
 				.is_some_and(|p| p.id() == element.id())
 		}) {
-			data["replies"] = json!({"kind":"Listing","data":{"children":[{"kind":"more","data":{"id":"_","parent_id":fullname,"count":0}}]}});
+			let text = more.text().collect::<String>();
+			let count = text
+				.split(|c: char| !c.is_ascii_digit())
+				.find(|p| !p.is_empty())
+				.and_then(|p| p.parse::<u64>().ok())
+				.unwrap_or(1);
+			data["replies"] = json!({"kind":"Listing","data":{"children":[{"kind":"more","data":{"id":"_","parent_id":fullname,"count":count}}]}});
 		}
 		comments.push(json!({"kind":"t1","data":data}));
 	}
@@ -333,7 +340,9 @@ fn render_body(element: ElementRef<'_>, depth: usize) -> String {
 					continue;
 				}
 				let inner = render_body(child, depth + 1);
-				if matches!(
+				if name == "shreddit-spoiler" || (name == "span" && child.value().classes().any(|class| class == "md-spoiler-text")) {
+					output.push_str(&format!("<span class=\"md-spoiler-text\">{inner}</span>"));
+				} else if matches!(
 					name,
 					"p"
 						| "div"
@@ -364,7 +373,7 @@ fn render_body(element: ElementRef<'_>, depth: usize) -> String {
 				} else if name == "img" {
 					if let Some(src) = child.value().attr("src").filter(|v| safe_link(v)) {
 						let src = crate::utils::format_url(src);
-						if !src.is_empty() {
+						if ["/img/", "/preview/", "/emoji/", "/static/"].iter().any(|prefix| src.starts_with(prefix)) {
 							output.push_str(&format!(
 								"<img src=\"{}\" alt=\"{}\" loading=\"lazy\">",
 								htmlescape::encode_attribute(&src),
@@ -372,8 +381,6 @@ fn render_body(element: ElementRef<'_>, depth: usize) -> String {
 							));
 						}
 					}
-				} else if name == "shreddit-spoiler" {
-					output.push_str(&format!("<span class=\"spoiler\">{inner}</span>"));
 				} else {
 					output.push_str(&inner);
 				}
@@ -475,7 +482,7 @@ mod tests {
 		assert!(body.contains("<strong>bold</strong>"));
 		assert!(body.contains("unsafe<a href="));
 		assert!(body.contains("&quot;a&quot;"));
-		assert!(body.contains("class=\"spoiler\""));
+		assert!(body.contains("class=\"md-spoiler-text\""));
 		for forbidden in ["onclick", "javascript:", "data:", "<script>", "iframe", "secret()"] {
 			assert!(!body.contains(forbidden), "{forbidden}");
 		}
@@ -521,6 +528,10 @@ mod tests {
 
 	#[test]
 	fn comments_html_paths_keep_thread_context_and_allowlisted_queries() {
+		assert_eq!(
+			ThreadPath::parse("/r/codex/comments/abc123/title/.json").unwrap().website_path,
+			"/r/codex/comments/abc123/title/"
+		);
 		let path = ThreadPath::parse("/r/codex/comments/abc123/_/reply.json?sort=confidence&context=3&raw_json=1&secret=discard").unwrap();
 		assert_eq!(path.id, "abc123");
 		assert_eq!(path.website_path, "/r/codex/comments/abc123/comment/reply/?sort=best&context=3");
@@ -532,6 +543,21 @@ mod tests {
 			"/r/example/comments/../_/.json",
 		] {
 			assert!(ThreadPath::parse(path).is_none(), "{path}");
+		}
+	}
+
+	#[test]
+	fn comments_html_images_use_only_redlib_media_proxies() {
+		let html = page(&comment(
+			"first",
+			"t3_abc123",
+			r#"<img src="https://i.redd.it/example.png" onload="bad()"><img src="https://tracker.example/pixel.gif"><img src="/settings/update">"#,
+		));
+		let parsed = parse_comments(&html, "abc123").unwrap();
+		let body = parsed["data"]["children"][0]["data"]["body_html"].as_str().unwrap();
+		assert!(body.contains("src=\"/img/example.png\""));
+		for forbidden in ["https://", "tracker.example", "settings/update", "onload"] {
+			assert!(!body.contains(forbidden));
 		}
 	}
 
