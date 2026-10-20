@@ -841,6 +841,55 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated anonymous comments API compatibility comparison"]
+	async fn live_encoded_comments_api() {
+		let lane = RedditLane::Tor;
+		let client = client_for_oauth_profile(lane, OauthTransportProfile::Firefox143Android).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let auth = timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(&client))
+			.await
+			.expect("Tor auth timeout")
+			.expect("anonymous OAuth");
+		let mut headers = backend.get_headers();
+		headers.extend(auth.additional_headers);
+		headers.insert("Authorization".to_owned(), format!("Bearer {}", auth.token));
+		fn count(listing: &serde_json::Value) -> usize {
+			listing["data"]["children"]
+				.as_array()
+				.into_iter()
+				.flatten()
+				.filter(|n| n["kind"] == "t1")
+				.map(|n| 1 + count(&n["data"]["replies"]))
+				.sum()
+		}
+		for (name, path) in [
+			("literal", "/r/codex/comments/1xaomu1.json?raw_json=1&limit=500"),
+			("encoded_scoped", "/r/codex%2Fcomments/1xaomu1.json?raw_json=1&limit=500"),
+			("encoded_root", "/comments%2F1xaomu1.json?raw_json=1&limit=500"),
+		] {
+			let mut request = client.get(format!("{}{path}", lane.api_origin().base));
+			for (key, value) in &headers {
+				request = request.header(key, value);
+			}
+			let response = timeout(Duration::from_secs(45), request.send()).await.expect("API timeout").expect("API transport");
+			let status = response.status().as_u16();
+			let kind = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+			let value = response.json::<serde_json::Value>().await.unwrap_or_default();
+			let shape = value.as_array().is_some_and(|a| a.len() == 2 && a[0]["kind"] == "Listing" && a[1]["kind"] == "Listing");
+			let post = value[0]["data"]["children"][0]["data"]["id"] == "1xaomu1";
+			println!(
+				"ENCODED_COMMENTS_API variant={name} status={status} type={kind} thread_shape={shape} post_matches={post} comments={}",
+				count(&value[1])
+			);
+			if name == "encoded_scoped" {
+				assert_eq!(status, 200);
+				assert!(shape && post);
+				assert!(count(&value[1]) > 0);
+			}
+		}
+	}
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "manual anonymous website HTML compatibility comparison"]
 	async fn live_anonymous_html_comments_diagnostic() {
