@@ -11,6 +11,7 @@ use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperR
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -2719,8 +2720,10 @@ fn request_once(
 	if oauth_client.lane != lane {
 		return async move { Err("Reddit request lane does not match its OAuth identity".to_string()) }.boxed();
 	}
-	// Build Reddit URL from path.
-	let url = format!("{base_path}{path}");
+	// Keep the logical path for admission, caches and diagnostics; apply Reddit's
+	// comments route compatibility encoding only to the outgoing URL.
+	let transport_path = comments_transport_path(&path);
+	let url = format!("{base_path}{transport_path}");
 
 	let mut headers: Vec<(String, String)> = vec![
 		("Host".into(), host.into()),
@@ -2759,6 +2762,30 @@ fn request_once(
 		}
 	}
 	.boxed()
+}
+
+/// Reddit currently rejects literal anonymous comments routes while accepting
+/// the same route with one percent-encoded separator. Both forms reach its JSON
+/// handler; see https://github.com/redlib-org/redlib/issues/591.
+fn comments_transport_path(path: &str) -> Cow<'_, str> {
+	let base = path.split('?').next().unwrap_or(path);
+	if canonical_comments_base(base).is_none() {
+		return Cow::Borrowed(path);
+	}
+	let separator = if base.starts_with("/comments/") {
+		"/comments".len()
+	} else if let Some(scoped) = base.strip_prefix("/r/") {
+		let Some((subreddit, rest)) = scoped.split_once('/') else {
+			return Cow::Borrowed(path);
+		};
+		if subreddit.is_empty() || !rest.starts_with("comments/") {
+			return Cow::Borrowed(path);
+		}
+		"/r/".len() + subreddit.len()
+	} else {
+		return Cow::Borrowed(path);
+	};
+	Cow::Owned(format!("{}%2F{}", &path[..separator], &path[separator + 1..]))
 }
 
 /// Make a request to a Reddit API and parse the JSON response.
@@ -3706,6 +3733,49 @@ mod tests {
 	use super::*;
 	use std::sync::atomic::AtomicUsize;
 	use {crate::config::get_setting, sealed_test::prelude::*};
+
+	#[test]
+	fn test_comments_transport_path_scoped_and_short_threads() {
+		for (path, expected) in [
+			(
+				"/r/codex/comments/1xaomu1.json?raw_json=1&limit=500",
+				"/r/codex%2Fcomments/1xaomu1.json?raw_json=1&limit=500",
+			),
+			(
+				"/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?sort=new",
+				"/r/codex%2Fcomments/1xaomu1/why_is_my_dot_mad_at_me/.json?sort=new",
+			),
+			("/r/codex/comments/1xaomu1/_/phvobrm.json?context=3", "/r/codex%2Fcomments/1xaomu1/_/phvobrm.json?context=3"),
+			("/comments/1xaomu1.json?raw_json=1", "/comments%2F1xaomu1.json?raw_json=1"),
+			("/comments/1xaomu1/_/phvobrm.json?context=3", "/comments%2F1xaomu1/_/phvobrm.json?context=3"),
+			("/r/comments/comments/abc.json", "/r/comments%2Fcomments/abc.json"),
+		] {
+			assert_eq!(comments_transport_path(path), expected);
+			assert_eq!(comments_transport_path(expected), expected, "encoding must be idempotent");
+		}
+	}
+
+	#[test]
+	fn test_comments_transport_path_preserves_other_routes_and_queries() {
+		for path in [
+			"/r/all/hot.json?after=t3_1xay0pv",
+			"/r/codex/comments.json",
+			"/r/codex/commentsXYZ/abc.json",
+			"/r/codex/wiki/comments/abc.json",
+			"/r//comments/abc.json",
+			"/comments/.json",
+			"/comments.json",
+			"/user/example/comments.json",
+			"/user/example/comments/abc.json",
+			"/search.json?q=/r/codex/comments/abc",
+			"https://example.com/r/codex/comments/abc.json",
+			"//example.com/r/codex/comments/abc.json",
+		] {
+			assert!(matches!(comments_transport_path(path), Cow::Borrowed(_)), "{path}");
+		}
+		let path = "/r/codex/comments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top";
+		assert_eq!(comments_transport_path(path), "/r/codex%2Fcomments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top");
+	}
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
 	static COALESCED_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
