@@ -865,6 +865,7 @@ mod tests {
 			("thread", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/"),
 			("sorted_thread", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/?sort=new"),
 			("canonical_thread", "/r/codex/comments/1xaomu1/"),
+			("placeholder_slug", "/r/codex/comments/1xaomu1/_/"),
 			("partial_comments", "/svc/shreddit/comments/r/codex/1xaomu1?render-mode=partial&sort=new&inline-refresh=1"),
 			("highlighted_thread", "/r/codex/comments/1xaomu1/comment/phv7x54/?context=3"),
 		] {
@@ -918,21 +919,20 @@ mod tests {
 		let api_client = client_for_oauth_profile(RedditLane::Tor, profile).unwrap();
 		let mut backend = MobileSpoofAuth::new(RedditLane::Tor);
 		if let Ok(Ok(auth)) = timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(&api_client)).await {
-			if let Ok(Ok(response)) = timeout(
-				Duration::from_secs(45),
-				api_client
-					.get(format!("{}/api/info.json?id=t3_1xaomu1&raw_json=1", RedditLane::Tor.api_origin().base))
-					.bearer_auth(auth.token)
-					.send(),
-			)
-			.await
-			{
-				let status = response.status().as_u16();
-				let value = response.json::<serde_json::Value>().await.unwrap_or_default();
-				println!(
-					"HTML_COMMENTS_DIAGNOSTIC probe=post_info status={status} post_matches={}",
-					value["data"]["children"][0]["data"]["id"] == "1xaomu1"
-				);
+			for post_path in ["/api/info.json?id=t3_1xaomu1&raw_json=1", "/by_id/t3_1xaomu1.json?raw_json=1"] {
+				if let Ok(Ok(response)) = timeout(
+					Duration::from_secs(45),
+					api_client.get(format!("{}{post_path}", RedditLane::Tor.api_origin().base)).bearer_auth(&auth.token).send(),
+				)
+				.await
+				{
+					let status = response.status().as_u16();
+					let value = response.json::<serde_json::Value>().await.unwrap_or_default();
+					println!(
+						"HTML_COMMENTS_DIAGNOSTIC probe=post_info path={post_path} status={status} post_matches={}",
+						value["data"]["children"][0]["data"]["id"] == "1xaomu1"
+					);
+				}
 			}
 		}
 	}
