@@ -892,7 +892,7 @@ mod tests {
 				Some((
 					status,
 					content,
-					text.matches("<shreddit-comment ").count(),
+					regex::Regex::new(r"<shreddit-comment(?:\s|>)").unwrap().find_iter(&text).count(),
 					text.contains("Why is my Dot mad at me?"),
 					text.contains("blocked by network security"),
 				))
