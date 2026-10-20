@@ -843,26 +843,17 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "isolated anonymous comments API compatibility comparison"]
+	#[ignore = "isolated anonymous comments API and page verification"]
 	async fn live_encoded_comments_api() {
+		let _ = pretty_env_logger::try_init();
+		assert_eq!(std::env::var("REDLIB_REDDIT_PRIMARY_LANE").as_deref(), Ok("tor"));
 		let lane = RedditLane::Tor;
 		let client = client_for_oauth_profile(lane, OauthTransportProfile::Firefox143Android).unwrap();
 		let mut backend = MobileSpoofAuth::new(lane);
-		let auth = timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(&client))
-			.await
-			.expect("Tor auth timeout")
-			.expect("anonymous OAuth");
-		let mut headers = backend.get_headers();
-		headers.extend(auth.additional_headers);
-		headers.insert("Authorization".to_owned(), format!("Bearer {}", auth.token));
+		let oauth = Oauth::authenticate_with_backend(&mut backend, client.clone(), OauthTransportProfile::Firefox143Android).await.expect("anonymous OAuth");
 		fn count(listing: &serde_json::Value) -> usize {
-			listing["data"]["children"]
-				.as_array()
-				.into_iter()
-				.flatten()
-				.filter(|n| n["kind"] == "t1")
-				.map(|n| 1 + count(&n["data"]["replies"]))
-				.sum()
+			listing["data"]["children"].as_array().into_iter().flatten().filter(|n| n["kind"] == "t1")
+				.map(|n| 1 + count(&n["data"]["replies"])).sum()
 		}
 		for (name, path) in [
 			("literal", "/r/codex/comments/1xaomu1.json?raw_json=1&limit=500"),
@@ -870,291 +861,35 @@ mod tests {
 			("encoded_root", "/comments%2F1xaomu1.json?raw_json=1&limit=500"),
 		] {
 			let mut request = client.get(format!("{}{path}", lane.api_origin().base));
-			for (key, value) in &headers {
-				request = request.header(key, value);
-			}
+			for (key, value) in &oauth.headers_map { request = request.header(key, value); }
 			let response = timeout(Duration::from_secs(45), request.send()).await.expect("API timeout").expect("API transport");
 			let status = response.status().as_u16();
-			let kind = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
 			let value = response.json::<serde_json::Value>().await.unwrap_or_default();
 			let shape = value.as_array().is_some_and(|a| a.len() == 2 && a[0]["kind"] == "Listing" && a[1]["kind"] == "Listing");
 			let post = value[0]["data"]["children"][0]["data"]["id"] == "1xaomu1";
-			println!(
-				"ENCODED_COMMENTS_API variant={name} status={status} type={kind} thread_shape={shape} post_matches={post} comments={}",
-				count(&value[1])
-			);
-			if name == "encoded_scoped" {
-				assert_eq!(status, 200);
-				assert!(shape && post);
-				assert!(count(&value[1]) > 0);
-			}
+			println!("ENCODED_COMMENTS_API variant={name} status={status} thread_shape={shape} post_matches={post} comments={}", count(&value[1]));
+			if name != "literal" { assert_eq!(status, 200); assert!(shape && post); assert!(count(&value[1]) > 0); }
 		}
-	}
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "manual anonymous website HTML compatibility comparison"]
-	async fn live_anonymous_html_comments_diagnostic() {
-		use hyper::body::HttpBody;
-		use wreq::EmulationFactory;
-		let emulation = wreq_util::EmulationOption::builder()
-			.emulation(wreq_util::Emulation::Chrome145)
-			.emulation_os(wreq_util::EmulationOS::Windows)
-			.build()
-			.emulation();
-		let proxy = wreq::Proxy::all(std::env::var("REDLIB_TOR_PROXY").expect("diagnostic Tor proxy")).unwrap();
-		let client = wreq::Client::builder()
-			.emulation(emulation)
-			.proxy(proxy)
-			.redirect(wreq::redirect::Policy::none())
-			.build()
-			.unwrap();
-		let base = RedditLane::Tor.auth_origin().base;
-		let mut cookies = std::collections::BTreeMap::new();
-		for (probe, path) in [
-			("home", "/"),
-			("thread", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/"),
-			("sorted_thread", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/?sort=new"),
-			("canonical_thread", "/r/codex/comments/1xaomu1/"),
-			("placeholder_slug", "/r/codex/comments/1xaomu1/_/"),
-			("partial_comments", "/svc/shreddit/comments/r/codex/1xaomu1?render-mode=partial&sort=new&inline-refresh=1"),
-			("highlighted_thread", "/r/codex/comments/1xaomu1/comment/phv7x54/?context=3"),
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		for (name, path) in [
+			("scoped", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/"),
+			("new", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/?sort=new"),
+			("short", "/comments/1xaomu1"),
+			("highlighted", "/r/codex/comments/1xaomu1/_/phvobrm?context=3"),
 		] {
-			let result = timeout(Duration::from_secs(60), async {
-				let mut request = client.get(format!("{base}{path}"));
-				if !cookies.is_empty() {
-					request = request.header("Cookie", cookies.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join("; "));
-				}
-				let response = request.send().await.ok()?;
-				let status = response.status().as_u16();
-				let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_owned();
-				for value in response.headers().get_all("set-cookie") {
-					if let Ok(value) = value.to_str() {
-						if let Ok(cookie) = cookie::Cookie::parse(value.to_owned()) {
-							cookies.insert(cookie.name().to_owned(), cookie.value().to_owned());
-						}
-					}
-				}
-				let mut stream = hyper::Body::wrap_stream(response.bytes_stream());
-				let mut bytes = Vec::new();
-				while let Some(Ok(chunk)) = stream.data().await {
-					if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
-						return None;
-					}
-					bytes.extend_from_slice(&chunk);
-				}
-				let text = String::from_utf8_lossy(&bytes);
-				Some((
-					status,
-					content,
-					regex::Regex::new(r"<shreddit-comment(?:\s|>)").unwrap().find_iter(&text).count(),
-					text.contains("Why is my Dot mad at me?"),
-					text.contains("blocked by network security"),
-				))
-			})
-			.await;
-			match result {
-				Ok(Some((status, content, comments, has_post, blocked))) => {
-					println!(
-						"HTML_COMMENTS_DIAGNOSTIC probe={probe} status={status} content={content} comments={comments} has_post={has_post} blocked={blocked} cookie_names={:?}",
-						cookies.keys().collect::<Vec<_>>()
-					);
-					if status == 429 {
-						break;
-					}
-				}
-				_ => println!("HTML_COMMENTS_DIAGNOSTIC probe={probe} transport_or_body_failed=true"),
-			}
-		}
-		let profile = OauthTransportProfile::Firefox143Android;
-		let api_client = client_for_oauth_profile(RedditLane::Tor, profile).unwrap();
-		let mut backend = MobileSpoofAuth::new(RedditLane::Tor);
-		if let Ok(Ok(auth)) = timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(&api_client)).await {
-			for post_path in ["/api/info.json?id=t3_1xaomu1&raw_json=1", "/by_id/t3_1xaomu1.json?raw_json=1"] {
-				let mut request = api_client.get(format!("{}{post_path}", RedditLane::Tor.api_origin().base)).bearer_auth(&auth.token);
-				for (key, value) in backend.get_headers().into_iter().chain(auth.additional_headers.clone()) {
-					request = request.header(key, value);
-				}
-				if let Ok(Ok(response)) = timeout(Duration::from_secs(45), request.send()).await {
-					let status = response.status().as_u16();
-					let value = response.json::<serde_json::Value>().await.unwrap_or_default();
-					println!(
-						"HTML_COMMENTS_DIAGNOSTIC probe=post_info path={post_path} status={status} post_matches={}",
-						value["data"]["children"][0]["data"]["id"] == "1xaomu1"
-					);
-				}
-			}
-		}
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "manual anonymous OAuth grant comparison"]
-	async fn live_comments_grant_diagnostic() {
-		use hyper::body::HttpBody;
-		let profile = OauthTransportProfile::Firefox143Android;
-		for lane in [RedditLane::Direct, RedditLane::Tor] {
-			let client = client_for_oauth_profile(lane, profile).expect("diagnostic transport");
-			let backend = MobileSpoofAuth::new(lane);
-			for (grant, client_id) in [("android", REDDIT_ANDROID_OAUTH_CLIENT_ID), ("legacy_web", "3XfBJWliHvqACnXrfIYlLw")] {
-				let user_agent = if grant == "legacy_web" {
-					"linux:LucifersCircle.redlib:0.36.0 (https://github.com/LucifersCircle/redlib)"
-				} else {
-					backend.user_agent()
-				};
-				let origin = lane.auth_origin();
-				let device_id = backend.device.headers.get("X-Reddit-Device-Id").expect("anonymous device id");
-				let form = url::form_urlencoded::Serializer::new(String::new())
-					.append_pair("grant_type", "https://oauth.reddit.com/grants/installed_client")
-					.append_pair("device_id", device_id)
-					.finish();
-				let token_response = timeout(
-					Duration::from_secs(45),
-					client
-						.post(format!("{}/api/v1/access_token", origin.base))
-						.default_headers(false)
-						.header("Host", origin.host)
-						.header("User-Agent", user_agent)
-						.header("Accept", "application/json")
-						.header("Content-Type", "application/x-www-form-urlencoded")
-						.basic_auth(client_id, Some(""))
-						.body(form)
-						.send(),
-				)
-				.await;
-				let response = match token_response {
-					Ok(Ok(response)) => response,
-					_ => {
-						println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_transport_failed=true", lane.label());
-						continue;
-					}
-				};
-				let status = response.status().as_u16();
-				if status != 200 {
-					let value = response.json::<serde_json::Value>().await.ok();
-					let code = value
-						.as_ref()
-						.and_then(|v| v.get("error"))
-						.and_then(serde_json::Value::as_str)
-						.filter(|v| {
-							matches!(
-								*v,
-								"invalid_grant" | "unauthorized_client" | "unsupported_grant_type" | "invalid_client" | "invalid_request" | "access_denied"
-							)
-						})
-						.unwrap_or("unclassified");
-					println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_status={status} error_code={code}", lane.label());
-					continue;
-				}
-				let value: serde_json::Value = match response.json().await {
-					Ok(value) => value,
-					Err(_) => {
-						println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_json_failed=true", lane.label());
-						continue;
-					}
-				};
-				let Some(token) = value.get("access_token").and_then(serde_json::Value::as_str) else {
-					println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_missing=true", lane.label());
-					continue;
-				};
-				println!(
-					"GRANT_DIAGNOSTIC lane={} grant={grant} token_status=200 scope={} expires_in={}",
-					lane.label(),
-					value.get("scope").and_then(serde_json::Value::as_str).unwrap_or("missing"),
-					value.get("expires_in").and_then(serde_json::Value::as_u64).unwrap_or(0)
-				);
-				let api = lane.api_origin();
-				let request = client
-					.get(format!("{}/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", api.base))
-					.default_headers(false)
-					.header("Host", api.host)
-					.header("User-Agent", user_agent)
-					.header("Accept", "application/json")
-					.bearer_auth(token);
-				let response = match timeout(Duration::from_secs(45), request.send()).await {
-					Ok(Ok(response)) => response,
-					_ => {
-						println!("GRANT_DIAGNOSTIC lane={} grant={grant} comments_transport_failed=true", lane.label());
-						continue;
-					}
-				};
-				let status = response.status().as_u16();
-				let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_owned();
-				let mut body = hyper::Body::wrap_stream(response.bytes_stream());
-				let mut bytes = Vec::new();
-				while let Some(Ok(chunk)) = body.data().await {
-					let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
-					bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
-					if bytes.len() >= 256 * 1024 {
-						break;
-					}
-				}
-				let json_array = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.is_array());
-				println!(
-					"GRANT_DIAGNOSTIC lane={} grant={grant} comments_status={status} content={content} json_array={json_array}",
-					lane.label()
-				);
-			}
-		}
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "manual Tor clearnet versus onion routing comparison"]
-	async fn live_tor_clearnet_comments_diagnostic() {
-		use hyper::body::HttpBody;
-		let profile = OauthTransportProfile::Firefox143Android;
-		let client = client_for_oauth_profile(RedditLane::Tor, profile).expect("isolated Tor transport");
-		let mut backend = MobileSpoofAuth::new(RedditLane::Direct);
-		let response = match timeout(TOR_OAUTH_TIMEOUT, backend.authenticate(client.as_ref())).await {
-			Ok(Ok(response)) => response,
-			Ok(Err(error)) => {
-				println!("TOR_CLEARNET_DIAGNOSTIC auth_failed={error}");
-				return;
-			}
-			Err(_) => {
-				println!("TOR_CLEARNET_DIAGNOSTIC auth_timeout_seconds={}", TOR_OAUTH_TIMEOUT.as_secs());
-				return;
-			}
-		};
-		let mut headers = backend.get_headers();
-		headers.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
-		headers.extend(response.additional_headers);
-		println!("TOR_CLEARNET_DIAGNOSTIC auth=ok");
-		for mode in ["mobile", "minimal"] {
-			let mut request = client
-				.get("https://oauth.reddit.com/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1")
-				.header("Host", "oauth.reddit.com");
-			if mode == "minimal" {
-				request = request.default_headers(false).header("Accept", "application/json");
-			}
-			for (key, value) in &headers {
-				if mode == "minimal" && !key.eq_ignore_ascii_case("authorization") && !key.eq_ignore_ascii_case("user-agent") {
-					continue;
-				}
-				request = request.header(key, value);
-			}
-			let response = match timeout(Duration::from_secs(45), request.send()).await {
-				Ok(Ok(response)) => response,
-				_ => {
-					println!("TOR_CLEARNET_DIAGNOSTIC mode={mode} transport_or_timeout=true");
-					continue;
-				}
-			};
-			let status = response.status().as_u16();
-			let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_owned();
-			let mut body = hyper::Body::wrap_stream(response.bytes_stream());
-			let mut bytes = Vec::new();
-			while let Some(Ok(chunk)) = body.data().await {
-				let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
-				bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
-				if bytes.len() >= 256 * 1024 {
-					break;
-				}
-			}
-			let json_array = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.is_array());
-			let network_block = String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("blocked by network security");
-			println!("TOR_CLEARNET_DIAGNOSTIC mode={mode} status={status} content={content} json_array={json_array} network_block={network_block}");
-			if status == 429 {
-				break;
-			}
-			tokio::time::sleep(Duration::from_secs(2)).await;
+			let (base, query) = path.split_once('?').unwrap_or((path, ""));
+			let value = timeout(Duration::from_secs(75), crate::client::json(format!("{base}.json?{query}"), false)).await.expect("JSON budget").expect("normal JSON wrapper");
+			assert_eq!(value[0]["data"]["children"][0]["data"]["id"], "1xaomu1");
+			assert!(count(&value[1]) > 0);
+			let req = hyper::Request::builder().uri(path).body(hyper::Body::empty()).unwrap();
+			let response = timeout(Duration::from_secs(75), crate::post::item(req)).await.expect("page budget").expect("rendered page");
+			assert_eq!(response.status(), 200, "must not show a loading screen");
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let body = String::from_utf8(body.to_vec()).unwrap();
+			assert!(body.contains("Why is my Dot mad at me?"));
+			assert!(body.contains("class=\"comment\""));
+			assert!(!body.contains("Still trying to load your page"));
+			println!("ENCODED_COMMENTS_PAGE variant={name} status=200 comments={} rendered_comments={}", count(&value[1]), body.matches("class=\"comment\"").count());
 		}
 	}
 

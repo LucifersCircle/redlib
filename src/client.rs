@@ -11,6 +11,7 @@ use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperR
 use log::{error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -2719,8 +2720,10 @@ fn request_once(
 	if oauth_client.lane != lane {
 		return async move { Err("Reddit request lane does not match its OAuth identity".to_string()) }.boxed();
 	}
-	// Build Reddit URL from path.
-	let url = format!("{base_path}{path}");
+	// Keep the logical path for admission, caches and diagnostics; apply Reddit's
+	// comments route compatibility encoding only to the outgoing URL.
+	let transport_path = comments_transport_path(&path);
+	let url = format!("{base_path}{transport_path}");
 
 	let mut headers: Vec<(String, String)> = vec![
 		("Host".into(), host.into()),
@@ -2759,6 +2762,30 @@ fn request_once(
 		}
 	}
 	.boxed()
+}
+
+/// Reddit currently rejects literal anonymous comments routes while accepting
+/// the same route with one percent-encoded separator. Both forms reach its JSON
+/// handler; see https://github.com/redlib-org/redlib/issues/591.
+fn comments_transport_path(path: &str) -> Cow<'_, str> {
+	let base = path.split('?').next().unwrap_or(path);
+	if canonical_comments_base(base).is_none() {
+		return Cow::Borrowed(path);
+	}
+	let separator = if base.starts_with("/comments/") {
+		"/comments".len()
+	} else if let Some(scoped) = base.strip_prefix("/r/") {
+		let Some((subreddit, rest)) = scoped.split_once('/') else {
+			return Cow::Borrowed(path);
+		};
+		if subreddit.is_empty() || !rest.starts_with("comments/") {
+			return Cow::Borrowed(path);
+		}
+		"/r/".len() + subreddit.len()
+	} else {
+		return Cow::Borrowed(path);
+	};
+	Cow::Owned(format!("{}%2F{}", &path[..separator], &path[separator + 1..]))
 }
 
 /// Make a request to a Reddit API and parse the JSON response.
@@ -2989,11 +3016,6 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 }
 
 async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, String> {
-	// Website comments have their own transport and cooldown. An old JSON
-	// circuit must not keep a working anonymous website request in standby.
-	if let Some(value) = website_comments_on_lane(&path, quarantine, configured_primary_lane()).await {
-		return Ok(value);
-	}
 	let lane = preferred_api_lane(Instant::now(), &path);
 	if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Direct {
 		return direct_then_tor_request(path, quarantine).await;
@@ -3108,10 +3130,6 @@ async fn direct_then_tor_request(path: String, quarantine: bool) -> Result<Value
 	recover_after_direct_standby(direct_standby_request(path.clone(), quarantine), || async move {
 		info!("Returning to Tor after direct standby did not recover the page: endpoint={}", endpoint_class(&path));
 		let recovery = async {
-			// Website recovery is independent of the legacy comments circuit.
-			if let Some(value) = website_comments_on_lane(&path, quarantine, RedditLane::Tor).await {
-				return Ok(value);
-			}
 			wait_for_tor_recovery(&path).await;
 			json_uncached_on_lane(path.clone(), quarantine, RedditLane::Tor).await.0
 		};
@@ -3208,9 +3226,6 @@ fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quo
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
-	if let Some(value) = website_comments_on_lane(&path, quarantine, lane).await {
-		return (Ok(value), TorRetryReason::None);
-	}
 	let mut budget = RecoveryBudget::new(
 		tokio::time::Instant::now(),
 		CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + lane.request_timeout().min(Duration::from_secs(30)),
@@ -3298,49 +3313,6 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 		}
 		tokio::time::sleep(delay).await;
 	}
-}
-
-async fn website_comments_on_lane(path: &str, quarantine: bool, lane: RedditLane) -> Option<Value> {
-	if quarantine || oauth_client(lane).is_none() {
-		return None;
-	}
-	let mut thread = crate::comments_html::ThreadPath::parse(path)?;
-	let post = comments_post_cached(thread.id.clone(), lane).await.ok()?;
-	if !thread.website_path.contains("/comment/") {
-		if let Some(permalink) = post["data"]["permalink"].as_str() {
-			if let Some(canonical) = crate::comments_html::ThreadPath::parse(permalink).filter(|p| p.id == thread.id) {
-				let query = thread.website_path.split_once('?').map(|(_, query)| query.to_owned());
-				thread.website_path = canonical.website_path;
-				if let Some(query) = query {
-					thread.website_path.push('?');
-					thread.website_path.push_str(&query);
-				}
-			}
-		}
-	}
-	let comments = crate::comments_html::fetch(&thread, lane).await.ok()?;
-	Some(serde_json::json!([{"kind":"Listing","data":{"children":[post]}}, comments]))
-}
-
-#[cached(size = 512, time = 60, result = true)]
-async fn comments_post_cached(id: String, lane: RedditLane) -> Result<Value, String> {
-	let mut refresh = TorQuotaRefreshRetryState::default();
-	let (result, _, _) = json_uncached_on_lane_with_options(
-		format!("/by_id/t3_{id}.json?raw_json=1"),
-		false,
-		lane,
-		AdmissionRetryMode::Bounded,
-		Some(Duration::from_secs(10)),
-		None,
-		&mut refresh,
-	)
-	.await;
-	let listing = result?;
-	let post = &listing["data"]["children"][0];
-	if post["kind"] != "t3" || post["data"]["id"].as_str() != Some(id.as_str()) {
-		return Err("Reddit returned an empty response while loading the post".to_string());
-	}
-	Ok(post.clone())
 }
 
 fn start_rejected_session_refresh(lane: RedditLane, generation: u64) {
@@ -3761,6 +3733,49 @@ mod tests {
 	use super::*;
 	use std::sync::atomic::AtomicUsize;
 	use {crate::config::get_setting, sealed_test::prelude::*};
+
+	#[test]
+	fn test_comments_transport_path_scoped_and_short_threads() {
+		for (path, expected) in [
+			(
+				"/r/codex/comments/1xaomu1.json?raw_json=1&limit=500",
+				"/r/codex%2Fcomments/1xaomu1.json?raw_json=1&limit=500",
+			),
+			(
+				"/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/.json?sort=new",
+				"/r/codex%2Fcomments/1xaomu1/why_is_my_dot_mad_at_me/.json?sort=new",
+			),
+			("/r/codex/comments/1xaomu1/_/phvobrm.json?context=3", "/r/codex%2Fcomments/1xaomu1/_/phvobrm.json?context=3"),
+			("/comments/1xaomu1.json?raw_json=1", "/comments%2F1xaomu1.json?raw_json=1"),
+			("/comments/1xaomu1/_/phvobrm.json?context=3", "/comments%2F1xaomu1/_/phvobrm.json?context=3"),
+			("/r/comments/comments/abc.json", "/r/comments%2Fcomments/abc.json"),
+		] {
+			assert_eq!(comments_transport_path(path), expected);
+			assert_eq!(comments_transport_path(expected), expected, "encoding must be idempotent");
+		}
+	}
+
+	#[test]
+	fn test_comments_transport_path_preserves_other_routes_and_queries() {
+		for path in [
+			"/r/all/hot.json?after=t3_1xay0pv",
+			"/r/codex/comments.json",
+			"/r/codex/commentsXYZ/abc.json",
+			"/r/codex/wiki/comments/abc.json",
+			"/r//comments/abc.json",
+			"/comments/.json",
+			"/comments.json",
+			"/user/example/comments.json",
+			"/user/example/comments/abc.json",
+			"/search.json?q=/r/codex/comments/abc",
+			"https://example.com/r/codex/comments/abc.json",
+			"//example.com/r/codex/comments/abc.json",
+		] {
+			assert!(matches!(comments_transport_path(path), Cow::Borrowed(_)), "{path}");
+		}
+		let path = "/r/codex/comments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top";
+		assert_eq!(comments_transport_path(path), "/r/codex%2Fcomments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top");
+	}
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
 	static COALESCED_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);

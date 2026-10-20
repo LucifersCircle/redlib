@@ -24,11 +24,9 @@ jobs:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Tor and browser driver
+      - name: Install Tor and build dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends tor xvfb xauth cmake pkg-config libclang-dev
-          npm install --prefix "$RUNNER_TEMP/comments-browser" playwright
-          google-chrome --version
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends tor cmake pkg-config libclang-dev
       - name: Start isolated diagnostic Tor
         run: |
           mkdir -p "$RUNNER_TEMP/comments-tor"
