@@ -17,7 +17,7 @@ const {chromium}=require('playwright');
   else await loader.getByText(/more replies/i).first().click({timeout:8000});
   const response=await pending;const body=await response.text();const headers=await response.request().allHeaders();
   const allowed=['accept','x-requested-with','sec-fetch-dest','sec-fetch-mode','sec-fetch-site'];
-  console.log(JSON.stringify({probe:'browser_reply_response',status:response.status(),type:await response.headerValue('content-type'),rawComments:(body.match(/<shreddit-comment(?:\s|>)/g)||[]).length,jsonKeys:(()=>{try{return Object.keys(JSON.parse(body))}catch{return []}})(),headerNames:Object.keys(headers),fixedHeaders:Object.fromEntries(allowed.filter(k=>k in headers).map(k=>[k,headers[k]]))}));
+  console.log(JSON.stringify({probe:'browser_reply_response',status:response.status(),type:await response.headerValue('content-type'),rawComments:(body.match(/<shreddit-comment(?:\s|>)/g)||[]).length,containsCommentTag:body.includes('<shreddit-comment'),firstTag:(body.match(/<([a-zA-Z][\w-]*)/)||[])[1],jsonKeys:(()=>{try{return Object.keys(JSON.parse(body))}catch{return []}})(),headerNames:Object.keys(headers),fixedHeaders:Object.fromEntries(allowed.filter(k=>k in headers).map(k=>[k,headers[k]]))}));
   await page.waitForTimeout(3000);
   console.log(JSON.stringify({probe:'browser_reply_result',after:await page.locator('shreddit-comment').count()}));
  }catch(e){console.log(JSON.stringify({probe:'browser_reply_error',error:e.message.split('\n')[0]}));process.exitCode=1}
