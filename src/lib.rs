@@ -1,4 +1,5 @@
 pub mod client;
+mod comments_html;
 pub mod config;
 pub mod duplicates;
 pub mod instance_info;

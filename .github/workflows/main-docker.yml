@@ -47,6 +47,7 @@ jobs:
         run: cargo check --locked --all-targets
       - name: Run deterministic resilience tests
         run: |
+          cargo test --locked --lib comments_html_
           cargo test --locked --lib primary_lane_is_explicit_and_defaults_to_direct
           cargo test --locked --lib test_tor_first_
           cargo test --locked --lib test_endpoint_edge_

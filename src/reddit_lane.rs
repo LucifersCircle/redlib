@@ -18,7 +18,7 @@ const TOR_AUTH_HOST: &str = "www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtq
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub(crate) enum RedditLane {
 	Direct,
 	Tor,

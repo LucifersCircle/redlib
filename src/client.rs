@@ -2989,6 +2989,11 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 }
 
 async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, String> {
+	// Website comments have their own transport and cooldown. An old JSON
+	// circuit must not keep a working anonymous website request in standby.
+	if let Some(value) = website_comments_on_lane(&path, quarantine, configured_primary_lane()).await {
+		return Ok(value);
+	}
 	let lane = preferred_api_lane(Instant::now(), &path);
 	if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Direct {
 		return direct_then_tor_request(path, quarantine).await;
@@ -3199,6 +3204,9 @@ fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quo
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
+	if let Some(value) = website_comments_on_lane(&path, quarantine, lane).await {
+		return (Ok(value), TorRetryReason::None);
+	}
 	let mut budget = RecoveryBudget::new(
 		tokio::time::Instant::now(),
 		CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + lane.request_timeout().min(Duration::from_secs(30)),
@@ -3286,6 +3294,49 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 		}
 		tokio::time::sleep(delay).await;
 	}
+}
+
+async fn website_comments_on_lane(path: &str, quarantine: bool, lane: RedditLane) -> Option<Value> {
+	if quarantine || oauth_client(lane).is_none() {
+		return None;
+	}
+	let mut thread = crate::comments_html::ThreadPath::parse(path)?;
+	let post = comments_post_cached(thread.id.clone(), lane).await.ok()?;
+	if !thread.website_path.contains("/comment/") {
+		if let Some(permalink) = post["data"]["permalink"].as_str() {
+			if let Some(canonical) = crate::comments_html::ThreadPath::parse(permalink).filter(|p| p.id == thread.id) {
+				let query = thread.website_path.split_once('?').map(|(_, query)| query.to_owned());
+				thread.website_path = canonical.website_path;
+				if let Some(query) = query {
+					thread.website_path.push('?');
+					thread.website_path.push_str(&query);
+				}
+			}
+		}
+	}
+	let comments = crate::comments_html::fetch(&thread, lane).await.ok()?;
+	Some(serde_json::json!([{"kind":"Listing","data":{"children":[post]}}, comments]))
+}
+
+#[cached(size = 512, time = 60, result = true)]
+async fn comments_post_cached(id: String, lane: RedditLane) -> Result<Value, String> {
+	let mut refresh = TorQuotaRefreshRetryState::default();
+	let (result, _, _) = json_uncached_on_lane_with_options(
+		format!("/by_id/t3_{id}.json?raw_json=1"),
+		false,
+		lane,
+		AdmissionRetryMode::Bounded,
+		Some(Duration::from_secs(10)),
+		None,
+		&mut refresh,
+	)
+	.await;
+	let listing = result?;
+	let post = &listing["data"]["children"][0];
+	if post["kind"] != "t3" || post["data"]["id"].as_str() != Some(id.as_str()) {
+		return Err("Reddit returned an empty response while loading the post".to_string());
+	}
+	Ok(post.clone())
 }
 
 fn start_rejected_session_refresh(lane: RedditLane, generation: u64) {
