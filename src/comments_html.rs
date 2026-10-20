@@ -24,6 +24,7 @@ const WAIT: &str = "Reddit is temporarily rejecting this instance. Retry in 5 se
 pub(crate) struct ThreadPath {
 	pub(crate) id: String,
 	pub(crate) website_path: String,
+	pub(crate) comment_id: Option<String>,
 }
 
 impl ThreadPath {
@@ -40,11 +41,7 @@ impl ThreadPath {
 		if !valid_id(id) || tail.len() > 2 || !path.starts_with('/') || path.starts_with("//") {
 			return None;
 		}
-		let slug = tail
-			.first()
-			.copied()
-			.filter(|slug| slug.len() <= 512 && slug.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
-			.unwrap_or("_");
+		let slug = tail.first().copied().filter(|slug| valid_slug(slug)).unwrap_or("_");
 		let mut website_path = format!("{prefix}/{id}/{slug}/");
 		if let [_, comment] = tail {
 			if !valid_id(comment) {
@@ -65,7 +62,11 @@ impl ThreadPath {
 			website_path.push('?');
 			website_path.push_str(&query);
 		}
-		Some(Self { id: id.to_string(), website_path })
+		Some(Self {
+			id: id.to_string(),
+			website_path,
+			comment_id: if let [_, comment] = tail { Some((*comment).to_owned()) } else { None },
+		})
 	}
 }
 
@@ -74,6 +75,15 @@ fn valid_id(id: &str) -> bool {
 }
 fn valid_sub(sub: &str) -> bool {
 	!sub.is_empty() && sub.len() <= 32 && sub.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn valid_slug(slug: &str) -> bool {
+	if slug.is_empty() || slug.len() > 512 {
+		return false;
+	}
+	percent_encoding::percent_decode_str(slug)
+		.decode_utf8()
+		.is_ok_and(|value| value != "." && value != ".." && !value.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | '?' | '#')))
 }
 
 struct Session {
@@ -194,15 +204,55 @@ async fn fetch_inner(session: &Session, thread: &ThreadPath, lane: RedditLane) -
 			}
 			bytes.extend_from_slice(&chunk);
 		}
-		let html = String::from_utf8(bytes).map_err(|_| WAIT.to_string())?;
+		let mut html = String::from_utf8(bytes).map_err(|_| WAIT.to_string())?;
+		let mut expanded_parent = None;
+		if let Some(comment) = thread.comment_id.as_deref() {
+			let paths = reply_paths(&html, &thread.id, comment, lane).map_err(|_| WAIT.to_string())?;
+			if paths.len() > 4 {
+				return Err(WAIT.to_string());
+			}
+			for path in &paths {
+				let response = session.client.get(path).send().await.map_err(|_| WAIT.to_string())?;
+				if !response.status().is_success()
+					|| !response
+						.headers()
+						.get("content-type")
+						.and_then(|v| v.to_str().ok())
+						.unwrap_or_default()
+						.starts_with("text/vnd.reddit.partial+html")
+				{
+					return Err(WAIT.to_string());
+				}
+				let mut stream = hyper::Body::wrap_stream(response.bytes_stream());
+				let mut fragment = Vec::new();
+				while let Some(chunk) = stream.data().await {
+					let chunk = chunk.map_err(|_| WAIT.to_string())?;
+					if html.len().saturating_add(fragment.len()).saturating_add(chunk.len()) > MAX_BODY {
+						return Err(WAIT.to_string());
+					}
+					fragment.extend_from_slice(&chunk);
+				}
+				let fragment = String::from_utf8(fragment).map_err(|_| WAIT.to_string())?;
+				if !has_replies_to(&fragment, &thread.id, comment) {
+					return Err(WAIT.to_string());
+				}
+				html.push_str(&fragment);
+			}
+			if !paths.is_empty() {
+				expanded_parent = Some(format!("t1_{comment}"));
+			}
+		}
 		let id = thread.id.clone();
-		return tokio::task::spawn_blocking(move || parse_comments(&html, &id))
-			.await
-			.map_err(|_| WAIT.to_string())?
-			.map_err(|reason| {
-				log::warn!("Anonymous Reddit website response incomplete: lane={} backend=website_html reason={reason}", lane.label());
-				WAIT.to_string()
-			});
+		return tokio::task::spawn_blocking(move || match expanded_parent.as_deref() {
+			Some(parent) => parse_comments_expanded(&html, &id, Some(parent)),
+			None => parse_comments(&html, &id),
+		})
+		.await
+		.map_err(|_| WAIT.to_string())?
+		.map_err(|reason| {
+			log::warn!("Anonymous Reddit website response incomplete: lane={} backend=website_html reason={reason}", lane.label());
+			WAIT.to_string()
+		});
 	}
 	Err(WAIT.to_string())
 }
@@ -221,7 +271,86 @@ fn selector(query: &str) -> Selector {
 	Selector::parse(query).expect("fixed website selector")
 }
 
+fn reply_paths(html: &str, post_id: &str, comment_id: &str, lane: RedditLane) -> Result<Vec<String>, &'static str> {
+	let document = Html::parse_document(html);
+	let fullname = format!("t1_{comment_id}");
+	let post = format!("t3_{post_id}");
+	let Some(comment) = document
+		.select(&selector("shreddit-comment"))
+		.find(|e| e.value().attr("thingid") == Some(fullname.as_str()) && e.value().attr("postid") == Some(post.as_str()))
+	else {
+		return Err("missing requested comment");
+	};
+	let base = url::Url::parse(lane.auth_origin().base).unwrap();
+	let mut paths = Vec::new();
+	for element in comment.select(&selector("faceplate-partial[src]")) {
+		if !element
+			.ancestors()
+			.filter_map(ElementRef::wrap)
+			.find(|e| e.value().name() == "shreddit-comment")
+			.is_some_and(|e| e.id() == comment.id())
+		{
+			continue;
+		}
+		let source = element.value().attr("src").unwrap_or_default();
+		if source.len() > 8192 {
+			return Err("continuation length limit");
+		}
+		let Some(url) = checked_redirect(&base, source, lane) else {
+			continue;
+		};
+		let Some(suffix) = url.path().strip_prefix("/svc/shreddit/more-comments/") else {
+			continue;
+		};
+		let Some((sub, thing)) = suffix.split_once('/') else {
+			continue;
+		};
+		if !valid_sub(sub) || thing != post {
+			return Err("invalid reply continuation");
+		}
+		let source = url.to_string();
+		if !paths.contains(&source) {
+			paths.push(source);
+		}
+	}
+	Ok(paths)
+}
+
+fn has_replies_to(html: &str, post_id: &str, comment_id: &str) -> bool {
+	let document = Html::parse_document(html);
+	let post = format!("t3_{post_id}");
+	let parent = format!("t1_{comment_id}");
+	document
+		.select(&selector("shreddit-comment"))
+		.any(|e| e.value().attr("postid") == Some(post.as_str()) && e.value().attr("parentid") == Some(parent.as_str()))
+}
+
+fn is_reply_source(source: &str, post: &str) -> bool {
+	let base = url::Url::parse(RedditLane::Direct.auth_origin().base).unwrap();
+	let Ok(url) = base.join(source) else {
+		return false;
+	};
+	if source.len() > 8192
+		|| url.scheme() != "https"
+		|| ![RedditLane::Direct.auth_origin().host, RedditLane::Tor.auth_origin().host].contains(&url.host_str().unwrap_or_default())
+		|| url.port_or_known_default() != Some(443)
+		|| !url.username().is_empty()
+		|| url.password().is_some()
+	{
+		return false;
+	}
+	url
+		.path()
+		.strip_prefix("/svc/shreddit/more-comments/")
+		.and_then(|s| s.split_once('/'))
+		.is_some_and(|(sub, id)| valid_sub(sub) && id == post)
+}
+
 pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'static str> {
+	parse_comments_expanded(html, post_id, None)
+}
+
+fn parse_comments_expanded(html: &str, post_id: &str, expanded_parent: Option<&str>) -> Result<Value, &'static str> {
 	let document = Html::parse_document(html);
 	let post_fullname = format!("t3_{post_id}");
 	let post = document
@@ -231,6 +360,8 @@ pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'stati
 	let count = post.value().attr("comment-count").and_then(|v| v.parse::<u64>().ok()).ok_or("missing comment count")?;
 	let mut comments = Vec::new();
 	let mut ids = HashMap::new();
+	let mut positions = Vec::new();
+	let mut position = 0;
 	for element in document.select(&selector("shreddit-comment")) {
 		if element.value().attr("postid") != Some(post_fullname.as_str()) {
 			continue;
@@ -240,8 +371,12 @@ pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'stati
 		}
 		let fullname = element.value().attr("thingid").ok_or("missing comment id")?;
 		let id = fullname.strip_prefix("t1_").filter(|id| valid_id(id)).ok_or("invalid comment id")?;
-		if ids.insert(fullname.to_string(), comments.len()).is_some() {
+		let existing = ids.get(fullname).copied();
+		if existing.is_some() && expanded_parent.is_none() {
 			return Err("duplicate comment");
+		}
+		if existing.is_none() {
+			ids.insert(fullname.to_string(), comments.len());
 		}
 		let parent = element.value().attr("parentid").unwrap_or(&post_fullname);
 		if parent != post_fullname && !parent.strip_prefix("t1_").is_some_and(valid_id) {
@@ -261,11 +396,14 @@ pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'stati
 		let mut data = json!({"id":id,"name":fullname,"parent_id":parent,"link_id":post_fullname,"author":element.value().attr("author").unwrap_or("[deleted]"),"body":body.text().collect::<String>(),"body_html":body_html,"created_utc":timestamp,"score":element.value().attr("score").and_then(|v|v.parse::<i64>().ok()).unwrap_or(0),"score_hidden":element.value().attr("score").and_then(|v|v.parse::<i64>().ok()).is_none(),"replies":"","all_awardings":[]});
 		// Preserve Reddit's permalink to deeper replies using the existing more
 		// comment renderer. No tracking or signed continuation URL leaves Redlib.
-		if let Some(more) = element.select(&selector("[slot=more-comments-permalink]")).find(|e| {
-			e.ancestors()
-				.filter_map(ElementRef::wrap)
-				.find(|p| p.value().name() == "shreddit-comment")
-				.is_some_and(|p| p.id() == element.id())
+		if let Some(more) = element.select(&selector("faceplate-partial[src]")).find(|e| {
+			expanded_parent != Some(fullname)
+				&& e.value().attr("src").is_some_and(|src| is_reply_source(src, &post_fullname))
+				&& e
+					.ancestors()
+					.filter_map(ElementRef::wrap)
+					.find(|p| p.value().name() == "shreddit-comment")
+					.is_some_and(|p| p.id() == element.id())
 		}) {
 			let text = more.text().collect::<String>();
 			let count = text
@@ -275,7 +413,15 @@ pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'stati
 				.unwrap_or(1);
 			data["replies"] = json!({"kind":"Listing","data":{"children":[{"kind":"more","data":{"id":"_","parent_id":fullname,"count":count}}]}});
 		}
-		comments.push(json!({"kind":"t1","data":data}));
+		let node = json!({"kind":"t1","data":data});
+		if let Some(index) = existing {
+			comments[index] = node;
+			positions[index] = position;
+		} else {
+			comments.push(node);
+			positions.push(position);
+		}
+		position += 1;
 	}
 	if comments.is_empty() && count != 0 {
 		return Err("missing comments");
@@ -285,6 +431,11 @@ pub(crate) fn parse_comments(html: &str, post_id: &str) -> Result<Value, &'stati
 		let parent = comment["data"]["parent_id"].as_str().ok_or("missing parent")?;
 		let parent = if ids.contains_key(parent) { parent } else { &post_fullname };
 		children.entry(parent.to_string()).or_default().push(index);
+	}
+	if expanded_parent.is_some() {
+		for siblings in children.values_mut() {
+			siblings.sort_by_key(|index| positions[*index]);
+		}
 	}
 	fn attach(parent: &str, nodes: &[Value], children: &HashMap<String, Vec<usize>>, depth: usize, visited: &mut usize) -> Result<Vec<Value>, &'static str> {
 		if depth > MAX_DEPTH {
@@ -410,6 +561,56 @@ mod tests {
 		assert!(!roots.is_empty(), "the supplied public thread has comments");
 		assert!(roots.iter().all(|c| c["data"]["body_html"].as_str().is_some_and(|body| !body.is_empty())));
 		println!("ANONYMOUS_HTML_ADAPTER root_comments={} tree_valid=true", roots.len());
+		let session = TOR.as_ref().unwrap();
+		let html = session
+			.client
+			.get(format!("{}/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/", RedditLane::Tor.auth_origin().base))
+			.send()
+			.await
+			.unwrap()
+			.text()
+			.await
+			.unwrap();
+		let target = {
+			let doc = Html::parse_document(&html);
+			doc
+				.select(&selector("faceplate-partial[src]"))
+				.filter(|e| e.value().attr("src").is_some_and(|src| is_reply_source(src, "t3_1xaomu1")))
+				.find_map(|e| {
+					e.ancestors()
+						.filter_map(ElementRef::wrap)
+						.find(|p| p.value().name() == "shreddit-comment")
+						.and_then(|p| p.value().attr("thingid").map(str::to_owned))
+				})
+				.expect("a real reply continuation in the supplied thread")
+		};
+		fn replies(listing: &Value, target: &str) -> Option<usize> {
+			fn count(listing: &Value) -> usize {
+				listing["data"]["children"]
+					.as_array()
+					.into_iter()
+					.flatten()
+					.filter(|c| c["kind"] == "t1")
+					.map(|c| 1 + count(&c["data"]["replies"]))
+					.sum()
+			}
+			for comment in listing["data"]["children"].as_array().into_iter().flatten() {
+				if comment["data"]["name"] == target {
+					return Some(count(&comment["data"]["replies"]));
+				}
+				if let Some(found) = replies(&comment["data"]["replies"], target) {
+					return Some(found);
+				}
+			}
+			None
+		}
+		let initial = replies(&result, &target).unwrap();
+		let id = target.strip_prefix("t1_").unwrap();
+		let path = ThreadPath::parse(&format!("/r/codex/comments/1xaomu1/_/{id}.json")).unwrap();
+		let expanded = fetch(&path, RedditLane::Tor).await.expect("anonymous reply continuation");
+		let after = replies(&expanded, &target).unwrap();
+		assert!(after > initial, "the continuation must load additional real replies");
+		println!("ANONYMOUS_REPLY_EXPANSION initial_replies={initial} expanded_replies={after}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -447,101 +648,6 @@ mod tests {
 		format!(
 			r#"<shreddit-comment thingid="t1_{id}" postid="t3_abc123" parentid="{parent}" author="example" score="4" created="2026-10-20T10:36:30.813000+0000"><details><div slot="comment"><div><p>{body}</p></div></div></details></shreddit-comment>"#
 		)
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "isolated read-only comment permalink verification"]
-	async fn live_anonymous_comment_permalink() {
-		let _ = pretty_env_logger::try_init();
-		let oauth = tokio::time::timeout(Duration::from_secs(60), crate::oauth::Oauth::new(RedditLane::Tor))
-			.await
-			.expect("anonymous Tor OAuth startup");
-		assert!(crate::client::install_oauth_client(oauth, true, None));
-		let value = crate::client::json("/r/codex/comments/1xaomu1/_/phv7x54.json?context=3".to_owned(), false)
-			.await
-			.expect("permalink comments");
-		fn count(v: &Value) -> usize {
-			v["data"]["children"]
-				.as_array()
-				.into_iter()
-				.flatten()
-				.filter(|v| v["kind"] == "t1")
-				.map(|v| 1 + count(&v["data"]["replies"]))
-				.sum()
-		}
-		fn target(v: &Value) -> Option<usize> {
-			for node in v["data"]["children"].as_array().into_iter().flatten() {
-				if node["data"]["id"] == "phv7x54" {
-					return Some(count(&node["data"]["replies"]));
-				}
-				if let Some(found) = target(&node["data"]["replies"]) {
-					return Some(found);
-				}
-			}
-			None
-		}
-		let replies = target(&value[1]).expect("requested comment must be present");
-		assert!(replies > 0, "requested comment has replies");
-		println!("ANONYMOUS_COMMENT_PERMALINK total_comments={} target_replies={replies}", count(&value[1]));
-		let session = TOR.as_ref().unwrap();
-		let origin = RedditLane::Tor.auth_origin();
-		let html = session
-			.client
-			.get(format!("{}/r/codex/comments/1xaomu1/comment/phv7x54/?context=3", origin.base))
-			.send()
-			.await
-			.unwrap()
-			.text()
-			.await
-			.unwrap();
-		let (paths, seen) = {
-			let doc = Html::parse_document(&html);
-			let target = doc.select(&selector("shreddit-comment")).find(|e| e.value().attr("thingid") == Some("t1_phv7x54")).unwrap();
-			let paths = target
-				.select(&selector("faceplate-partial[src]"))
-				.filter_map(|e| e.value().attr("src"))
-				.filter(|p| p.starts_with("/svc/shreddit/more-comments/"))
-				.map(str::to_owned)
-				.collect::<Vec<_>>();
-			let seen = doc
-				.select(&selector("shreddit-comment"))
-				.filter_map(|e| e.value().attr("thingid"))
-				.map(str::to_owned)
-				.collect::<Vec<_>>();
-			(paths, seen)
-		};
-
-		let fields = {
-			let doc = Html::parse_document(&html);
-			let target = doc.select(&selector("shreddit-comment")).find(|e| e.value().attr("thingid") == Some("t1_phv7x54")).unwrap();
-			["depth", "comment-position", "comment-parent-positions"].map(|k| (k, target.value().attr(k).unwrap_or_default().to_owned()))
-		};
-		println!("ANONYMOUS_REPLY_POSITION fields={fields:?}");
-		let mut paths = paths;
-		for position in ["0", "[0]"] {
-			let query = url::form_urlencoded::Serializer::new(String::new())
-				.append_pair("sort", "best")
-				.append_pair("startingDepth", "1")
-				.append_pair("commentParentPositions", position)
-				.finish();
-			paths.push(format!("/svc/shreddit/more-comments/codex/t3_1xaomu1?{query}"));
-		}
-		for path in paths.into_iter().take(3) {
-			let r = session.client.get(format!("{}{path}", origin.base)).send().await.unwrap();
-			let status = r.status().as_u16();
-			let html = r.text().await.unwrap();
-			let doc = Html::parse_document(&html);
-			let ids = doc.select(&selector("shreddit-comment")).filter_map(|e| e.value().attr("thingid")).collect::<Vec<_>>();
-			let parents = doc
-				.select(&selector("shreddit-comment"))
-				.filter_map(|e| e.value().attr("parentid"))
-				.collect::<std::collections::HashSet<_>>();
-			println!(
-				"ANONYMOUS_MORE_REPLIES status={status} comments={} duplicates={} parents={parents:?}",
-				ids.len(),
-				ids.iter().filter(|id| seen.iter().any(|prior| prior == *id)).count()
-			);
-		}
 	}
 
 	#[test]
@@ -612,7 +718,7 @@ mod tests {
 	fn comments_html_preserves_deeper_reply_links_without_tracking_urls() {
 		let html = page(&comment("first", "t3_abc123", "Body").replace(
 			"</details>",
-			r#"<a slot="more-comments-permalink" href="/r/example/comments/abc123/comment/first/?tracking=secret">More</a></details>"#,
+			r#"<a slot="more-comments-permalink" href="/r/example/comments/abc123/comment/first/?tracking=secret">More</a><faceplate-partial src="/svc/shreddit/more-comments/example/t3_abc123?startingDepth=1">6 more replies</faceplate-partial></details>"#,
 		));
 		let parsed = parse_comments(&html, "abc123").unwrap();
 		let more = &parsed["data"]["children"][0]["data"]["replies"]["data"]["children"][0];
@@ -622,7 +728,62 @@ mod tests {
 	}
 
 	#[test]
+	fn comments_html_expansion_replaces_duplicate_children_and_removes_used_more_link() {
+		let parent = comment("first", "t3_abc123", "Parent").replace("</details>", r#"<a slot="more-comments-permalink">More replies</a><faceplate-partial src="/svc/shreddit/more-comments/example/t3_abc123?startingDepth=1">6 more replies</faceplate-partial></details>"#);
+		let html = format!(
+			"<html><body>{}</body></html>{}{}",
+			page(&(parent + &comment("old", "t1_first", "Old"))),
+			comment("new", "t1_first", "New"),
+			comment("old", "t1_first", "Updated")
+		);
+		let value = parse_comments_expanded(&html, "abc123", Some("t1_first")).unwrap();
+		let replies = value["data"]["children"][0]["data"]["replies"]["data"]["children"].as_array().unwrap();
+		assert_eq!(replies.len(), 2);
+		assert!(replies.iter().all(|v| v["kind"] == "t1"));
+		assert_eq!(replies[0]["data"]["body"], "New");
+		assert_eq!(replies[1]["data"]["body"], "Updated");
+	}
+
+	#[test]
+	fn comments_html_does_not_invent_more_replies_from_a_fallback_permalink() {
+		let html = page(&comment("first", "t3_abc123", "Body").replace("</details>", r#"<a slot="more-comments-permalink">More replies</a></details>"#));
+		let value = parse_comments(&html, "abc123").unwrap();
+		assert_eq!(value["data"]["children"][0]["data"]["replies"], "");
+	}
+
+	#[test]
+	fn comments_html_reply_fragments_must_contain_replies_to_the_requested_comment() {
+		assert!(has_replies_to(&comment("reply", "t1_first", "Reply"), "abc123", "first"));
+		assert!(!has_replies_to("<html>Unable to load</html>", "abc123", "first"));
+		assert!(!has_replies_to(&comment("reply", "t1_other", "Wrong parent"), "abc123", "first"));
+	}
+
+	#[test]
+	fn comments_html_reply_paths_are_owned_by_the_requested_comment_and_lane() {
+		let child = comment("child", "t1_first", "Child").replace(
+			"</details>",
+			r#"<faceplate-partial src="/svc/shreddit/more-comments/example/t3_abc123?startingDepth=2"></faceplate-partial></details>"#,
+		);
+		let parent=comment("first","t3_abc123","Parent").replace("</details>",&format!(r#"{child}<faceplate-partial src="/svc/shreddit/more-comments/example/t3_abc123?startingDepth=1"></faceplate-partial><faceplate-partial src="https://evil.example/svc/shreddit/more-comments/example/t3_abc123"></faceplate-partial></details>"#));
+		let paths = reply_paths(&page(&parent), "abc123", "first", RedditLane::Tor).unwrap();
+		assert_eq!(paths.len(), 1);
+		assert!(paths[0].ends_with("?startingDepth=1"));
+		assert!(paths[0].starts_with(RedditLane::Tor.auth_origin().base));
+		assert!(reply_paths(&page(&parent.replace("t3_abc123?", "t3_wrong?")), "abc123", "first", RedditLane::Tor).is_err());
+	}
+
+	#[test]
 	fn comments_html_paths_keep_thread_context_and_allowlisted_queries() {
+		assert_eq!(
+			ThreadPath::parse("/r/codex/comments/abc123/日本語/.json").unwrap().website_path,
+			"/r/codex/comments/abc123/日本語/"
+		);
+		assert_eq!(
+			ThreadPath::parse("/r/codex/comments/abc123/%E6%97%A5/.json").unwrap().website_path,
+			"/r/codex/comments/abc123/%E6%97%A5/"
+		);
+		assert!(!valid_slug("%2f%2fevil.example"));
+		assert!(!valid_slug("%2e%2e"));
 		assert_eq!(
 			ThreadPath::parse("/r/codex/comments/abc123/title/.json").unwrap().website_path,
 			"/r/codex/comments/abc123/title/"
