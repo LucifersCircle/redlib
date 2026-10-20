@@ -3108,6 +3108,10 @@ async fn direct_then_tor_request(path: String, quarantine: bool) -> Result<Value
 	recover_after_direct_standby(direct_standby_request(path.clone(), quarantine), || async move {
 		info!("Returning to Tor after direct standby did not recover the page: endpoint={}", endpoint_class(&path));
 		let recovery = async {
+			// Website recovery is independent of the legacy comments circuit.
+			if let Some(value) = website_comments_on_lane(&path, quarantine, RedditLane::Tor).await {
+				return Ok(value);
+			}
 			wait_for_tor_recovery(&path).await;
 			json_uncached_on_lane(path.clone(), quarantine, RedditLane::Tor).await.0
 		};

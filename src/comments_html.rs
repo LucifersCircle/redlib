@@ -366,7 +366,7 @@ fn render_body(element: ElementRef<'_>, depth: usize) -> String {
 					output.push_str(&format!("<{name}>"));
 				} else if name == "a" {
 					if let Some(href) = child.value().attr("href").filter(|v| safe_link(v)) {
-						output.push_str(&format!("<a href=\"{}\" rel=\"nofollow noreferrer\">{inner}</a>", htmlescape::encode_attribute(href)));
+						output.push_str(&format!("<a href=\"{}\" rel=\"nofollow noreferrer\">{inner}</a>", htmlescape::encode_minimal(href)));
 					} else {
 						output.push_str(&inner);
 					}
@@ -376,8 +376,8 @@ fn render_body(element: ElementRef<'_>, depth: usize) -> String {
 						if ["/img/", "/preview/", "/emoji/", "/static/"].iter().any(|prefix| src.starts_with(prefix)) {
 							output.push_str(&format!(
 								"<img src=\"{}\" alt=\"{}\" loading=\"lazy\">",
-								htmlescape::encode_attribute(&src),
-								htmlescape::encode_attribute(child.value().attr("alt").unwrap_or_default())
+								htmlescape::encode_minimal(&src),
+								htmlescape::encode_minimal(child.value().attr("alt").unwrap_or_default())
 							));
 						}
 					}
@@ -447,6 +447,42 @@ mod tests {
 		format!(
 			r#"<shreddit-comment thingid="t1_{id}" postid="t3_abc123" parentid="{parent}" author="example" score="4" created="2026-10-20T10:36:30.813000+0000"><details><div slot="comment"><div><p>{body}</p></div></div></details></shreddit-comment>"#
 		)
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated read-only comment permalink verification"]
+	async fn live_anonymous_comment_permalink() {
+		let _ = pretty_env_logger::try_init();
+		let oauth = tokio::time::timeout(Duration::from_secs(60), crate::oauth::Oauth::new(RedditLane::Tor))
+			.await
+			.expect("anonymous Tor OAuth startup");
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		let value = crate::client::json("/r/codex/comments/1xaomu1/_/phv7x54.json?context=3".to_owned(), false)
+			.await
+			.expect("permalink comments");
+		fn count(v: &Value) -> usize {
+			v["data"]["children"]
+				.as_array()
+				.into_iter()
+				.flatten()
+				.filter(|v| v["kind"] == "t1")
+				.map(|v| 1 + count(&v["data"]["replies"]))
+				.sum()
+		}
+		fn target(v: &Value) -> Option<usize> {
+			for node in v["data"]["children"].as_array().into_iter().flatten() {
+				if node["data"]["id"] == "phv7x54" {
+					return Some(count(&node["data"]["replies"]));
+				}
+				if let Some(found) = target(&node["data"]["replies"]) {
+					return Some(found);
+				}
+			}
+			None
+		}
+		let replies = target(&value[1]).expect("requested comment must be present");
+		assert!(replies > 0, "requested comment has replies");
+		println!("ANONYMOUS_COMMENT_PERMALINK total_comments={} target_replies={replies}", count(&value[1]));
 	}
 
 	#[test]
@@ -561,6 +597,20 @@ mod tests {
 		for forbidden in ["https://", "tracker.example", "settings/update", "onload"] {
 			assert!(!body.contains(forbidden));
 		}
+	}
+
+	#[test]
+	fn comments_html_reddit_links_use_the_existing_local_link_rewriter() {
+		let html = page(&comment(
+			"first",
+			"t3_abc123",
+			r#"<a href="https://www.reddit.com/r/example/comments/abc123/title/">Thread</a><a href="https://oauth.reddit.com/r/example/">Community</a>"#,
+		));
+		let parsed = parse_comments(&html, "abc123").unwrap();
+		let body = crate::utils::rewrite_emotes(&Value::Null, parsed["data"]["children"][0]["data"]["body_html"].as_str().unwrap().to_owned());
+		let document = Html::parse_fragment(&body);
+		let links: Vec<_> = document.select(&selector("a")).filter_map(|e| e.value().attr("href")).collect();
+		assert_eq!(links, ["/r/example/comments/abc123/title/", "/r/example/"]);
 	}
 
 	#[test]
