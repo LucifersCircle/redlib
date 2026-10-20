@@ -198,7 +198,7 @@ docker logs -f redlib
 
 #### Optional Tor resilience fallback
 
-This fork can keep an independently authenticated Tor lane warm and use it when Reddit returns the narrow edge-throttle signature that Redlib classifies as `403 + Retry-After + no quota headers`. Direct access remains primary, and a direct half-open probe periodically checks for recovery. After bounded local retries, one request may also spill to an already-ready Tor lane when only the direct identity's locally tracked quota reserve is exhausted. That spillover is capped at three seconds, does not create a new identity merely to obtain admission, and never bypasses an explicit upstream rate-limit rejection or cooldown. Generic failures, media proxy requests, and canonical `HEAD` requests do not switch to Tor.
+This fork can keep an independently authenticated Tor lane and use it when Reddit returns the narrow edge-throttle signature that Redlib classifies as `403 + Retry-After + no quota headers`. Direct access remains primary by default, and a half-open probe checks for recovery after cooldown. After bounded local retries, one request may also spill to an already-ready Tor lane when only the direct identity's locally tracked quota reserve is exhausted. That spillover is capped at three seconds, does not create a new identity merely to obtain admission, and never bypasses an explicit upstream rate-limit rejection or cooldown. Media proxy requests remain direct. Reddit share-link resolution follows the selected lane and permits one bounded fallback.
 
 The fallback is disabled by default. For the supplied Portainer stack:
 
@@ -213,6 +213,16 @@ The fallback is disabled by default. For the supplied Portainer stack:
 The Tor sidecar has its own outbound network because Tor must reach the public Tor network. Redlib connects to it only over the internal `tor_private` network. Direct and Tor OAuth start independently; if Tor becomes ready first, Redlib can serve through Tor while the direct lane continues its bounded-backoff startup retries in the background. If Tor is unavailable, Redlib retains the direct circuit's cooldown rather than sending onion hostnames outside the configured SOCKS proxy.
 
 Each fresh Tor OAuth identity uses unique SOCKS username/password isolation credentials and keeps that isolated HTTP transport for its lifetime. C Tor enables `IsolateSOCKSAuth` by default; a custom Tor configuration must not disable it with `NoIsolateSOCKSAuth`. This prevents a replacement OAuth identity from silently reusing the previous identity's Tor circuit group while allowing in-flight requests to finish with their original matching token and transport.
+
+To serve normal Reddit API requests through Tor while keeping direct access as a standby, also set:
+
+```env
+REDLIB_REDDIT_PRIMARY_LANE=tor
+```
+
+Both lanes continue to authenticate and renew their own sessions independently. A direct connection is not needed to refresh Tor OAuth. Routing considers the requested endpoint's breaker, transport cooldown, rejected credentials, and local allowance. While Tor is unavailable or its local allowance is paused, an admissible direct lane can serve requests. Each direct standby attempt is capped at 15 seconds, including queueing and retries, with at most two standby requests in progress. A failed Tor request may try direct once. If direct fails or is busy, the request returns to Tor for one bounded recovery attempt, waiting for Tor cooldown or credential renewal without holding transport slots. The final Tor recovery has a 30-second server budget; it never starts another direct attempt. The complete Tor-first API/share-link operation has a 75-second server budget so the application can return a loading response before a long request is replaced by a proxy timeout. Explicit upstream quota cooldowns remain on their original lane. Tor's normal API requests use the normal server recovery bounds, rather than the three-second opportunistic spillover deadline.
+
+Edge rejection breakers are independent for comments, listings, search, and the other endpoint classes, while transport and upstream quota controls remain shared within a lane. A successful listing cannot clear a comment rejection. Known private, banned, quarantined, and gated JSON errors are returned as resource errors instead of opening a breaker. Explicit token rejections (`401`, or `403` with a Bearer `invalid_token` challenge) can renew a Tor-first session in the background using the existing OAuth backoff. Other 403s retain their cooldown without creating new identities. Rejection diagnostics include the lane, endpoint class, request ID, generation, content/body category, and recognized resource reason; they omit URLs, tokens, and response payloads. `direct_standby_attempts` appears in the periodic traffic summary. If server-side recovery still cannot return a page, browser GET requests show only “Still trying to load your page…” and automatically retry the same URL after the indicated cooldown, with a small jitter to spread retries. These waiting responses carry HTTP 503, Retry-After, and no-store headers. Permanent resource errors retain their explanation; form submissions are not automatically replayed.
 
 ### Docker CLI
 
@@ -440,6 +450,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
 | `REDDIT_MAX_CONCURRENCY`  | Integer 1-64    | `8`                    | Caps simultaneous Reddit JSON API requests to flatten bursts and reduce upstream rate-limit pressure.    |
 | `TOR_FALLBACK`            | `["on", "off"]` | `off`                | Enables the separate Tor API/OAuth lane for confirmed direct edge throttles and bounded local quota spillover. |
+| `REDDIT_PRIMARY_LANE`     | `["direct", "tor"]` | `direct`          | Selects the normal API lane. `tor` requires `TOR_FALLBACK=on`; direct remains a bounded standby. Media remains direct. |
 | `TOR_PROXY`               | `socks5h://host:port` | (empty)          | Required with `TOR_FALLBACK=on`; credentials, paths, queries, and non-`socks5h` schemes are rejected.      |
 
 ## Default user settings

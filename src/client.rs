@@ -1,6 +1,6 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, RefreshReason};
-use crate::reddit_lane::{RedditLane, TOR_FALLBACK_CONFIG};
+use crate::reddit_lane::{RedditLane, PRIMARY_REDDIT_LANE, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::format_url;
@@ -76,6 +76,12 @@ const MAX_LOCAL_QUOTA_RETRIES: u8 = 3;
 const TOR_QUOTA_REFRESH_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const MAX_TOR_QUOTA_REFRESH_RETRIES: u8 = 16;
 const TOR_QUOTA_SPILLOVER_TIMEOUT: Duration = Duration::from_secs(3);
+const DIRECT_STANDBY_TIMEOUT: Duration = Duration::from_secs(15);
+const TOR_STANDBY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const TOR_FIRST_PAGE_BUDGET: Duration = Duration::from_secs(75);
+const REJECTED_SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+static DIRECT_STANDBY_CAPACITY: Semaphore = Semaphore::const_new(2);
+static DIRECT_STANDBY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 const EMERGENCY_QUOTA_REFRESH_RETRY: Duration = Duration::from_secs(2);
 const OAUTH_STARTUP_RETRY: Duration = Duration::from_secs(5);
 const JSON_FLIGHT_ABORTED_ERROR: &str = "The shared Reddit request ended before producing a response";
@@ -166,6 +172,8 @@ struct QuotaSpilloverTicket {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TorRetryReason {
 	None,
+	TransportUnavailable,
+	SessionUnavailable,
 	EdgeRejected,
 	QuotaReserve(QuotaSpilloverTicket),
 }
@@ -212,6 +220,7 @@ enum EdgeCircuitState {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct EdgeAttempt {
+	endpoint: usize,
 	epoch: u64,
 	half_open: bool,
 }
@@ -540,6 +549,14 @@ impl QuotaGovernor {
 	}
 }
 
+#[derive(Debug, Default)]
+struct EdgeCircuit {
+	failures: u8,
+	epoch: u64,
+	state: EdgeCircuitState,
+	episode_started_at: Option<Instant>,
+}
+
 #[derive(Debug)]
 struct UpstreamGuard {
 	lane: RedditLane,
@@ -551,11 +568,10 @@ struct UpstreamGuard {
 	failures_in_window: u8,
 	upstream_failure_blocked_until: Option<Instant>,
 	rate_limit_blocked_until: Option<Instant>,
-	edge_throttle_failures: u8,
-	edge_epoch: u64,
-	edge_state: EdgeCircuitState,
-	edge_episode_started_at: Option<Instant>,
+	edges: [EdgeCircuit; 7],
 	identity_installed_at: Instant,
+	rejected_oauth_generation: Option<u64>,
+	rejected_session_refresh_after: Instant,
 }
 
 impl Default for UpstreamGuard {
@@ -576,12 +592,46 @@ impl UpstreamGuard {
 			failures_in_window: 0,
 			upstream_failure_blocked_until: None,
 			rate_limit_blocked_until: None,
-			edge_throttle_failures: 0,
-			edge_epoch: 0,
-			edge_state: EdgeCircuitState::Closed,
-			edge_episode_started_at: None,
+			edges: std::array::from_fn(|_| EdgeCircuit::default()),
 			identity_installed_at: Instant::now(),
+			rejected_oauth_generation: None,
+			rejected_session_refresh_after: Instant::now(),
 		}
+	}
+
+	fn routing_availability(&self, now: Instant, generation: u64, endpoint: usize) -> LaneAvailability {
+		if generation != self.quota.generation {
+			return LaneAvailability::Unavailable;
+		}
+		if self.rate_limit_blocked_until.is_some_and(|until| until > now) {
+			return LaneAvailability::UpstreamQuotaCooldown;
+		}
+		if self.upstream_failure_blocked_until.is_some_and(|until| until > now) {
+			return LaneAvailability::TransportCooldown;
+		}
+		if self.rejected_oauth_generation == Some(generation) || self.active_endpoint_cooldown(now, endpoint).is_some() {
+			return LaneAvailability::Unavailable;
+		}
+		if self.quota.reserve_exhausted(now) {
+			return LaneAvailability::LocalQuotaPause;
+		}
+		LaneAvailability::Ready
+	}
+
+	fn reject_oauth_generation(&mut self, generation: u64) -> bool {
+		if self.quota.generation != generation || self.rejected_oauth_generation == Some(generation) {
+			return false;
+		}
+		self.rejected_oauth_generation = Some(generation);
+		true
+	}
+
+	fn rejected_session_refresh_delay(&mut self, now: Instant) -> Duration {
+		let delay = self.rejected_session_refresh_after.saturating_duration_since(now);
+		if delay.is_zero() {
+			self.rejected_session_refresh_after = now + REJECTED_SESSION_REFRESH_INTERVAL;
+		}
+		delay
 	}
 
 	fn known_quota_state(&self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
@@ -596,6 +646,7 @@ impl UpstreamGuard {
 
 	fn install_oauth_generation(&mut self, generation: u64, fresh_identity: bool) {
 		self.quota.install_generation(generation, fresh_identity);
+		self.rejected_oauth_generation = None;
 		if fresh_identity {
 			self.quota_rotation_armed = false;
 			self.quota_wait_logged_epoch = None;
@@ -611,7 +662,7 @@ impl UpstreamGuard {
 		}
 		if self.rate_limit_blocked_until.is_some_and(|deadline| deadline > now)
 			|| self.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now)
-			|| !matches!(self.edge_state, EdgeCircuitState::Closed)
+			|| self.edges.iter().any(|edge| !matches!(edge.state, EdgeCircuitState::Closed))
 		{
 			return false;
 		}
@@ -705,6 +756,7 @@ impl UpstreamGuard {
 			&& ticket.generation == self.quota.generation
 			&& ticket.quota_epoch == self.quota.epoch
 			&& self.active_cooldown(now).is_none()
+			&& self.edges.iter().all(|edge| matches!(edge.state, EdgeCircuitState::Closed))
 			&& self.quota.reserve_exhausted(now)
 	}
 
@@ -723,8 +775,13 @@ impl UpstreamGuard {
 		Some((available, reset_remaining))
 	}
 
+	#[cfg(test)]
 	fn try_admit(&mut self, now: Instant, generation: u64) -> Result<UpstreamAttempt, AdmissionDenied> {
-		if let Some((delay, reason)) = self.active_cooldown(now) {
+		self.try_admit_endpoint(now, generation, 0)
+	}
+
+	fn try_admit_endpoint(&mut self, now: Instant, generation: u64, endpoint: usize) -> Result<UpstreamAttempt, AdmissionDenied> {
+		if let Some((delay, reason)) = self.active_endpoint_cooldown(now, endpoint) {
 			return Err(AdmissionDenied {
 				delay,
 				reason,
@@ -751,13 +808,14 @@ impl UpstreamGuard {
 			},
 		})?;
 		let quota_consumption_watermark = self.quota.headerless_consumption;
-		let edge = match self.begin_attempt(now) {
+		let edge = match self.begin_endpoint_attempt(now, endpoint) {
 			Ok(edge) => edge,
 			Err(error) => {
 				let mut placeholder = UpstreamAttempt {
 					lane: self.lane,
 					edge: EdgeAttempt {
-						epoch: self.edge_epoch,
+						endpoint,
+						epoch: self.edges[endpoint].epoch,
 						half_open: false,
 					},
 					generation,
@@ -814,6 +872,10 @@ impl UpstreamGuard {
 	}
 
 	fn active_cooldown(&self, now: Instant) -> Option<(Duration, CooldownReason)> {
+		self.active_endpoint_cooldown(now, 0)
+	}
+
+	fn active_endpoint_cooldown(&self, now: Instant, endpoint: usize) -> Option<(Duration, CooldownReason)> {
 		let mut active = None;
 		let mut consider = |deadline: Option<Instant>, reason| {
 			if let Some(remaining) = deadline.filter(|deadline| *deadline > now).map(|deadline| deadline.duration_since(now)) {
@@ -825,7 +887,7 @@ impl UpstreamGuard {
 
 		consider(self.rate_limit_blocked_until, CooldownReason::RateLimit);
 		consider(self.upstream_failure_blocked_until, CooldownReason::UpstreamFailures);
-		match self.edge_state {
+		match self.edges[endpoint].state {
 			EdgeCircuitState::Open { until } => consider(Some(until), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::Closed => {}
@@ -844,8 +906,8 @@ impl UpstreamGuard {
 		};
 		consider(self.rate_limit_blocked_until, CooldownReason::RateLimit);
 		consider(self.upstream_failure_blocked_until, CooldownReason::UpstreamFailures);
-		match self.edge_state {
-			EdgeCircuitState::Closed if attempt.epoch == self.edge_epoch => {}
+		match self.edges[attempt.endpoint].state {
+			EdgeCircuitState::Closed if attempt.epoch == self.edges[attempt.endpoint].epoch => {}
 			EdgeCircuitState::HalfOpen { epoch, .. } if attempt.half_open && attempt.epoch == epoch => {}
 			EdgeCircuitState::Open { until } => consider(Some(until.max(now + Duration::from_secs(1))), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at.max(now + Duration::from_secs(1))), CooldownReason::EdgeThrottle),
@@ -861,36 +923,44 @@ impl UpstreamGuard {
 		}
 	}
 
+	#[cfg(test)]
 	fn begin_attempt(&mut self, now: Instant) -> Result<EdgeAttempt, (Duration, CooldownReason)> {
-		if matches!(self.edge_state, EdgeCircuitState::HalfOpen { expires_at, .. } if expires_at <= now) {
-			self.edge_epoch = self.edge_epoch.wrapping_add(1);
-			self.edge_state = EdgeCircuitState::HalfOpen {
-				epoch: self.edge_epoch,
+		self.begin_endpoint_attempt(now, 0)
+	}
+
+	fn begin_endpoint_attempt(&mut self, now: Instant, endpoint: usize) -> Result<EdgeAttempt, (Duration, CooldownReason)> {
+		if matches!(self.edges[endpoint].state, EdgeCircuitState::HalfOpen { expires_at, .. } if expires_at <= now) {
+			self.edges[endpoint].epoch = self.edges[endpoint].epoch.wrapping_add(1);
+			self.edges[endpoint].state = EdgeCircuitState::HalfOpen {
+				epoch: self.edges[endpoint].epoch,
 				expires_at: now + self.lane.request_timeout(),
 			};
 			return Ok(EdgeAttempt {
-				epoch: self.edge_epoch,
+				endpoint,
+				epoch: self.edges[endpoint].epoch,
 				half_open: true,
 			});
 		}
-		if let Some(active) = self.active_cooldown(now) {
+		if let Some(active) = self.active_endpoint_cooldown(now, endpoint) {
 			return Err(active);
 		}
 
-		match self.edge_state {
+		match self.edges[endpoint].state {
 			EdgeCircuitState::Open { .. } => {
-				self.edge_state = EdgeCircuitState::HalfOpen {
-					epoch: self.edge_epoch,
+				self.edges[endpoint].state = EdgeCircuitState::HalfOpen {
+					epoch: self.edges[endpoint].epoch,
 					expires_at: now + self.lane.request_timeout(),
 				};
 				Ok(EdgeAttempt {
-					epoch: self.edge_epoch,
+					endpoint,
+					epoch: self.edges[endpoint].epoch,
 					half_open: true,
 				})
 			}
 			EdgeCircuitState::HalfOpen { expires_at, .. } => Err((expires_at.checked_duration_since(now).unwrap_or(Duration::from_secs(1)), CooldownReason::EdgeThrottle)),
 			EdgeCircuitState::Closed => Ok(EdgeAttempt {
-				epoch: self.edge_epoch,
+				endpoint,
+				epoch: self.edges[endpoint].epoch,
 				half_open: false,
 			}),
 		}
@@ -920,7 +990,7 @@ impl UpstreamGuard {
 
 	fn record_api_success(&mut self, now: Instant, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
 		self.reset_failure_window();
-		let closes_probe = matches!(self.edge_state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
+		let closes_probe = matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
 		// A success cannot end a cooldown extended by another in-flight failure.
 		if self.upstream_failure_blocked_until.is_some_and(|until| now >= until) {
 			self.upstream_failure_blocked_until = None;
@@ -928,21 +998,23 @@ impl UpstreamGuard {
 		if self.rate_limit_blocked_until.is_some_and(|until| now >= until) {
 			self.rate_limit_blocked_until = None;
 		}
-		let current_closed_attempt = matches!(self.edge_state, EdgeCircuitState::Closed) && attempt.epoch == self.edge_epoch;
+		let current_closed_attempt = matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::Closed) && attempt.epoch == self.edges[attempt.endpoint].epoch;
 		let recovery = closes_probe.then(|| EdgeRecovery {
-			consecutive_failures: self.edge_throttle_failures,
-			episode_seconds: self.edge_episode_started_at.map_or(0, |started| now.saturating_duration_since(started).as_secs()),
+			consecutive_failures: self.edges[attempt.endpoint].failures,
+			episode_seconds: self.edges[attempt.endpoint]
+				.episode_started_at
+				.map_or(0, |started| now.saturating_duration_since(started).as_secs()),
 			current_generation: self.quota.generation,
 			identity_age_seconds: now.saturating_duration_since(self.identity_installed_at).as_secs(),
 		});
 		if closes_probe {
-			self.edge_throttle_failures = 0;
-			self.edge_epoch = self.edge_epoch.wrapping_add(1);
-			self.edge_state = EdgeCircuitState::Closed;
-			self.edge_episode_started_at = None;
+			self.edges[attempt.endpoint].failures = 0;
+			self.edges[attempt.endpoint].epoch = self.edges[attempt.endpoint].epoch.wrapping_add(1);
+			self.edges[attempt.endpoint].state = EdgeCircuitState::Closed;
+			self.edges[attempt.endpoint].episode_started_at = None;
 		} else if current_closed_attempt {
-			self.edge_throttle_failures = 0;
-			self.edge_episode_started_at = None;
+			self.edges[attempt.endpoint].failures = 0;
+			self.edges[attempt.endpoint].episode_started_at = None;
 		}
 		recovery
 	}
@@ -957,33 +1029,35 @@ impl UpstreamGuard {
 	}
 
 	fn record_edge_throttle(&mut self, now: Instant, attempt: EdgeAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
-		let episode_seconds = self.edge_episode_started_at.map_or(0, |started| now.saturating_duration_since(started).as_secs());
+		let episode_seconds = self.edges[attempt.endpoint]
+			.episode_started_at
+			.map_or(0, |started| now.saturating_duration_since(started).as_secs());
 		let identity_age_seconds = now.saturating_duration_since(self.identity_installed_at).as_secs();
-		if attempt.epoch != self.edge_epoch {
-			let delay = match self.edge_state {
+		if attempt.epoch != self.edges[attempt.endpoint].epoch {
+			let delay = match self.edges[attempt.endpoint].state {
 				EdgeCircuitState::Open { until } => until.checked_duration_since(now).unwrap_or_default(),
 				EdgeCircuitState::HalfOpen { .. } => Duration::from_secs(1),
-				EdgeCircuitState::Closed => edge_throttle_base_delay(self.edge_throttle_failures.max(1), retry_after).0,
+				EdgeCircuitState::Closed => edge_throttle_base_delay(self.edges[attempt.endpoint].failures.max(1), retry_after).0,
 			};
 			return EdgeThrottleDecision {
 				delay,
-				consecutive_failures: self.edge_throttle_failures,
+				consecutive_failures: self.edges[attempt.endpoint].failures,
 				started_cooldown: false,
 				episode_seconds,
 				current_generation: self.quota.generation,
 				identity_age_seconds,
 			};
 		}
-		let episode_started_at = *self.edge_episode_started_at.get_or_insert(now);
+		let episode_started_at = *self.edges[attempt.endpoint].episode_started_at.get_or_insert(now);
 		let episode_seconds = now.saturating_duration_since(episode_started_at).as_secs();
 
-		self.edge_throttle_failures = self.edge_throttle_failures.saturating_add(1);
-		let delay = edge_throttle_delay(self.edge_throttle_failures, retry_after);
-		self.edge_epoch = self.edge_epoch.wrapping_add(1);
-		self.edge_state = EdgeCircuitState::Open { until: now + delay };
+		self.edges[attempt.endpoint].failures = self.edges[attempt.endpoint].failures.saturating_add(1);
+		let delay = edge_throttle_delay(self.edges[attempt.endpoint].failures, retry_after);
+		self.edges[attempt.endpoint].epoch = self.edges[attempt.endpoint].epoch.wrapping_add(1);
+		self.edges[attempt.endpoint].state = EdgeCircuitState::Open { until: now + delay };
 		EdgeThrottleDecision {
 			delay,
-			consecutive_failures: self.edge_throttle_failures,
+			consecutive_failures: self.edges[attempt.endpoint].failures,
 			started_cooldown: true,
 			episode_seconds,
 			current_generation: self.quota.generation,
@@ -992,9 +1066,9 @@ impl UpstreamGuard {
 	}
 
 	fn abandon_edge_probe(&mut self, now: Instant, attempt: EdgeAttempt) {
-		if attempt.half_open && matches!(self.edge_state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch) {
-			let delay = edge_throttle_delay(self.edge_throttle_failures.max(1), None);
-			self.edge_state = EdgeCircuitState::Open { until: now + delay };
+		if attempt.half_open && matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch) {
+			let delay = edge_throttle_delay(self.edges[attempt.endpoint].failures.max(1), None);
+			self.edges[attempt.endpoint].state = EdgeCircuitState::Open { until: now + delay };
 		}
 	}
 
@@ -1116,6 +1190,68 @@ impl ApiRequestError {
 			},
 		}
 	}
+}
+
+const MAX_REJECTION_BODY_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Eq, PartialEq)]
+struct RejectionDetails {
+	body_kind: &'static str,
+	resource_reason: Option<&'static str>,
+}
+
+fn rejection_details(body: &[u8]) -> RejectionDetails {
+	let Ok(json) = serde_json::from_slice::<Value>(body) else {
+		return RejectionDetails {
+			body_kind: "non_json",
+			resource_reason: None,
+		};
+	};
+	let resource_reason = if json["error"].as_u64() == Some(403) {
+		match json["reason"].as_str() {
+			Some("private") => Some("private"),
+			Some("banned") => Some("banned"),
+			Some("quarantined") => Some("quarantined"),
+			Some("gated") => Some("gated"),
+			_ => None,
+		}
+	} else {
+		None
+	};
+	RejectionDetails {
+		body_kind: "json",
+		resource_reason,
+	}
+}
+
+async fn read_rejection_details(body: &mut Body) -> RejectionDetails {
+	use hyper::body::HttpBody;
+	let mut bytes = Vec::new();
+	while let Some(chunk) = body.data().await {
+		let Ok(chunk) = chunk else {
+			return RejectionDetails {
+				body_kind: "body_error",
+				resource_reason: None,
+			};
+		};
+		if bytes.len().saturating_add(chunk.len()) > MAX_REJECTION_BODY_BYTES {
+			return RejectionDetails {
+				body_kind: "oversized",
+				resource_reason: None,
+			};
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	rejection_details(&bytes)
+}
+
+fn credential_rejected(status: u16, challenge: Option<&str>) -> bool {
+	status == 401
+		|| status == 403
+			&& challenge.is_some_and(|challenge| {
+				let challenge = challenge.to_ascii_lowercase();
+				challenge.starts_with("bearer ") && challenge.contains("error=\"invalid_token\"")
+			})
 }
 
 fn classify_throttle_response(status: u16, retry_after_present: bool, quota_headers_present: bool) -> Option<ThrottleKind> {
@@ -1384,7 +1520,7 @@ fn maybe_log_traffic_summary() {
 	drop(last);
 
 	info!(
-		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} comment_keys={} admitted_json={} api_sends={} api_lanes={} tor_fallbacks={} tor_quota_spillover_attempts={} tor_quota_spillover_successes={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_lanes={} local_denials={}",
+		"Reddit traffic summary (elapsed_seconds={}): inbound_routes={} inbound_methods={} inbound_status={} logical_json={} comment_keys={} admitted_json={} api_sends={} api_lanes={} tor_fallbacks={} direct_standby_attempts={} tor_quota_spillover_attempts={} tor_quota_spillover_successes={} redirect_hops={} canonical_heads={} media_sends={} media_destinations={} media_results={} oauth_lanes={} local_denials={}",
 		elapsed.as_secs().max(1),
 		take_counter_summary(
 			["home", "subreddit", "comments", "user", "search", "rss", "media", "health", "other"],
@@ -1412,6 +1548,7 @@ fn maybe_log_traffic_summary() {
 		),
 		take_counter_summary(["direct", "tor"], &API_LANE_SENDS),
 		TOR_FALLBACKS.swap(0, Ordering::Relaxed),
+		DIRECT_STANDBY_ATTEMPTS.swap(0, Ordering::Relaxed),
 		TOR_QUOTA_SPILLOVER_ATTEMPTS.swap(0, Ordering::Relaxed),
 		TOR_QUOTA_SPILLOVER_SUCCESSES.swap(0, Ordering::Relaxed),
 		REDIRECT_HOPS.swap(0, Ordering::Relaxed),
@@ -1457,38 +1594,77 @@ fn oauth_startup_error() -> String {
 	)
 }
 
-fn tor_fallback_ready() -> bool {
-	TOR_OAUTH_CLIENT.load().is_some()
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LaneAvailability {
+	Ready,
+	Unavailable,
+	TransportCooldown,
+	LocalQuotaPause,
+	UpstreamQuotaCooldown,
 }
 
-fn edge_fallback_active(guard: &UpstreamGuard, now: Instant) -> bool {
-	if guard.rate_limit_blocked_until.is_some_and(|deadline| deadline > now) || guard.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now) {
-		return false;
-	}
-	match guard.edge_state {
-		EdgeCircuitState::Open { until } => until > now,
-		EdgeCircuitState::HalfOpen { expires_at, .. } => expires_at > now,
-		EdgeCircuitState::Closed => false,
-	}
-}
-
-fn direct_edge_fallback_active(now: Instant) -> bool {
-	edge_fallback_active(&upstream_guard(RedditLane::Direct), now)
-}
-
-fn select_preferred_api_lane(direct_ready: bool, tor_ready: bool, direct_edge_active: bool) -> RedditLane {
-	if tor_ready && (!direct_ready || direct_edge_active) {
+fn configured_primary_lane() -> RedditLane {
+	if *PRIMARY_REDDIT_LANE == RedditLane::Tor && matches!(TOR_FALLBACK_CONFIG.as_ref(), Ok(Some(_))) {
 		RedditLane::Tor
 	} else {
 		RedditLane::Direct
 	}
 }
 
-fn preferred_api_lane(now: Instant) -> RedditLane {
-	let direct_ready = OAUTH_CLIENT.load().is_some();
-	let tor_ready = tor_fallback_ready();
-	let direct_edge_active = direct_ready && direct_edge_fallback_active(now);
-	select_preferred_api_lane(direct_ready, tor_ready, direct_edge_active)
+fn lane_availability(lane: RedditLane, now: Instant, path: &str) -> LaneAvailability {
+	let Some(oauth) = oauth_client(lane) else { return LaneAvailability::Unavailable };
+	let guard = upstream_guard(lane);
+	guard.routing_availability(now, oauth.generation, endpoint_class_index(path))
+}
+
+fn tor_fallback_ready(path: &str) -> bool {
+	lane_availability(RedditLane::Tor, Instant::now(), path) == LaneAvailability::Ready
+}
+
+fn edge_fallback_active(guard: &UpstreamGuard, now: Instant, endpoint: usize) -> bool {
+	if guard.rate_limit_blocked_until.is_some_and(|deadline| deadline > now) || guard.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now) {
+		return false;
+	}
+	match guard.edges[endpoint].state {
+		EdgeCircuitState::Open { until } => until > now,
+		EdgeCircuitState::HalfOpen { expires_at, .. } => expires_at > now,
+		EdgeCircuitState::Closed => false,
+	}
+}
+
+fn direct_edge_fallback_active(now: Instant, path: &str) -> bool {
+	edge_fallback_active(&upstream_guard(RedditLane::Direct), now, endpoint_class_index(path))
+}
+
+fn select_api_lane(primary: RedditLane, direct: LaneAvailability, tor: LaneAvailability) -> RedditLane {
+	let (preferred, standby) = match primary {
+		RedditLane::Direct => (direct, tor),
+		RedditLane::Tor => (tor, direct),
+	};
+	// Explicit upstream quota cooldowns stay on their original lane. Direct's
+	// local reserve keeps the existing bounded spillover policy.
+	if preferred == LaneAvailability::Ready
+		|| preferred == LaneAvailability::UpstreamQuotaCooldown
+		|| primary == RedditLane::Direct && matches!(preferred, LaneAvailability::LocalQuotaPause | LaneAvailability::TransportCooldown)
+	{
+		return primary;
+	}
+	if standby == LaneAvailability::Ready {
+		match primary {
+			RedditLane::Direct => RedditLane::Tor,
+			RedditLane::Tor => RedditLane::Direct,
+		}
+	} else {
+		primary
+	}
+}
+
+fn preferred_api_lane(now: Instant, path: &str) -> RedditLane {
+	select_api_lane(
+		configured_primary_lane(),
+		lane_availability(RedditLane::Direct, now, path),
+		lane_availability(RedditLane::Tor, now, path),
+	)
 }
 
 fn direct_quota_spillover_valid(ticket: QuotaSpilloverTicket, now: Instant) -> bool {
@@ -1601,7 +1777,7 @@ fn local_admission_message(denial: AdmissionDenied, short_refresh_retry: bool) -
 	format!("{}. Retry in {} seconds", denial.reason.message(), retry_after_seconds(denial.delay))
 }
 
-fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
+fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endpoint: usize) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
 	let mut guard = upstream_guard(lane);
 	let oauth_client = oauth_client(lane).ok_or_else(|| BeginAttemptDenied {
 		admission: None,
@@ -1611,8 +1787,17 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> R
 		tor_quota_refresh: None,
 	})?;
 	let generation = oauth_client.generation;
+	if guard.rejected_oauth_generation == Some(generation) {
+		return Err(BeginAttemptDenied {
+			admission: None,
+			message: "Refreshing the anonymous Reddit session. Retry in 2 seconds".to_string(),
+			edge_deferred: false,
+			quota_spillover: None,
+			tor_quota_refresh: None,
+		});
+	}
 	let now = Instant::now();
-	let result = guard.try_admit(now, generation);
+	let result = guard.try_admit_endpoint(now, generation, endpoint);
 	let denied_quota_epoch = result.as_ref().err().filter(|denial| denial.reserve_exhausted).map(|_| guard.quota.epoch);
 	// Capture ownership with the denied generation still locked. A refresh can
 	// install its replacement between dropping this guard and formatting denial.
@@ -1656,6 +1841,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool) -> R
 
 async fn begin_upstream_attempt(
 	lane: RedditLane,
+	endpoint: usize,
 	mode: AdmissionRetryMode,
 	tor_refresh: &mut TorQuotaRefreshRetryState,
 ) -> Result<(Arc<Oauth>, UpstreamAttempt, SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
@@ -1666,7 +1852,7 @@ async fn begin_upstream_attempt(
 	loop {
 		let quota_changed = quota_notify(lane).notified();
 		let (permit, probe) = acquire_attempt_capacity(lane, mode, capacity_deadline).await?;
-		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded && tor_refresh.owner.is_none()) {
+		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded && tor_refresh.owner.is_none(), endpoint) {
 			Ok(attempt) => {
 				if retry_count > 0 {
 					info!(
@@ -2117,7 +2303,12 @@ pub fn start_oauth() {
 pub fn start_tor_fallback() {
 	let config = match TOR_FALLBACK_CONFIG.as_ref() {
 		Ok(Some(config)) => config,
-		Ok(None) => return,
+		Ok(None) => {
+			if *PRIMARY_REDDIT_LANE == RedditLane::Tor {
+				warn!("Tor-first routing requires REDLIB_TOR_FALLBACK=on; using direct-first routing");
+			}
+			return;
+		}
 		Err(error) => {
 			warn!("Tor fallback is disabled because its configuration is invalid: {error}");
 			return;
@@ -2126,7 +2317,7 @@ pub fn start_tor_fallback() {
 	if TOR_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
-	info!("Warming Tor fallback through {}", config.proxy_url);
+	info!("Warming Tor fallback through {}: primary_lane={}", config.proxy_url, configured_primary_lane().label());
 	tokio::spawn(async {
 		let oauth = Oauth::new(RedditLane::Tor).await;
 		if install_oauth_client(oauth, true, None) {
@@ -2203,15 +2394,52 @@ fn build_emulated_client_with_profile(
 /// 429, or if we were unable to decode the value in the `Location` header.
 #[cached(size = 1024, time = 600, result = true)]
 pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, String> {
-	let lane = preferred_api_lane(Instant::now());
+	with_tor_first_page_budget(&path, canonical_path_routed(path.clone(), tries)).await
+}
+
+async fn canonical_path_routed(path: String, tries: i8) -> Result<Option<String>, String> {
+	let lane = preferred_api_lane(Instant::now(), &path);
+	if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Direct {
+		return canonical_direct_then_tor(path, tries).await;
+	}
 	match canonical_path_on_lane(path.clone(), tries, lane).await {
-		Err(CanonicalPathError::RetryOnTor(_)) if should_retry_canonical_on_tor(lane, tor_fallback_ready()) => {
+		Err(CanonicalPathError::RetryOnTor(_))
+			if configured_primary_lane() == RedditLane::Tor
+				&& lane == RedditLane::Tor
+				&& lane_availability(RedditLane::Direct, Instant::now(), &path) == LaneAvailability::Ready =>
+		{
+			canonical_direct_then_tor(path, tries).await
+		}
+		Err(CanonicalPathError::RetryOnTor(_)) if should_retry_canonical_on_tor(lane, tor_fallback_ready(&path)) => {
 			info!("Retrying Reddit share-link resolution on the Tor lane");
 			canonical_path_on_lane(path, tries, RedditLane::Tor).await.map_err(CanonicalPathError::into_message)
 		}
 		Ok(path) => Ok(path),
 		Err(error) => Err(error.into_message()),
 	}
+}
+
+async fn canonical_direct_then_tor(path: String, tries: i8) -> Result<Option<String>, String> {
+	let direct = async {
+		let _standby = DIRECT_STANDBY_CAPACITY
+			.try_acquire()
+			.map_err(|_| "Reddit direct standby is busy. Retry in 2 seconds".to_string())?;
+		match tokio::time::timeout(DIRECT_STANDBY_TIMEOUT, canonical_path_on_lane(path.clone(), tries, RedditLane::Direct)).await {
+			Ok(result) => result.map_err(CanonicalPathError::into_message),
+			Err(_) => Err("Reddit direct standby timed out. Retry in 2 seconds".to_string()),
+		}
+	};
+	recover_after_direct_standby(direct, || async {
+		let recovery = async {
+			wait_for_tor_recovery(&path).await;
+			canonical_path_on_lane(path.clone(), tries, RedditLane::Tor).await.map_err(CanonicalPathError::into_message)
+		};
+		match tokio::time::timeout(TOR_STANDBY_RECOVERY_TIMEOUT, recovery).await {
+			Ok(result) => result,
+			Err(_) => Err(tor_recovery_wait_message(&path)),
+		}
+	})
+	.await
 }
 
 #[async_recursion::async_recursion]
@@ -2251,6 +2479,13 @@ async fn canonical_path_on_lane(path: String, tries: i8, lane: RedditLane) -> Re
 	let res = res.ok_or_else(|| CanonicalPathError::Terminal("Unable to make HEAD request to Reddit.".to_string()))?;
 	let status = res.status().as_u16();
 	let policy_error = res.headers().get(wreq_header::RETRY_AFTER).is_some();
+	let quota_error = || {
+		let delay = rate_limit_delay(
+			res.headers().get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok()),
+			res.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok()),
+		);
+		CanonicalPathError::Terminal(format!("Reddit rate limit exceeded. Retry in {} seconds", retry_after_seconds(delay)))
+	};
 
 	match status {
 		// If Reddit responds with a 2xx, then the path is already canonical.
@@ -2287,10 +2522,10 @@ async fn canonical_path_on_lane(path: String, tries: i8, lane: RedditLane) -> Re
 		300..=399 => Ok(None),
 
 		// Rate limiting
-		429 => Err(CanonicalPathError::Terminal("Too many requests.".to_string())),
+		429 => Err(quota_error()),
 
 		// Special condition rate limiting - https://github.com/redlib-org/redlib/issues/229
-		403 if policy_error => Err(CanonicalPathError::Terminal("Too many requests.".to_string())),
+		403 if policy_error => Err(quota_error()),
 
 		_ => Ok(
 			res
@@ -2750,11 +2985,23 @@ fn is_metadata_path(path: &str) -> bool {
 }
 
 async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> {
-	let lane = preferred_api_lane(Instant::now());
+	with_tor_first_page_budget(&path, json_uncached_routed(path.clone(), quarantine)).await
+}
+
+async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, String> {
+	let lane = preferred_api_lane(Instant::now(), &path);
+	if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Direct {
+		return direct_then_tor_request(path, quarantine).await;
+	}
 	let (result, retry_reason) = json_uncached_on_lane(path.clone(), quarantine, lane).await;
+	if should_use_direct_standby(configured_primary_lane(), lane, retry_reason, lane_availability(RedditLane::Direct, Instant::now(), &path)) {
+		info!("Trying bounded direct standby: endpoint={} reason={retry_reason:?}", endpoint_class(&path));
+		return direct_then_tor_request(path, quarantine).await;
+	}
+
 	let now = Instant::now();
-	let tor_ready = tor_fallback_ready();
-	let direct_edge_active = direct_edge_fallback_active(now);
+	let tor_ready = tor_fallback_ready(&path);
+	let direct_edge_active = direct_edge_fallback_active(now, &path);
 	let direct_refreshing = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
 	let quota_spillover_valid = match retry_reason {
 		TorRetryReason::QuotaReserve(ticket) if !direct_refreshing => direct_quota_spillover_valid(ticket, now),
@@ -2799,8 +3046,93 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 				}
 			}
 		}
-		TorRetryReason::None => result,
+		TorRetryReason::None | TorRetryReason::TransportUnavailable | TorRetryReason::SessionUnavailable => result,
 	}
+}
+
+async fn with_tor_first_page_budget<T>(path: &str, request: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+	if configured_primary_lane() != RedditLane::Tor {
+		return request.await;
+	}
+	// Return an application loading page before a proxy can replace a long
+	// recovery with its own error response. Cancellation releases admission.
+	match tokio::time::timeout(TOR_FIRST_PAGE_BUDGET, request).await {
+		Ok(result) => result,
+		Err(_) => Err(tor_recovery_wait_message(path)),
+	}
+}
+
+async fn recover_after_direct_standby<T, D, R>(direct: D, recover: impl FnOnce() -> R) -> Result<T, String>
+where
+	D: std::future::Future<Output = Result<T, String>>,
+	R: std::future::Future<Output = Result<T, String>>,
+{
+	match direct.await {
+		Ok(value) => Ok(value),
+		Err(_) => recover().await,
+	}
+}
+
+async fn wait_for_tor_recovery(path: &str) {
+	loop {
+		// No transport permits are held while waiting for cooldown or OAuth.
+		let changed = quota_notify(RedditLane::Tor).notified();
+		let delay = {
+			let guard = upstream_guard(RedditLane::Tor);
+			guard
+				.active_endpoint_cooldown(Instant::now(), endpoint_class_index(path))
+				.map(|(delay, _)| delay)
+				.or_else(|| guard.rejected_oauth_generation.map(|_| LOCAL_QUOTA_RETRY_INTERVAL))
+		};
+		let Some(delay) = delay else { return };
+		tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed => {} }
+	}
+}
+
+fn tor_recovery_wait_message(path: &str) -> String {
+	let delay = upstream_guard(RedditLane::Tor)
+		.active_endpoint_cooldown(Instant::now(), endpoint_class_index(path))
+		.map_or(Duration::from_secs(5), |(delay, _)| delay);
+	format!(
+		"Reddit API request timed out while recovering the Tor lane. Retry in {} seconds",
+		retry_after_seconds(delay)
+	)
+}
+
+async fn direct_then_tor_request(path: String, quarantine: bool) -> Result<Value, String> {
+	recover_after_direct_standby(direct_standby_request(path.clone(), quarantine), || async move {
+		info!("Returning to Tor after direct standby did not recover the page: endpoint={}", endpoint_class(&path));
+		let recovery = async {
+			wait_for_tor_recovery(&path).await;
+			json_uncached_on_lane(path.clone(), quarantine, RedditLane::Tor).await.0
+		};
+		match tokio::time::timeout(TOR_STANDBY_RECOVERY_TIMEOUT, recovery).await {
+			Ok(result) => result,
+			Err(_) => Err(tor_recovery_wait_message(&path)),
+		}
+	})
+	.await
+}
+
+async fn direct_standby_request(path: String, quarantine: bool) -> Result<Value, String> {
+	let _standby = DIRECT_STANDBY_CAPACITY
+		.try_acquire()
+		.map_err(|_| "Reddit direct standby is busy. Retry in 2 seconds".to_string())?;
+	DIRECT_STANDBY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+	match tokio::time::timeout(DIRECT_STANDBY_TIMEOUT, json_uncached_on_lane(path, quarantine, RedditLane::Direct)).await {
+		Ok((result, _)) => result,
+		Err(_) => Err("Reddit direct standby timed out. Retry in 2 seconds".to_string()),
+	}
+}
+
+fn should_use_direct_standby(primary: RedditLane, lane: RedditLane, reason: TorRetryReason, direct: LaneAvailability) -> bool {
+	primary == RedditLane::Tor
+		&& lane == RedditLane::Tor
+		&& direct == LaneAvailability::Ready
+		&& matches!(
+			reason,
+			TorRetryReason::EdgeRejected | TorRetryReason::TransportUnavailable | TorRetryReason::SessionUnavailable
+		)
 }
 
 fn should_retry_on_tor(lane: RedditLane, reason: TorRetryReason, tor_ready: bool, direct_edge_active: bool, direct_refreshing: bool, quota_spillover_valid: bool) -> bool {
@@ -2810,7 +3142,7 @@ fn should_retry_on_tor(lane: RedditLane, reason: TorRetryReason, tor_ready: bool
 	match reason {
 		TorRetryReason::EdgeRejected => direct_edge_active,
 		TorRetryReason::QuotaReserve(_) => !direct_refreshing && quota_spillover_valid,
-		TorRetryReason::None => false,
+		TorRetryReason::None | TorRetryReason::TransportUnavailable | TorRetryReason::SessionUnavailable => false,
 	}
 }
 
@@ -2886,6 +3218,13 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 			Ok(result) => result,
 			Err(_) => return (Err("Reddit API request timed out after bounded server-side recovery".to_string()), TorRetryReason::None),
 		};
+		if lane == RedditLane::Tor
+			&& configured_primary_lane() == RedditLane::Tor
+			&& (matches!(recovery_reason, LaneRecoveryReason::TransportFailure) || tor_retry_reason == TorRetryReason::TransportUnavailable)
+			&& lane_availability(RedditLane::Direct, Instant::now(), &path) == LaneAvailability::Ready
+		{
+			return (result, TorRetryReason::TransportUnavailable);
+		}
 		let delay = match recovery_reason {
 			LaneRecoveryReason::TorQuotaRefreshWait(ticket) => {
 				if !tor_refresh.claim_redirect_replay(lane, ticket, Instant::now()) {
@@ -2949,6 +3288,33 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 	}
 }
 
+fn start_rejected_session_refresh(lane: RedditLane, generation: u64) {
+	let mut guard = upstream_guard(lane);
+	if !guard.reject_oauth_generation(generation) {
+		return;
+	}
+	drop(guard);
+	tokio::spawn(async move {
+		// One worker per rejected generation. OAuth's existing backoff and
+		// single-refresh guard also apply while the direct lane serves traffic.
+		loop {
+			if !oauth_client(lane).is_some_and(|client| client.generation == generation) {
+				return;
+			}
+			let delay = upstream_guard(lane).rejected_session_refresh_delay(Instant::now());
+			if !delay.is_zero() {
+				tokio::time::sleep(delay).await;
+				continue;
+			}
+			let outcome = force_refresh_token(lane, RefreshReason::Unauthorized).await;
+			if matches!(outcome, crate::oauth::RefreshOutcome::Refreshed | crate::oauth::RefreshOutcome::Superseded) {
+				return;
+			}
+			tokio::time::sleep(outcome.retry_after().unwrap_or(Duration::from_secs(2))).await;
+		}
+	});
+}
+
 async fn json_uncached_on_lane_with_options(
 	path: String,
 	quarantine: bool,
@@ -2980,11 +3346,15 @@ async fn json_uncached_on_lane_with_options(
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
-	let (oauth_client, mut upstream_attempt, _permit, _probe) = match begin_upstream_attempt(lane, admission_mode, tor_refresh).await {
+	let (oauth_client, mut upstream_attempt, _permit, _probe) = match begin_upstream_attempt(lane, endpoint_class_index(&path), admission_mode, tor_refresh).await {
 		Ok(attempt) => attempt,
 		Err(denied) => {
-			let retry_reason = if denied.edge_deferred {
+			let retry_reason = if upstream_guard(lane).rejected_oauth_generation.is_some() {
+				TorRetryReason::SessionUnavailable
+			} else if denied.edge_deferred {
 				TorRetryReason::EdgeRejected
+			} else if denied.admission.is_some_and(|admission| admission.reason == CooldownReason::UpstreamFailures) {
+				TorRetryReason::TransportUnavailable
 			} else {
 				denied.quota_spillover.map_or(TorRetryReason::None, TorRetryReason::QuotaReserve)
 			};
@@ -3018,24 +3388,40 @@ async fn json_uncached_on_lane_with_options(
 				let status = response.status();
 				let status_code = status.as_u16();
 
-				let remaining = response.headers().get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
-				let reset = response.headers().get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
-				let used = response.headers().get("x-ratelimit-used").and_then(|value| value.to_str().ok());
-				let retry_after = response.headers().get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
+				let response_headers = response.headers().clone();
+				let remaining = response_headers.get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
+				let reset = response_headers.get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
+				let used = response_headers.get("x-ratelimit-used").and_then(|value| value.to_str().ok());
+				let retry_after = response_headers.get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
 				let parsed_remaining = parse_rate_limit_count(remaining);
 				let parsed_used = parse_rate_limit_count(used);
 				let reset_duration = parse_delay_seconds(reset);
 				let retry_after_duration = parse_retry_after(retry_after, SystemTime::now());
 				let quota_headers_present = remaining.is_some() || reset.is_some() || used.is_some();
 
-				let throttle_kind = classify_throttle_response(status_code, retry_after.is_some(), quota_headers_present);
+				let challenge = response_headers.get(wreq_header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok());
+				let auth_rejected = credential_rejected(status_code, challenge);
+				let content_kind = response_headers.get(wreq_header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map_or("missing", |value| {
+					if value.starts_with("application/json") { "json" } else if value.starts_with("text/html") { "html" } else { "other" }
+				});
+				let mut response = response.into_hyper_response();
+				let rejection = if status_code == 403 { Some(read_rejection_details(response.body_mut()).await) } else { None };
+				let resource_reason = rejection.as_ref().and_then(|details| details.resource_reason);
+				let throttle_kind = if resource_reason.is_some() || auth_rejected { None } else {
+					classify_throttle_response(status_code, retry_after.is_some(), quota_headers_present)
+				};
+				if status_code == 403 {
+					warn!("Reddit rejection: lane={} endpoint={} request_id={} generation={} content_kind={content_kind} body_kind={} resource_reason={} credential_rejected={auth_rejected}",
+						lane.label(), endpoint_class(&path), upstream_attempt.request_id, request_generation,
+						rejection.as_ref().map_or("missing", |details| details.body_kind), resource_reason.unwrap_or("none"));
+				}
 				reconcile_rate_limit(
 					&mut upstream_attempt,
 					parsed_remaining,
 					reset_duration,
 					matches!(throttle_kind, Some(ThrottleKind::Quota)) || parsed_remaining == Some(0),
 				);
-				if throttle_kind.is_none() {
+				if throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
 					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path);
 				}
 				trace!(
@@ -3052,6 +3438,8 @@ async fn json_uncached_on_lane_with_options(
 						RedditLane::Tor => TOR_OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst),
 					},
 				);
+
+				if let Some(reason) = resource_reason { return Err(reason.to_string()); }
 
 				match throttle_kind {
 					Some(ThrottleKind::Quota) => {
@@ -3075,8 +3463,8 @@ async fn json_uncached_on_lane_with_options(
 						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
 						match decision {
 							decision if decision.started_cooldown => warn!(
-								"Reddit edge throttle: status={} endpoint={} retry_after_present={} retry_after_valid={} retry_after_seconds={} quota_headers_present={} consecutive_failures={} episode_seconds={} cooldown_seconds={} half_open_probe={} request_generation={} current_generation={} current_identity_age_seconds={}",
-								status,
+								"Reddit edge throttle: lane={} status={} endpoint={} retry_after_present={} retry_after_valid={} retry_after_seconds={} quota_headers_present={} consecutive_failures={} episode_seconds={} cooldown_seconds={} half_open_probe={} request_generation={} current_generation={} current_identity_age_seconds={}",
+								lane.label(), status,
 								endpoint_class(&path),
 								retry_after.is_some(),
 								retry_after_duration.is_some(),
@@ -3102,9 +3490,14 @@ async fn json_uncached_on_lane_with_options(
 					None => {}
 				}
 
-				if status_code == 401 {
+				if auth_rejected {
 					if !is_current_oauth_generation(lane, request_generation) {
 						return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
+					}
+					if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Tor {
+						start_rejected_session_refresh(lane, request_generation);
+						retry_reason = TorRetryReason::SessionUnavailable;
+						return Err("Refreshing the anonymous Reddit session. Retry in 2 seconds".to_string());
 					}
 					error!("Reddit rejected the OAuth token; forcing a refresh");
 					let outcome = force_refresh_token(lane, RefreshReason::Unauthorized).await;
@@ -3114,13 +3507,17 @@ async fn json_uncached_on_lane_with_options(
 					return Err("OAuth token has expired. Please refresh the page!".to_string());
 				}
 
+				if status_code == 403 {
+					return Err("Reddit error 403: Forbidden".to_string());
+				}
+
 				if status.is_server_error() {
 					record_upstream_failure(lane, "http_status", Some(status_code), &path, request_generation);
 					return Err("Reddit is having issues, check if there's an outage".to_string());
 				}
 
 				// asynchronously aggregate the chunks of the body
-				match hyper::body::aggregate(response.into_hyper_response()).await {
+				match hyper::body::aggregate(response).await {
 					Ok(body) => {
 						let has_remaining = body.has_remaining();
 
@@ -3408,6 +3805,169 @@ mod tests {
 		assert_eq!(parsed.port(), Some(9050));
 		assert_eq!(parsed.username(), "identity-17");
 		assert_eq!(parsed.password(), Some("identity-17"));
+	}
+
+	#[tokio::test]
+	async fn test_tor_first_failed_direct_standby_always_returns_to_tor() {
+		let calls = std::sync::Mutex::new(Vec::new());
+		let direct = async {
+			calls.lock().unwrap().push("direct");
+			Err("direct failed".to_string())
+		};
+		let result = recover_after_direct_standby(direct, || async {
+			calls.lock().unwrap().push("tor");
+			Ok::<_, String>("recovered")
+		})
+		.await;
+		assert_eq!(result, Ok("recovered"));
+		assert_eq!(*calls.lock().unwrap(), vec!["direct", "tor"]);
+		let result = recover_after_direct_standby(async { Ok::<_, String>("direct success") }, || async { panic!("successful standby must not retry Tor") }).await;
+		assert_eq!(result, Ok("direct success"));
+	}
+
+	#[tokio::test]
+	async fn test_tor_first_final_failure_uses_the_latest_tor_result() {
+		let result = recover_after_direct_standby(async { Err::<(), _>("direct unavailable".to_string()) }, || async {
+			Err("Reddit is temporarily rejecting this instance. Retry in 42 seconds".to_string())
+		})
+		.await;
+		assert_eq!(result, Err("Reddit is temporarily rejecting this instance. Retry in 42 seconds".to_string()));
+	}
+
+	#[test]
+	fn test_tor_first_routing_respects_availability_and_upstream_quota() {
+		use LaneAvailability::*;
+		for (direct, tor, expected) in [
+			(Ready, Ready, RedditLane::Tor),
+			(Ready, Unavailable, RedditLane::Direct),
+			(Ready, TransportCooldown, RedditLane::Direct),
+			(Ready, LocalQuotaPause, RedditLane::Direct),
+			(Ready, UpstreamQuotaCooldown, RedditLane::Tor),
+			(Unavailable, Unavailable, RedditLane::Tor),
+			(UpstreamQuotaCooldown, Unavailable, RedditLane::Tor),
+			(LocalQuotaPause, Unavailable, RedditLane::Tor),
+			(Unavailable, Ready, RedditLane::Tor),
+		] {
+			assert_eq!(select_api_lane(RedditLane::Tor, direct, tor), expected);
+		}
+		assert_eq!(select_api_lane(RedditLane::Direct, LocalQuotaPause, Ready), RedditLane::Direct);
+		assert_eq!(select_api_lane(RedditLane::Direct, UpstreamQuotaCooldown, Ready), RedditLane::Direct);
+		assert_eq!(select_api_lane(RedditLane::Direct, TransportCooldown, Ready), RedditLane::Direct);
+	}
+
+	#[test]
+	fn test_credential_rejection_refresh_spacing_survives_token_handoff() {
+		let mut guard = UpstreamGuard::default();
+		let now = Instant::now();
+		assert_eq!(guard.rejected_session_refresh_delay(now), Duration::ZERO);
+		guard.install_oauth_generation(1, false);
+		assert_eq!(guard.rejected_session_refresh_delay(now), REJECTED_SESSION_REFRESH_INTERVAL);
+		assert_eq!(guard.rejected_session_refresh_delay(now + REJECTED_SESSION_REFRESH_INTERVAL), Duration::ZERO);
+	}
+
+	#[test]
+	fn test_tor_first_standby_is_narrow_and_never_recursive() {
+		for reason in [TorRetryReason::EdgeRejected, TorRetryReason::TransportUnavailable, TorRetryReason::SessionUnavailable] {
+			assert!(should_use_direct_standby(RedditLane::Tor, RedditLane::Tor, reason, LaneAvailability::Ready));
+			assert!(!should_use_direct_standby(RedditLane::Direct, RedditLane::Tor, reason, LaneAvailability::Ready));
+			assert!(!should_use_direct_standby(RedditLane::Tor, RedditLane::Direct, reason, LaneAvailability::Ready));
+			assert!(!should_use_direct_standby(
+				RedditLane::Tor,
+				RedditLane::Tor,
+				reason,
+				LaneAvailability::UpstreamQuotaCooldown
+			));
+		}
+		assert!(!should_use_direct_standby(RedditLane::Tor, RedditLane::Tor, TorRetryReason::None, LaneAvailability::Ready));
+	}
+
+	#[test]
+	fn test_endpoint_edge_recovery_requires_the_failed_class() {
+		let now = Instant::now();
+		let comments = endpoint_class_index("/r/example/comments/abc.json");
+		let listing = endpoint_class_index("/r/example/hot.json");
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		let rejected = guard.begin_endpoint_attempt(now, comments).unwrap();
+		let denial = guard.record_edge_throttle(now, rejected, Some(Duration::ZERO));
+		assert_eq!(guard.routing_availability(now, 0, comments), LaneAvailability::Unavailable);
+		assert_eq!(guard.routing_availability(now, 0, listing), LaneAvailability::Ready);
+		let probe_at = now + denial.delay + Duration::from_millis(1);
+		let listing_attempt = guard.begin_endpoint_attempt(probe_at, listing).unwrap();
+		assert!(!listing_attempt.half_open);
+		assert!(guard.record_api_success(probe_at, listing_attempt).is_none());
+		assert_eq!(guard.edges[comments].failures, 1);
+		let comment_probe = guard.begin_endpoint_attempt(probe_at, comments).unwrap();
+		assert!(comment_probe.half_open);
+		assert!(guard.begin_endpoint_attempt(probe_at, comments).is_err());
+		assert!(guard.record_api_success(probe_at, comment_probe).is_some());
+		assert_eq!(guard.edges[comments].failures, 0);
+	}
+
+	#[test]
+	fn test_endpoint_edge_episodes_and_shared_quota_remain_independent() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		let comments = guard.begin_endpoint_attempt(now, 4).unwrap();
+		let listing = guard.begin_endpoint_attempt(now, 0).unwrap();
+		let comment_denial = guard.record_edge_throttle(now, comments, None);
+		let listing_denial = guard.record_edge_throttle(now, listing, None);
+		assert_eq!(guard.edges[4].failures, 1);
+		assert_eq!(guard.edges[0].failures, 1);
+		let probe_at = now + comment_denial.delay.max(listing_denial.delay) + Duration::from_millis(1);
+		let listing_probe = guard.begin_endpoint_attempt(probe_at, 0).unwrap();
+		assert!(guard.record_api_success(probe_at, listing_probe).is_some());
+		assert_eq!(guard.edges[4].failures, 1);
+		assert!(matches!(guard.edges[4].state, EdgeCircuitState::Open { .. }));
+		guard.block_for_rate_limit(now, Duration::from_secs(60));
+		for endpoint in 0..7 {
+			assert_eq!(guard.routing_availability(now, 0, endpoint), LaneAvailability::UpstreamQuotaCooldown);
+			assert_eq!(guard.begin_endpoint_attempt(now, endpoint).unwrap_err().1, CooldownReason::RateLimit);
+		}
+	}
+
+	#[test]
+	fn test_credential_rejection_is_explicit_and_generation_scoped() {
+		assert!(credential_rejected(401, None));
+		assert!(credential_rejected(403, Some("Bearer error=\"invalid_token\"")));
+		assert!(!credential_rejected(403, None));
+		assert!(!credential_rejected(403, Some("Bearer error=\"insufficient_scope\"")));
+		assert!(!credential_rejected(429, Some("Bearer error=\"invalid_token\"")));
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::default();
+		guard.install_oauth_generation(7, true);
+		assert!(!guard.reject_oauth_generation(6));
+		assert!(guard.reject_oauth_generation(7));
+		assert!(!guard.reject_oauth_generation(7));
+		assert_eq!(guard.routing_availability(now, 7, 4), LaneAvailability::Unavailable);
+		guard.install_oauth_generation(8, false);
+		assert_eq!(guard.routing_availability(now, 8, 4), LaneAvailability::Ready);
+		assert_eq!(guard.routing_availability(now, 7, 4), LaneAvailability::Unavailable);
+		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
+		assert_eq!(guard.routing_availability(now, 8, 4), LaneAvailability::TransportCooldown);
+	}
+
+	#[test]
+	fn test_rejection_details_preserve_resource_errors_without_logging_payloads() {
+		for reason in ["private", "banned", "quarantined", "gated"] {
+			let body = serde_json::json!({"error":403, "reason":reason, "message":"Forbidden"}).to_string();
+			assert_eq!(rejection_details(body.as_bytes()).resource_reason, Some(reason));
+		}
+		for body in [
+			br#"{"error":403,"reason":null,"message":"Forbidden"}"#.as_slice(),
+			br#"{"error":403,"reason":"arbitrary private payload"}"#.as_slice(),
+			b"<html>blocked</html>",
+		] {
+			assert_eq!(rejection_details(body).resource_reason, None);
+			assert!(!format!("{:?}", rejection_details(body)).contains("payload"));
+		}
+	}
+
+	#[tokio::test]
+	async fn test_rejection_body_read_is_bounded() {
+		let mut body = Body::from(vec![b'x'; MAX_REJECTION_BODY_BYTES + 1]);
+		assert_eq!(read_rejection_details(&mut body).await.body_kind, "oversized");
+		let mut body = Body::from(r#"{"error":403,"reason":"private"}"#);
+		assert_eq!(read_rejection_details(&mut body).await.resource_reason, Some("private"));
 	}
 
 	#[test]
@@ -4008,13 +4568,23 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
 		guard.quota.generation = 2;
-		guard.edge_state = EdgeCircuitState::HalfOpen {
+		guard.edges[0].state = EdgeCircuitState::HalfOpen {
 			epoch: 1,
 			expires_at: now + Duration::from_secs(90),
 		};
 		guard.upstream_failure_blocked_until = Some(now - Duration::from_secs(1));
-		assert!(guard.record_generation_success(now, 1, EdgeAttempt { epoch: 1, half_open: true }).is_none());
-		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
+		assert!(guard
+			.record_generation_success(
+				now,
+				1,
+				EdgeAttempt {
+					endpoint: 0,
+					epoch: 1,
+					half_open: true
+				}
+			)
+			.is_none());
+		assert!(matches!(guard.edges[0].state, EdgeCircuitState::Open { .. }));
 		assert!(guard.upstream_failure_blocked_until.is_some());
 	}
 
@@ -4157,7 +4727,7 @@ mod tests {
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
 		guard.upstream_failure_blocked_until = None;
-		guard.edge_state = EdgeCircuitState::Open {
+		guard.edges[0].state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(60),
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
@@ -4225,11 +4795,11 @@ mod tests {
 			available: LOW_RATE_LIMIT_THRESHOLD - 1,
 			reset_at: now + QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1),
 		};
-		guard.edge_state = EdgeCircuitState::Open {
+		guard.edges[0].state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(10),
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
-		guard.edge_state = EdgeCircuitState::Closed;
+		guard.edges[0].state = EdgeCircuitState::Closed;
 		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 	}
@@ -4396,7 +4966,7 @@ mod tests {
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
 		assert!(!guard.completed_quota_rotation_still_valid(now, next_ticket));
 		guard.upstream_failure_blocked_until = None;
-		guard.edge_state = EdgeCircuitState::Open {
+		guard.edges[0].state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(10),
 		};
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
@@ -4458,7 +5028,11 @@ mod tests {
 		};
 		let attempt = |request_id| UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 3,
 			quota_epoch: 4,
 			request_id,
@@ -4491,7 +5065,11 @@ mod tests {
 		};
 		let attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 3,
 			quota_epoch: 4,
 			request_id: 1,
@@ -4525,7 +5103,11 @@ mod tests {
 		assert!(discovery_probe);
 		let discovery_attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 3,
 			quota_epoch,
 			request_id,
@@ -4542,7 +5124,11 @@ mod tests {
 
 		let late_old_attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 3,
 			quota_epoch: 4,
 			request_id: 2,
@@ -4581,7 +5167,11 @@ mod tests {
 		};
 		let attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch: 3,
 			request_id: 1,
@@ -4614,7 +5204,11 @@ mod tests {
 		};
 		let attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch: 3,
 			request_id: 1,
@@ -4666,7 +5260,11 @@ mod tests {
 		};
 		let stale_attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 4,
 			quota_epoch: 2,
 			request_id: 8,
@@ -4678,7 +5276,11 @@ mod tests {
 		};
 		let mut stale_unsent_attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 4,
 			quota_epoch: 2,
 			request_id: 9,
@@ -4730,7 +5332,11 @@ mod tests {
 
 		let stale_attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 4,
 			quota_epoch: 3,
 			request_id: 1,
@@ -4761,7 +5367,11 @@ mod tests {
 		assert!(discovery_probe);
 		let attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id,
@@ -4798,7 +5408,11 @@ mod tests {
 
 		let probe = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id: probe_request_id,
@@ -4844,7 +5458,11 @@ mod tests {
 
 		let follower = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id: follower_request_id,
@@ -4889,7 +5507,11 @@ mod tests {
 
 		let follower = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id: follower_request_id,
@@ -4933,7 +5555,11 @@ mod tests {
 			let watermark = quota.headerless_consumption;
 			let attempt = UpstreamAttempt {
 				lane: RedditLane::Direct,
-				edge: EdgeAttempt { epoch: 0, half_open: false },
+				edge: EdgeAttempt {
+					endpoint: 0,
+					epoch: 0,
+					half_open: false,
+				},
 				generation: 2,
 				quota_epoch,
 				request_id,
@@ -4954,7 +5580,11 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let snapshot = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id,
@@ -4984,7 +5614,11 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let mut probe = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id,
@@ -5017,7 +5651,11 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let abandoned = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id,
@@ -5064,7 +5702,11 @@ mod tests {
 
 		let follower = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 2,
 			quota_epoch,
 			request_id: follower_request_id,
@@ -5126,7 +5768,11 @@ mod tests {
 		quota.install_generation(2, false);
 		let stale_attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 1,
 			quota_epoch,
 			request_id,
@@ -5157,7 +5803,11 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 3).unwrap();
 		let mut attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 3,
 			quota_epoch,
 			request_id,
@@ -5199,7 +5849,11 @@ mod tests {
 		};
 		let attempt = UpstreamAttempt {
 			lane: RedditLane::Direct,
-			edge: EdgeAttempt { epoch: 0, half_open: false },
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
 			generation: 8,
 			quota_epoch: 12,
 			request_id: 3,
@@ -5294,8 +5948,8 @@ mod tests {
 		assert!(recovery_probe.half_open);
 		assert_eq!(guard.redirect_cooldown(probe_at, redirecting).map(|(_, reason)| reason), Some(CooldownReason::EdgeThrottle));
 
-		guard.edge_state = EdgeCircuitState::Closed;
-		guard.edge_epoch = redirecting.epoch;
+		guard.edges[0].state = EdgeCircuitState::Closed;
+		guard.edges[0].epoch = redirecting.epoch;
 		guard.block_for_rate_limit(now, Duration::from_secs(20));
 		assert_eq!(guard.redirect_cooldown(now, redirecting).map(|(_, reason)| reason), Some(CooldownReason::RateLimit));
 	}
@@ -5330,7 +5984,7 @@ mod tests {
 		assert!(recovery.episode_seconds >= 15);
 		let stale = guard.record_edge_throttle(recovery_at, original, None);
 		assert!(!stale.started_cooldown);
-		assert!(guard.edge_episode_started_at.is_none());
+		assert!(guard.edges[0].episode_started_at.is_none());
 		let recovered_attempt = guard.begin_attempt(recovery_at).unwrap();
 		let recovered = guard.record_edge_throttle(recovery_at, recovered_attempt, Some(Duration::from_secs(2)));
 		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&recovered.delay));
@@ -5348,12 +6002,12 @@ mod tests {
 
 		let direct_attempt = direct.begin_attempt(now).unwrap();
 		direct.record_edge_throttle(now, direct_attempt, Some(Duration::ZERO));
-		assert!(edge_fallback_active(&direct, now));
-		assert!(!edge_fallback_active(&tor, now));
+		assert!(edge_fallback_active(&direct, now, 0));
+		assert!(!edge_fallback_active(&tor, now, 0));
 		assert!(tor.begin_attempt(now).is_ok());
 
 		direct.block_for_rate_limit(now, Duration::from_secs(30));
-		assert!(!edge_fallback_active(&direct, now));
+		assert!(!edge_fallback_active(&direct, now, 0));
 		assert_eq!(direct.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::RateLimit));
 	}
 
@@ -5373,11 +6027,11 @@ mod tests {
 
 	#[test]
 	fn test_tor_serves_requests_while_direct_oauth_is_starting() {
-		assert_eq!(select_preferred_api_lane(false, true, false), RedditLane::Tor);
-		assert_eq!(select_preferred_api_lane(false, false, false), RedditLane::Direct);
-		assert_eq!(select_preferred_api_lane(true, true, false), RedditLane::Direct);
-		assert_eq!(select_preferred_api_lane(true, true, true), RedditLane::Tor);
-		assert_eq!(select_preferred_api_lane(true, false, true), RedditLane::Direct);
+		use LaneAvailability::{Ready, Unavailable};
+		assert_eq!(select_api_lane(RedditLane::Direct, Unavailable, Ready), RedditLane::Tor);
+		assert_eq!(select_api_lane(RedditLane::Direct, Unavailable, Unavailable), RedditLane::Direct);
+		assert_eq!(select_api_lane(RedditLane::Direct, Ready, Ready), RedditLane::Direct);
+		assert_eq!(select_api_lane(RedditLane::Direct, Ready, Unavailable), RedditLane::Direct);
 	}
 
 	#[test]
@@ -5458,7 +6112,7 @@ mod tests {
 		guard.block_for_rate_limit(now, Duration::from_secs(20));
 		guard.install_oauth_generation(2, false);
 		assert_eq!(guard.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::RateLimit));
-		assert_eq!(guard.edge_throttle_failures, 1);
+		assert_eq!(guard.edges[0].failures, 1);
 		assert_eq!(guard.quota.generation, 2);
 	}
 
@@ -5476,7 +6130,7 @@ mod tests {
 
 		assert!(guard.rate_limit_blocked_until.is_none());
 		assert_eq!(guard.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::UpstreamFailures));
-		assert_eq!(guard.edge_throttle_failures, 1);
+		assert_eq!(guard.edges[0].failures, 1);
 		assert_eq!(guard.upstream_failure_blocked_until, Some(failure_deadline));
 		assert_eq!(guard.quota.generation, 2);
 	}
@@ -5489,8 +6143,8 @@ mod tests {
 		let late_success = guard.begin_attempt(now).unwrap();
 		guard.record_edge_throttle(now, denied, None);
 		assert!(guard.record_api_success(now, late_success).is_none());
-		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
-		assert_eq!(guard.edge_throttle_failures, 1);
+		assert!(matches!(guard.edges[0].state, EdgeCircuitState::Open { .. }));
+		assert_eq!(guard.edges[0].failures, 1);
 	}
 
 	#[test]
@@ -5502,7 +6156,7 @@ mod tests {
 		let probe_at = now + denial.delay + Duration::from_millis(1);
 		let probe = guard.begin_attempt(probe_at).unwrap();
 		guard.abandon_edge_probe(probe_at, probe);
-		assert!(matches!(guard.edge_state, EdgeCircuitState::Open { .. }));
+		assert!(matches!(guard.edges[0].state, EdgeCircuitState::Open { .. }));
 		assert!(guard.begin_attempt(probe_at + Duration::from_secs(1)).is_err());
 	}
 
@@ -5517,11 +6171,11 @@ mod tests {
 		let replacement_probe = guard.begin_attempt(stale_probe_at + RedditLane::Direct.request_timeout() + Duration::from_secs(1)).unwrap();
 		assert!(replacement_probe.half_open);
 		assert!(guard.record_api_success(stale_probe_at, stale_probe).is_none());
-		assert!(matches!(guard.edge_state, EdgeCircuitState::HalfOpen { .. }));
+		assert!(matches!(guard.edges[0].state, EdgeCircuitState::HalfOpen { .. }));
 		assert!(guard
 			.record_api_success(stale_probe_at + RedditLane::Direct.request_timeout() + Duration::from_secs(1), replacement_probe)
 			.is_some());
-		assert!(matches!(guard.edge_state, EdgeCircuitState::Closed));
+		assert!(matches!(guard.edges[0].state, EdgeCircuitState::Closed));
 	}
 
 	#[test]

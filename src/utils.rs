@@ -648,6 +648,14 @@ pub struct ErrorTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "loading.html")]
+struct LoadingTemplate {
+	prefs: Preferences,
+	url: String,
+	retry_after: u64,
+}
+
+#[derive(Template)]
 #[template(path = "info.html")]
 pub struct InfoTemplate {
 	pub msg: String,
@@ -1507,6 +1515,27 @@ pub fn redirect(path: &str) -> Response<Body> {
 
 /// Renders a generic error landing page.
 pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, String> {
+	let temporary = temporary_error_retry_after(msg);
+	if let Some(retry_after) = temporary.filter(|_| req.method() == hyper::Method::GET) {
+		log::info!("Waiting for Reddit page recovery: {}", msg.split('|').next().unwrap_or_default());
+		let seconds = retry_after.unwrap_or(5).max(3).saturating_add(fastrand::u64(0..=2));
+		let body = LoadingTemplate {
+			prefs: Preferences::new(&req),
+			url: req.uri().to_string(),
+			retry_after: seconds,
+		}
+		.render()
+		.unwrap_or_default();
+		return Ok(
+			Response::builder()
+				.status(503)
+				.header("content-type", "text/html; charset=utf-8")
+				.header("Retry-After", seconds.to_string())
+				.header("Cache-Control", "no-store")
+				.body(body.into())
+				.unwrap_or_default(),
+		);
+	}
 	error!("Error page rendered: {}", msg.split('|').next().unwrap_or_default());
 	let url = req.uri().to_string();
 	let body = ErrorTemplate {
@@ -1517,7 +1546,6 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	.render()
 	.unwrap_or_default();
 
-	let temporary = temporary_error_retry_after(msg);
 	let mut response = Response::builder().status(if temporary.is_some() { 503 } else { 404 }).header("content-type", "text/html");
 	if let Some(Some(seconds)) = temporary {
 		response = response.header("Retry-After", seconds.to_string());
@@ -1526,7 +1554,7 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 }
 
 fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
-	const TEMPORARY_ERRORS: [&str; 14] = [
+	const TEMPORARY_ERRORS: [&str; 20] = [
 		"Redlib is starting its anonymous Reddit session",
 		"The shared Reddit request ended before producing a response",
 		"Reddit requests are temporarily paused",
@@ -1541,6 +1569,12 @@ fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
 		"Couldn't send request to Reddit",
 		"Failed receiving body from Reddit",
 		"Failed to parse page JSON data",
+		"Reddit direct standby",
+		"Reddit error 403",
+		"OAuth token has expired",
+		"OAuth token changed",
+		"Unable to resolve Reddit share link",
+		"Unable to make HEAD request to Reddit",
 	];
 	if !TEMPORARY_ERRORS.iter().any(|prefix| msg.starts_with(prefix)) {
 		return None;
@@ -1691,6 +1725,37 @@ mod tests {
 		);
 		assert_eq!(temporary_error_retry_after("Reddit is having issues, check if there's an outage"), Some(None));
 		assert_eq!(temporary_error_retry_after("r/example is a private community"), None);
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_render_a_quiet_retrying_page() {
+		let msg = "Reddit is temporarily rejecting this instance. Retry in 42 seconds";
+		let request = hyper::Request::builder().uri("/r/example/comments/abc.json?sort=new").body(hyper::Body::empty()).unwrap();
+		let response = super::error(request, msg).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+		assert_eq!(response.headers()["cache-control"], "no-store");
+		let seconds = response.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap();
+		assert!((42..=44).contains(&seconds));
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let html = std::str::from_utf8(&body).unwrap();
+		assert!(html.contains("Still trying to load your page…"));
+		assert!(html.contains(&format!("http-equiv=\"refresh\" content=\"{seconds}\"")));
+		assert!(!html.contains(msg));
+		assert!(!html.contains("check_update.js"));
+		assert!(!html.contains("Report"));
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_do_not_hide_terminal_errors_or_replay_posts() {
+		let request = hyper::Request::builder().uri("/r/example").body(hyper::Body::empty()).unwrap();
+		let response = super::error(request, "r/example is a private community").await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		assert!(std::str::from_utf8(&body).unwrap().contains("r/example is a private community"));
+		let request = hyper::Request::builder().method("POST").uri("/settings").body(hyper::Body::empty()).unwrap();
+		let response = super::error(request, "Reddit API request timed out").await.unwrap();
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		assert!(!std::str::from_utf8(&body).unwrap().contains("http-equiv=\"refresh\""));
 	}
 
 	#[test]

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Loading your page…{% endblock %}
+{% block head %}
+{% call super() %}
+<meta http-equiv="refresh" content="{{ retry_after }}">
+<meta name="robots" content="noindex">
+{% endblock %}
+{% block content %}
+<p role="status" aria-live="polite">Still trying to load your page…</p>
+{% endblock %}
