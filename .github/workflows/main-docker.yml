@@ -47,7 +47,6 @@ jobs:
         run: cargo check --locked --all-targets
       - name: Run deterministic resilience tests
         run: |
-          cargo test --locked --lib comments_html_
           cargo test --locked --lib primary_lane_is_explicit_and_defaults_to_direct
           cargo test --locked --lib test_tor_first_
           cargo test --locked --lib test_endpoint_edge_
@@ -114,6 +113,7 @@ jobs:
           cargo test --locked --lib test_abandoned_half_open_probe_reopens_edge_circuit
           cargo test --locked --lib test_expired_half_open_probe_cannot_block_or_recover_circuit
           cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
+          cargo test --locked --lib test_comments_transport_path_
           cargo test --locked --lib test_json_cache_policy_is_narrow
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib temporary_errors_
