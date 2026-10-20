@@ -555,7 +555,9 @@ mod tests {
 		));
 		let parsed = parse_comments(&html, "abc123").unwrap();
 		let body = parsed["data"]["children"][0]["data"]["body_html"].as_str().unwrap();
-		assert!(body.contains("src=\"/img/example.png\""));
+		let document = Html::parse_fragment(body);
+		let sources: Vec<_> = document.select(&selector("img")).filter_map(|e| e.value().attr("src")).collect();
+		assert_eq!(sources, ["/img/example.png"]);
 		for forbidden in ["https://", "tracker.example", "settings/update", "onload"] {
 			assert!(!body.contains(forbidden));
 		}
