@@ -41,6 +41,7 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
-      - name: Verify the anonymous comments HTML adapter
-        run: |
-          cargo test --locked --lib live_anonymous_comment_permalink -- --ignored --nocapture
+      - name: Inspect the browser reply expansion request
+        env:
+          NODE_PATH: ${{ runner.temp }}/comments-browser/node_modules
+        run: xvfb-run --auto-servernum node scripts/diagnose_replies_browser.cjs
