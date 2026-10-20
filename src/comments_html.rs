@@ -510,7 +510,23 @@ mod tests {
 				.collect::<Vec<_>>();
 			(paths, seen)
 		};
-		for path in paths.into_iter().take(2) {
+
+		let fields = {
+			let doc = Html::parse_document(&html);
+			let target = doc.select(&selector("shreddit-comment")).find(|e| e.value().attr("thingid") == Some("t1_phv7x54")).unwrap();
+			["depth", "comment-position", "comment-parent-positions"].map(|k| (k, target.value().attr(k).unwrap_or_default().to_owned()))
+		};
+		println!("ANONYMOUS_REPLY_POSITION fields={fields:?}");
+		let mut paths = paths;
+		for position in ["0", "[0]"] {
+			let query = url::form_urlencoded::Serializer::new(String::new())
+				.append_pair("sort", "best")
+				.append_pair("startingDepth", "1")
+				.append_pair("commentParentPositions", position)
+				.finish();
+			paths.push(format!("/svc/shreddit/more-comments/codex/t3_1xaomu1?{query}"));
+		}
+		for path in paths.into_iter().take(3) {
 			let r = session.client.get(format!("{}{path}", origin.base)).send().await.unwrap();
 			let status = r.status().as_u16();
 			let html = r.text().await.unwrap();
