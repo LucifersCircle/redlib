@@ -841,86 +841,117 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+
 	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "manual live endpoint diagnosis; performs one authentication per lane"]
-	async fn live_comments_endpoint_diagnostic() {
+	#[ignore = "manual anonymous OAuth grant comparison"]
+	async fn live_comments_grant_diagnostic() {
 		use hyper::body::HttpBody;
 		let profile = OauthTransportProfile::Firefox143Android;
 		for lane in [RedditLane::Direct, RedditLane::Tor] {
 			let client = client_for_oauth_profile(lane, profile).expect("diagnostic transport");
-			let mut backend = MobileSpoofAuth::new(lane);
-			let oauth = match Oauth::authenticate_with_backend(&mut backend, client, profile).await {
-				Ok(oauth) => oauth,
-				Err(error) => {
-					println!("ENDPOINT_DIAGNOSTIC lane={} auth_failed={error}", lane.label());
+			let backend = MobileSpoofAuth::new(lane);
+			for (grant, client_id) in [("android", REDDIT_ANDROID_OAUTH_CLIENT_ID), ("legacy_web", "3XfBJWliHvqACnXrfIYlLw")] {
+				let user_agent = if grant == "legacy_web" {
+					"linux:LucifersCircle.redlib:0.36.0 (https://github.com/LucifersCircle/redlib)"
+				} else {
+					backend.user_agent()
+				};
+				let origin = lane.auth_origin();
+				let device_id = backend.device.headers.get("X-Reddit-Device-Id").expect("anonymous device id");
+				let form = url::form_urlencoded::Serializer::new(String::new())
+					.append_pair("grant_type", "https://oauth.reddit.com/grants/installed_client")
+					.append_pair("device_id", device_id)
+					.finish();
+				let token_response = timeout(
+					Duration::from_secs(45),
+					client
+						.post(format!("{}/api/v1/access_token", origin.base))
+						.default_headers(false)
+						.header("Host", origin.host)
+						.header("User-Agent", user_agent)
+						.header("Accept", "application/json")
+						.header("Content-Type", "application/x-www-form-urlencoded")
+						.basic_auth(client_id, Some(""))
+						.body(form)
+						.send(),
+				)
+				.await;
+				let response = match token_response {
+					Ok(Ok(response)) => response,
+					_ => {
+						println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_transport_failed=true", lane.label());
+						continue;
+					}
+				};
+				let status = response.status().as_u16();
+				if status != 200 {
+					let value = response.json::<serde_json::Value>().await.ok();
+					let code = value
+						.as_ref()
+						.and_then(|v| v.get("error"))
+						.and_then(serde_json::Value::as_str)
+						.filter(|v| {
+							matches!(
+								*v,
+								"invalid_grant" | "unauthorized_client" | "unsupported_grant_type" | "invalid_client" | "invalid_request" | "access_denied"
+							)
+						})
+						.unwrap_or("unclassified");
+					println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_status={status} error_code={code}", lane.label());
 					continue;
 				}
-			};
-			println!("ENDPOINT_DIAGNOSTIC lane={} auth=ok", lane.label());
-			for (label, path, public) in [
-				("baseline", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("minimal_oauth", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("minimal_descriptive_ua", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("minimal_session", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("mobile_no_retry", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-				("mobile_no_cookie", "/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", false),
-			] {
-				let result = timeout(Duration::from_secs(30), async {
-					let origin = if public { lane.auth_origin() } else { lane.api_origin() };
-					let mut request = oauth.http_client.get(format!("{}{path}", origin.base)).header("Host", origin.host);
-					if label == "baseline" {
-						request = request.header("Cookie", "");
-					} else {
-						request = request.default_headers(false).header("Accept", "application/json");
+				let value: serde_json::Value = match response.json().await {
+					Ok(value) => value,
+					Err(_) => {
+						println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_json_failed=true", lane.label());
+						continue;
 					}
-					for (key, value) in &oauth.headers_map {
-						let lower = key.to_ascii_lowercase();
-						let essential = matches!(lower.as_str(), "authorization" | "user-agent");
-						let session = matches!(lower.as_str(), "x-reddit-loid" | "x-reddit-session");
-						if matches!(label, "minimal_oauth" | "minimal_descriptive_ua") && !essential {
-							continue;
-						}
-						if label == "minimal_session" && !(essential || session) {
-							continue;
-						}
-						if label == "mobile_no_retry" && lower == "x-reddit-retry" {
-							continue;
-						}
-						request = request.header(key, value);
+				};
+				let Some(token) = value.get("access_token").and_then(serde_json::Value::as_str) else {
+					println!("GRANT_DIAGNOSTIC lane={} grant={grant} token_missing=true", lane.label());
+					continue;
+				};
+				println!(
+					"GRANT_DIAGNOSTIC lane={} grant={grant} token_status=200 scope={} expires_in={}",
+					lane.label(),
+					value.get("scope").and_then(serde_json::Value::as_str).unwrap_or("missing"),
+					value.get("expires_in").and_then(serde_json::Value::as_u64).unwrap_or(0)
+				);
+				let api = lane.api_origin();
+				let request = client
+					.get(format!("{}/r/codex/comments/1xaomu1.json?depth=1&limit=1&raw_json=1", api.base))
+					.default_headers(false)
+					.header("Host", api.host)
+					.header("User-Agent", user_agent)
+					.header("Accept", "application/json")
+					.bearer_auth(token);
+				let response = match timeout(Duration::from_secs(45), request.send()).await {
+					Ok(Ok(response)) => response,
+					_ => {
+						println!("GRANT_DIAGNOSTIC lane={} grant={grant} comments_transport_failed=true", lane.label());
+						continue;
 					}
-					if label == "minimal_descriptive_ua" {
-						request = request.header("User-Agent", "linux:LucifersCircle.redlib:0.36.0 (https://github.com/LucifersCircle/redlib)");
+				};
+				let status = response.status().as_u16();
+				let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_owned();
+				let mut body = hyper::Body::wrap_stream(response.bytes_stream());
+				let mut bytes = Vec::new();
+				while let Some(Ok(chunk)) = body.data().await {
+					let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
+					bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+					if bytes.len() >= 256 * 1024 {
+						break;
 					}
-					let response = request.send().await?;
-					let status = response.status().as_u16();
-					let content = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_string();
-					let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).unwrap_or("missing").to_string();
-					let mut body = hyper::Body::wrap_stream(response.bytes_stream());
-					let mut bytes = Vec::new();
-					while let Some(Ok(chunk)) = body.data().await {
-						let remaining = (256 * 1024_usize).saturating_sub(bytes.len());
-						bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
-						if bytes.len() >= 256 * 1024 {
-							break;
-						}
-					}
-					let json_array = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| value.is_array());
-					let network_block = String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("blocked by network security");
-					println!(
-						"ENDPOINT_DIAGNOSTIC lane={} route={label} status={status} content={content} retry_after={retry} bytes={} json_array={json_array} network_block={network_block}",
-						lane.label(),
-						bytes.len()
-					);
-					Ok::<(), wreq::Error>(())
-				})
-				.await;
-				if !matches!(result, Ok(Ok(()))) {
-					println!("ENDPOINT_DIAGNOSTIC lane={} route={label} transport_or_timeout=true", lane.label());
 				}
-				tokio::time::sleep(Duration::from_secs(2)).await;
+				let json_array = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.is_array());
+				println!(
+					"GRANT_DIAGNOSTIC lane={} grant={grant} comments_status={status} content={content} json_array={json_array}",
+					lane.label()
+				);
 			}
 		}
 	}
+
 	use super::*;
 	use crate::client::OAUTH_CLIENT;
 

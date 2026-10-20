@@ -19,6 +19,10 @@ async function inspect(label, base, proxyServer) {
     } catch {}
   });
   try {
+    const home = await page.goto(base+'/', {waitUntil:'domcontentloaded',timeout:40000});
+    await page.waitForTimeout(4000);
+    console.log(JSON.stringify({lane:label,probe:'anonymous_home_bootstrap',status:home?.status(),cookieNames:(await context.cookies()).map(c=>c.name)}));
+    if (home?.status() === 429) return;
     const response = await page.goto(base+'/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/', {waitUntil:'domcontentloaded',timeout:40000});
     await page.waitForTimeout(4000);
     const body = await page.locator('body').innerText();
