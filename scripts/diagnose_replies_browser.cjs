@@ -4,10 +4,13 @@ const {chromium}=require('playwright');
  const browser=await chromium.launch({executablePath:'/usr/bin/google-chrome',headless:false,proxy:{server:'socks5://127.0.0.1:19050'}});
  try {
   const page=await browser.newPage();
-  await page.goto(base+'/',{waitUntil:'domcontentloaded',timeout:40000});
-  await page.goto(base+'/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/',{waitUntil:'domcontentloaded',timeout:40000});
+  const home=await page.goto(base+'/',{waitUntil:'commit',timeout:60000});
+  console.log(JSON.stringify({probe:'browser_home_commit',status:home.status()}));
+  await page.waitForTimeout(1500);
+  const thread=await page.goto(base+'/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/',{waitUntil:'commit',timeout:60000});
+  console.log(JSON.stringify({probe:'browser_thread_commit',status:thread.status()}));
   const loader=page.locator('faceplate-partial[src*="/svc/shreddit/more-comments/"]').first();
-  await loader.waitFor({state:'attached',timeout:30000});
+  await loader.waitFor({state:'attached',timeout:90000});
   const source=await loader.getAttribute('src');const url=new URL(source,base);
   const params=Object.fromEntries(['sort','startingDepth','commentParentPositions'].map(k=>[k,url.searchParams.get(k)]));
   console.log(JSON.stringify({probe:'browser_reply_source',path:url.pathname,params,before:await page.locator('shreddit-comment').count()}));
