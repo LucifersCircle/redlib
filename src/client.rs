@@ -3306,7 +3306,7 @@ async fn website_comments_on_lane(path: &str, quarantine: bool, lane: RedditLane
 	}
 	let mut thread = crate::comments_html::ThreadPath::parse(path)?;
 	let post = comments_post_cached(thread.id.clone(), lane).await.ok()?;
-	if !thread.website_path.contains("/comment/") {
+	if thread.comment_id.is_none() {
 		if let Some(permalink) = post["data"]["permalink"].as_str() {
 			if let Some(canonical) = crate::comments_html::ThreadPath::parse(permalink).filter(|p| p.id == thread.id) {
 				let query = thread.website_path.split_once('?').map(|(_, query)| query.to_owned());
