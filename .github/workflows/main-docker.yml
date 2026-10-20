@@ -39,12 +39,5 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
-      - name: Inspect normal anonymous Chrome session
-        env:
-          NODE_PATH: ${{ runner.temp }}/comments-browser/node_modules
-          REDLIB_DIAGNOSTIC_BROWSER: /usr/bin/google-chrome
-          REDLIB_DIAGNOSTIC_TOR: "on"
-          REDLIB_DIAGNOSTIC_HEADED: "on"
-        run: xvfb-run --auto-servernum node scripts/diagnose_comments_browser.cjs
       - name: Compare anonymous HTML using the Rust HTTP transport
         run: cargo test --locked --lib live_anonymous_html_comments_diagnostic -- --ignored --nocapture
