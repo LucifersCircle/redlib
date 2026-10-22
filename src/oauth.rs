@@ -18,7 +18,7 @@ use tokio::time::timeout;
 const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
-const TOR_OAUTH_TIMEOUT: Duration = Duration::from_secs(45);
+const TOR_OAUTH_TIMEOUT: Duration = Duration::from_secs(90);
 const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
@@ -1173,6 +1173,7 @@ mod reported_tor_comments_diagnostic {
 	async fn live_reported_tor_comments() {
 		let _ = pretty_env_logger::try_init();
 		assert!(crate::client::oauth_client(RedditLane::Direct).is_none());
+		let mut authenticated = 0;
 		for profile in [OauthTransportProfile::Chrome140Android, OauthTransportProfile::Chrome145Android] {
 			let lane = RedditLane::Tor;
 			let client = client_for_oauth_profile(lane, profile).unwrap();
@@ -1184,6 +1185,7 @@ mod reported_tor_comments_diagnostic {
 					continue;
 				}
 			};
+			authenticated += 1;
 			println!("REPORTED_AUTH profile={} ok=true", profile.label());
 			let origin = lane.api_origin();
 			let mut current_works = false;
@@ -1191,6 +1193,14 @@ mod reported_tor_comments_diagnostic {
 				("current_scoped_encoding", "/r/gaming%2Fcomments/1xcfm9l?raw_json=1"),
 				("listing_control", "/r/gaming/hot?limit=1&raw_json=1"),
 				("literal_scoped", "/r/gaming/comments/1xcfm9l?raw_json=1"),
+				("scoped_lowercase_slash", "/r/gaming%2fcomments/1xcfm9l?raw_json=1"),
+				("encoded_c", "/r/gaming/%63omments/1xcfm9l?raw_json=1"),
+				("encoded_o", "/r/gaming/c%6fmments/1xcfm9l?raw_json=1"),
+				(
+					"encoded_scoped_with_slug",
+					"/r/gaming%2Fcomments/1xcfm9l/the_nintendo_switch_2_has_been_hacked_first/?raw_json=1",
+				),
+				("scoped_encoded_json", "/r/gaming%2Fcomments/1xcfm9l.json?raw_json=1"),
 				("short_encoded", "/comments%2F1xcfm9l?raw_json=1"),
 				("short_literal", "/comments/1xcfm9l?raw_json=1"),
 				("after_comments_encoding", "/r/gaming/comments%2F1xcfm9l?raw_json=1"),
@@ -1266,5 +1276,6 @@ mod reported_tor_comments_diagnostic {
 			}
 		}
 		assert!(crate::client::oauth_client(RedditLane::Direct).is_none());
+		assert!(authenticated > 0, "onion OAuth did not complete; comments comparison is inconclusive");
 	}
 }

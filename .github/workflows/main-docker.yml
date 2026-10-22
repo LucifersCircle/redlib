@@ -41,5 +41,9 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/reported-comments-tor.log"
           exit 1
+      - name: Check isolated Tor onion reachability
+        run: |
+          curl --socks5-hostname 127.0.0.1:19050 --max-time 60 --silent --show-error --head --output /dev/null --write-out 'ONION_PREFLIGHT origin=www status=%{http_code} connect_seconds=%{time_connect} total_seconds=%{time_total}\n' https://www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/ || true
+          curl --socks5-hostname 127.0.0.1:19050 --max-time 60 --silent --show-error --head --output /dev/null --write-out 'ONION_PREFLIGHT origin=oauth status=%{http_code} connect_seconds=%{time_connect} total_seconds=%{time_total}\n' https://oauth.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/ || true
       - name: Compare exact reported comments API route
         run: cargo test --locked --lib live_reported_tor_comments -- --ignored --nocapture
