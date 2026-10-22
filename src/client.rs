@@ -1,6 +1,7 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, RefreshReason};
-use crate::reddit_lane::{RedditLane, PRIMARY_REDDIT_LANE, TOR_FALLBACK_CONFIG};
+use crate::reddit_graphql::{CommentsRequest, ErrorKind as GraphqlErrorKind, GraphqlError};
+use crate::reddit_lane::{RedditLane, RedditOrigin, PRIMARY_REDDIT_LANE, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
 use crate::utils::format_url;
@@ -27,7 +28,6 @@ use wreq::{header as wreq_header, Client as WreqClient, Method, Proxy, Response 
 use wreq_util::{Emulation, Platform, Profile};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
-const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
 
 const REDDIT_SHORT_URL_BASE: &str = "https://redd.it";
 const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
@@ -1179,6 +1179,10 @@ enum ApiRequestError {
 		message: String,
 		ticket: QuotaRefreshWaitTicket,
 	},
+	Terminal {
+		message: String,
+		session_unavailable: bool,
+	},
 	Upstream(String),
 }
 
@@ -1422,7 +1426,7 @@ fn record_local_denial(reason: CooldownReason) {
 }
 
 fn media_destination_index(format: &str) -> usize {
-	if format.contains("v.redd.it") {
+	if format.contains("v.redd.it") || format.contains("packaged-media.redd.it") {
 		0
 	} else if format.contains("i.redd.it") {
 		1
@@ -2630,13 +2634,84 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
+enum RedditReadResponse {
+	Rest(WreqResponse),
+	Comments {
+		response: WreqResponse,
+		post: Option<Value>,
+		request: CommentsRequest,
+	},
+}
+
+fn graphql_api_error(error: GraphqlError, lane: RedditLane, generation: u64, headers: &wreq::header::HeaderMap) -> ApiRequestError {
+	if error.kind == GraphqlErrorKind::Invalid {
+		return ApiRequestError::Upstream(error.message);
+	}
+	if error.kind == GraphqlErrorKind::RateLimit {
+		let retry = headers.get("retry-after").and_then(|v| v.to_str().ok()).or(Some("30"));
+		let reset = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok());
+		let (delay, _) = block_for_rate_limit(lane, generation, retry, reset);
+		return ApiRequestError::deferred(error.message, CooldownReason::RateLimit, delay);
+	}
+	ApiRequestError::Terminal {
+		message: error.message,
+		session_unavailable: error.kind == GraphqlErrorKind::Session,
+	}
+}
+
+async fn reddit_comments(
+	path: &str,
+	quarantine: bool,
+	oauth: Arc<Oauth>,
+	attempt: &mut UpstreamAttempt,
+	allow_quota_refresh: bool,
+	request: CommentsRequest,
+	origin: RedditOrigin,
+) -> Result<RedditReadResponse, ApiRequestError> {
+	let lane = attempt.lane;
+	let mut post = None;
+	for (index, payload) in [request.post_payload(), request.comments_payload()].into_iter().enumerate() {
+		attempt.mark_sent();
+		record_api_send(path, false, lane);
+		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
+			.await
+			.map_err(ApiRequestError::Upstream)?;
+		if index == 1 || !response.status().is_success() {
+			return Ok(RedditReadResponse::Comments { response, post, request });
+		}
+		let headers = response.headers().clone();
+		let remaining = headers
+			.get("x-ratelimit-remaining")
+			.and_then(|v| v.to_str().ok())
+			.and_then(|v| parse_rate_limit_count(Some(v)));
+		let reset = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()).and_then(|v| parse_delay_seconds(Some(v)));
+		let value = response.json::<Value>().await.map_err(|error| ApiRequestError::Upstream(error.to_string()))?;
+		post = Some(match request.post(&value, quarantine) {
+			Ok(post) => post,
+			Err(error) => {
+				reconcile_rate_limit(attempt, remaining, reset, remaining == Some(0));
+				return Err(graphql_api_error(error, lane, oauth.generation, &headers));
+			}
+		});
+		// The second read is a continuation of the same admitted request. Keep its
+		// token, transport, permit and half-open probe, and reserve every wire send.
+		// No success is recorded until both responses have been validated.
+		reserve_redirect_hop(attempt, oauth.generation, remaining, reset, allow_quota_refresh)?;
+	}
+	unreachable!("comments reads always have two operations")
+}
+
 async fn reddit_get(
 	path: String,
 	quarantine: bool,
 	oauth_client: Arc<Oauth>,
 	attempt: &mut UpstreamAttempt,
 	allow_quota_refresh: bool,
-) -> Result<WreqResponse, ApiRequestError> {
+) -> Result<RedditReadResponse, ApiRequestError> {
+	if let Some(request) = CommentsRequest::from_path(&path) {
+		let origin = attempt.lane.graphql_origin();
+		return reddit_comments(&path, quarantine, oauth_client, attempt, allow_quota_refresh, request, origin).await;
+	}
 	let lane = attempt.lane;
 	let origin = lane.api_origin();
 	let generation = oauth_client.generation;
@@ -2651,11 +2726,11 @@ async fn reddit_get(
 		attempt.mark_sent();
 		record_api_send(&path, redirect_count > 0, lane);
 		let transport_path = api_transport_path(&path, lane);
-		let response = request_once(&Method::GET, transport_path.into_owned(), quarantine, origin.base, origin.host, oauth_client.clone(), lane)
+		let response = request_once(&Method::GET, transport_path.into_owned(), quarantine, origin, oauth_client.clone(), lane, None)
 			.await
 			.map_err(ApiRequestError::Upstream)?;
 		if !response.status().is_redirection() {
-			return Ok(response);
+			return Ok(RedditReadResponse::Rest(response));
 		}
 
 		if redirect_count == MAX_API_REDIRECTS {
@@ -2693,7 +2768,7 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 	let Some(oauth_client) = oauth_client(lane) else {
 		return async { Err(oauth_startup_error()) }.boxed();
 	};
-	request_once(&Method::HEAD, path, quarantine, base_path, host, oauth_client, lane)
+	request_once(&Method::HEAD, path, quarantine, RedditOrigin { base: base_path, host }, oauth_client, lane, None)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -2743,10 +2818,10 @@ fn request_once(
 	method: &'static Method,
 	path: String,
 	quarantine: bool,
-	base_path: &'static str,
-	host: &'static str,
+	origin: RedditOrigin,
 	oauth_client: Arc<Oauth>,
 	lane: RedditLane,
+	payload: Option<Value>,
 ) -> Boxed<Result<WreqResponse, String>> {
 	if oauth_client.lane != lane {
 		return async move { Err("Reddit request lane does not match its OAuth identity".to_string()) }.boxed();
@@ -2754,10 +2829,10 @@ fn request_once(
 	// Keep the logical path for admission, caches and diagnostics; apply Reddit's
 	// comments route compatibility encoding only to the outgoing URL.
 	let transport_path = comments_transport_path(&path);
-	let url = format!("{base_path}{transport_path}");
+	let url = format!("{}{transport_path}", origin.base);
 
 	let mut headers: Vec<(String, String)> = vec![
-		("Host".into(), host.into()),
+		("Host".into(), origin.host.into()),
 		(
 			"Cookie".into(),
 			if quarantine {
@@ -2780,6 +2855,9 @@ fn request_once(
 
 	for (key, value) in headers {
 		builder = builder.header(key, value);
+	}
+	if let Some(payload) = payload {
+		builder = builder.json(&payload);
 	}
 
 	async move {
@@ -2979,7 +3057,7 @@ fn normalize_comments_query(query: &str) -> BTreeMap<String, String> {
 	for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
 		if matches!(
 			key.as_ref(),
-			"comment" | "context" | "depth" | "limit" | "sort" | "showedits" | "showmedia" | "showmore" | "showtitle" | "sr_detail" | "theme" | "threaded" | "truncate"
+			"after" | "comment" | "context" | "depth" | "limit" | "sort" | "showedits" | "showmedia" | "showmore" | "showtitle" | "sr_detail" | "theme" | "threaded" | "truncate"
 		) {
 			raw.insert(key.into_owned(), value.into_owned());
 		}
@@ -2988,6 +3066,7 @@ fn normalize_comments_query(query: &str) -> BTreeMap<String, String> {
 	let mut normalized = BTreeMap::new();
 	for (key, value) in raw {
 		let value = match key.as_str() {
+			"after" if !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control) => value,
 			"sort" if matches!(value.as_str(), "confidence" | "top" | "new" | "controversial" | "old" | "random" | "qa" | "live") => value,
 			"context" => match value.parse::<u16>() {
 				Ok(context) if context <= 9999 => context.to_string(),
@@ -3518,6 +3597,10 @@ async fn json_uncached_on_lane_with_options(
 	let result = tokio::time::timeout_at(request_deadline, async {
 		match reddit_get(path.clone(), quarantine, oauth_client, &mut upstream_attempt, allow_quota_refresh).await {
 			Ok(response) => {
+				let (response, graphql) = match response {
+					RedditReadResponse::Rest(response) => (response, None),
+					RedditReadResponse::Comments { response, post, request } => (response, Some((post, request))),
+				};
 				let status = response.status();
 				let status_code = status.as_u16();
 
@@ -3540,7 +3623,11 @@ async fn json_uncached_on_lane_with_options(
 				let mut response = response.into_hyper_response();
 				let rejection = if status_code == 403 { Some(read_rejection_details(response.body_mut()).await) } else { None };
 				let resource_reason = rejection.as_ref().and_then(|details| details.resource_reason);
-				let throttle_kind = if resource_reason.is_some() || auth_rejected { None } else {
+				let throttle_kind = if resource_reason.is_some() || auth_rejected { None } else if graphql.is_some() && status_code == 403 && content_kind == "html" && !quota_headers_present {
+					// The GraphQL API reports resource errors as JSON. An HTML 403
+					// is an edge rejection even when that edge omits Retry-After.
+					Some(ThrottleKind::Edge)
+				} else {
 					classify_throttle_response(status_code, retry_after.is_some(), quota_headers_present)
 				};
 				if status_code == 403 {
@@ -3663,6 +3750,27 @@ async fn json_uncached_on_lane_with_options(
 						match serde_json::from_reader(body.reader()) {
 							Ok(value) => {
 								let json: Value = value;
+								let json = if status.is_success() {
+									if let Some((post, request)) = graphql {
+										let post = post.ok_or_else(|| "Reddit comments API returned incomplete metadata".to_string())?;
+										match request.finish(post, &json) {
+											Ok(json) => json,
+											Err(error) => {
+                                            if error.kind == GraphqlErrorKind::Invalid {
+                                                record_upstream_failure(lane, "comments_schema", Some(status_code), &path, request_generation);
+                                                if quota_spillover_ticket.is_none() { recovery_reason = LaneRecoveryReason::TransportFailure; }
+                                            }
+
+												if error.kind == GraphqlErrorKind::Session { retry_reason = TorRetryReason::SessionUnavailable; }
+												if error.kind == GraphqlErrorKind::RateLimit {
+													let (delay, current) = block_for_rate_limit(lane, request_generation, retry_after.or(Some("30")), reset);
+													if current { recovery_reason = LaneRecoveryReason::QuotaCooldown(delay); }
+												}
+												return Err(error.message);
+											}
+										}
+									} else { json }
+								} else { json };
 
 								// If user is suspended
 								if let Some(data) = json.get("data") {
@@ -3748,6 +3856,10 @@ async fn json_uncached_on_lane_with_options(
 			}
 			Err(ApiRequestError::TorQuotaRefreshWait { message, ticket }) => {
 				recovery_reason = tor_redirect_refresh_recovery(lane, admission_mode, quota_spillover_ticket.is_some(), ticket);
+				Err(message)
+			}
+			Err(ApiRequestError::Terminal { message, session_unavailable }) => {
+				if session_unavailable { retry_reason = TorRetryReason::SessionUnavailable; }
 				Err(message)
 			}
 			Err(ApiRequestError::Upstream(error)) => {
@@ -3839,6 +3951,120 @@ mod tests {
 	use super::*;
 	use std::sync::atomic::AtomicUsize;
 	use {crate::config::get_setting, sealed_test::prelude::*};
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "off"), ("REDLIB_REDDIT_PRIMARY_LANE", "direct")])]
+	fn test_graphql_comments_pair_keeps_probe_and_reserves_each_send() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			use hyper::service::{make_service_fn, service_fn};
+			use std::convert::Infallible;
+			let mode = Arc::new(AtomicUsize::new(0));
+			let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+			let test_mode = mode.clone();
+			let test_calls = calls.clone();
+			let endpoint = endpoint_class_index("/comments/abc.json");
+			let service = make_service_fn(move |_| {
+				let mode = test_mode.clone();
+				let calls = test_calls.clone();
+				async move {
+					Ok::<_, Infallible>(service_fn(move |request: HyperRequest<Body>| {
+						let mode = mode.clone();
+						let calls = calls.clone();
+						async move {
+							assert_eq!(request.method(), hyper::Method::POST);
+							assert_eq!(request.headers()["authorization"], "Bearer local-test-fixture");
+							let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
+							let payload: Value = serde_json::from_slice(&body).unwrap();
+							let name = payload["operationName"].as_str().unwrap().to_string();
+							calls.lock().unwrap().push(name.clone());
+							assert!(
+								matches!(upstream_guard(RedditLane::Direct).edges[endpoint].state, EdgeCircuitState::HalfOpen { .. }),
+								"metadata must not prematurely recover the comments probe"
+							);
+							let (remaining, body) = if name == "PostsByIds" {
+								(
+									if mode.load(Ordering::SeqCst) == 0 { "100" } else { "0" },
+									serde_json::json!({"data":{"postsInfoByIds":[{"__typename":"SubredditPost","id":"t3_abc","postTitle":"Fixture","subreddit":{"type":"PUBLIC"}}]}}),
+								)
+							} else {
+								assert_eq!(name, "PostComments");
+								(
+									"99",
+									serde_json::json!({"data":{"postInfoById":{"id":"t3_abc","commentForest":{"trees":[{"parentId":null,"node":{"id":"t1_reply","content":{"markdown":"hello"}}}]}}}}),
+								)
+							};
+							Ok::<_, Infallible>(
+								HyperResponse::builder()
+									.header("content-type", "application/json")
+									.header("x-ratelimit-remaining", remaining)
+									.header("x-ratelimit-reset", "60")
+									.body(Body::from(body.to_string()))
+									.unwrap(),
+							)
+						}
+					}))
+				}
+			});
+			let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+			let address = server.local_addr();
+			let origin = RedditOrigin {
+				base: Box::leak(format!("http://{address}").into_boxed_str()),
+				host: Box::leak(address.to_string().into_boxed_str()),
+			};
+			let server = tokio::spawn(server);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			for scenario in 0..2 {
+				mode.store(scenario, Ordering::SeqCst);
+				calls.lock().unwrap().clear();
+				*upstream_guard(RedditLane::Direct) = UpstreamGuard::new(RedditLane::Direct);
+				assert!(install_oauth_client(Oauth::request_fixture(RedditLane::Direct, http.clone()), true, None));
+				upstream_guard(RedditLane::Direct).edges[endpoint].state = EdgeCircuitState::Open {
+					until: Instant::now() - Duration::from_millis(1),
+				};
+				let mut refresh = TorQuotaRefreshRetryState::default();
+				let (oauth, mut attempt, _permit, _probe) = begin_upstream_attempt(RedditLane::Direct, endpoint, AdmissionRetryMode::Bounded, &mut refresh)
+					.await
+					.unwrap();
+				let result = reddit_comments(
+					"/comments/abc.json",
+					false,
+					oauth,
+					&mut attempt,
+					false,
+					CommentsRequest::from_path("/comments/abc.json").unwrap(),
+					origin,
+				)
+				.await;
+				if scenario == 0 {
+					let RedditReadResponse::Comments {
+						response,
+						post: Some(post),
+						request,
+					} = result.unwrap()
+					else {
+						panic!("comments response")
+					};
+					let response = response.json::<Value>().await.unwrap();
+					assert_eq!(request.finish(post, &response).unwrap()[1]["data"]["children"][0]["data"]["body"], "hello");
+					assert_eq!(*calls.lock().unwrap(), ["PostsByIds", "PostComments"]);
+					assert_eq!(upstream_guard(RedditLane::Direct).quota.next_request_id, 2);
+					reconcile_rate_limit(&mut attempt, Some(99), Some(Duration::from_secs(60)), false);
+					record_upstream_success(&mut attempt, "/comments/abc.json");
+					assert!(matches!(upstream_guard(RedditLane::Direct).edges[endpoint].state, EdgeCircuitState::Closed));
+				} else {
+					assert!(matches!(
+						result,
+						Err(ApiRequestError::Deferred {
+							recovery: LaneRecoveryReason::QuotaCooldown(_),
+							..
+						})
+					));
+					assert_eq!(*calls.lock().unwrap(), ["PostsByIds"], "do not send the second read after its admission is denied");
+				}
+			}
+			server.abort();
+		});
+	}
 
 	#[test]
 	fn test_tor_api_transport_path_preserves_logical_routes_and_queries() {

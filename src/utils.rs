@@ -933,10 +933,7 @@ pub async fn parse_post(post: &Value) -> Post {
 	} else {
 		let selftext = val(post, "selftext");
 		if selftext.contains("```") {
-			let mut html_output = String::new();
-			let parser = pulldown_cmark::Parser::new(&selftext);
-			pulldown_cmark::html::push_html(&mut html_output, parser);
-			rewrite_urls(&html_output)
+			rewrite_urls(&crate::reddit_graphql::markdown(&selftext, &Value::Null))
 		} else {
 			rewrite_urls(&val(post, "selftext_html"))
 		}
@@ -1223,6 +1220,14 @@ pub fn format_url(url: &str) -> String {
 				"np.reddit.com" => capture(&REGEX_URL_NP, "/", 1),
 				"reddit.com" => capture(&REGEX_URL_PLAIN, "/", 1),
 				"v.redd.it" => chain!(capture(&REGEX_URL_VIDEOS, "/vid/", 3), capture(&REGEX_URL_VIDEOS_HLS, "/hls/", 2)),
+				"packaged-media.redd.it" => {
+					let mut path = format!("/packaged-video{}", parsed.path());
+					if let Some(query) = parsed.query() {
+						path.push('?');
+						path.push_str(query);
+					}
+					path
+				}
 				"i.redd.it" => capture(&REGEX_URL_IMAGES, "/img/", 1),
 				"a.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_A, "/thumb/a/", 1),
 				"b.thumbs.redditmedia.com" => capture(&REGEX_URL_THUMBS_B, "/thumb/b/", 1),
@@ -1547,11 +1552,13 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 }
 
 fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
-	const TEMPORARY_ERRORS: [&str; 20] = [
+	const TEMPORARY_ERRORS: [&str; 22] = [
 		"Redlib is starting its anonymous Reddit session",
 		"The shared Reddit request ended before producing a response",
 		"Reddit requests are temporarily paused",
 		"Reddit is temporarily rejecting this instance",
+		"Reddit is temporarily unable to load comments",
+		"Reddit's anonymous comments session is unavailable",
 		"Reddit rate limit exceeded",
 		"Refreshing the anonymous Reddit session",
 		"OAuth token refresh is temporarily unavailable",

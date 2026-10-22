@@ -22,6 +22,7 @@ struct PostTemplate {
 	url: String,
 	url_without_query: String,
 	comment_query: String,
+	next: Option<String>,
 }
 
 fn split_comment_search_query(query: &str) -> (String, String) {
@@ -40,6 +41,13 @@ fn split_comment_search_query(query: &str) -> (String, String) {
 		}
 	}
 	(serializer.finish(), local_query)
+}
+
+fn next_comments_url(path: &str, query: &str, cursor: &str) -> String {
+	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	serializer.extend_pairs(url::form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key != "after"));
+	serializer.append_pair("after", cursor);
+	format!("{path}?{}", serializer.finish())
 }
 
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
@@ -82,6 +90,10 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	match json(path, quarantined).await {
 		// Otherwise, grab the JSON output from the request
 		Ok(response) => {
+			let next = response[1]["data"]["after"]
+				.as_str()
+				.filter(|cursor| !cursor.is_empty())
+				.map(|cursor| next_comments_url(req.uri().path(), req.uri().query().unwrap_or_default(), cursor));
 			// Parse the JSON into Post and Comment structs
 			let post = parse_post(&response[0]["data"]["children"][0]).await;
 
@@ -108,6 +120,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				single_thread,
 				url: req_url,
 				comment_query: query,
+				next,
 			}))
 		}
 		// If the Reddit API returns an error, exit and send error page to user
@@ -124,7 +137,19 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 
 #[cfg(test)]
 mod tests {
-	use super::split_comment_search_query;
+	use super::{next_comments_url, split_comment_search_query};
+
+	#[test]
+	fn test_graphql_comments_next_link_preserves_sort_and_encodes_cursor_once() {
+		let cursor = "commenttree:opaque+value&after=other\"";
+		let url = next_comments_url("/comments/abc", "sort=new&after=old&q=hello&type=comment", cursor);
+		let parsed = url::Url::parse(&format!("https://example.test{url}")).unwrap();
+		let pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
+		assert_eq!(pairs.iter().filter(|(key, _)| key == "after").count(), 1);
+		assert!(pairs.contains(&("after".into(), cursor.into())));
+		assert!(pairs.contains(&("sort".into(), "new".into())));
+		assert!(pairs.contains(&("q".into(), "hello".into())));
+	}
 
 	#[test]
 	fn test_comment_search_parameters_stay_local() {

@@ -88,6 +88,19 @@ fn shuffled_oauth_profiles() -> [OauthTransportProfile; OAUTH_BROWSER_PROFILES.l
 }
 
 impl Oauth {
+	#[cfg(test)]
+	pub(crate) fn request_fixture(lane: RedditLane, client: Arc<wreq::Client>) -> Self {
+		Self {
+			headers_map: HashMap::from([("Authorization".into(), "Bearer local-test-fixture".into())]),
+			http_client: client,
+			refresh_at: Instant::now() + Duration::from_secs(3600),
+			backend: MobileSpoofAuth::new(lane),
+			transport_profile: OauthTransportProfile::Chrome145Android,
+			generation: 0,
+			lane,
+		}
+	}
+
 	/// Create a new OAuth client
 	pub(crate) async fn new(lane: RedditLane) -> Self {
 		let mut failure_cycles = 0_u32;
@@ -1152,4 +1165,93 @@ mod tests {
 		assert!(rotated_is_fresh);
 		assert_ne!(rotated_device_id, original_device_id);
 	}
+}
+
+
+#[cfg(test)]
+mod anonymous_graphql_page_diagnostic {
+    use super::*;
+    use serde_json::Value;
+    use crate::server::RequestExt;
+    #[tokio::test(flavor="multi_thread")]
+    #[ignore="isolated anonymous comments page, sorting, focus and pagination"]
+    async fn live_anonymous_graphql_page() {
+        let _=pretty_env_logger::try_init();
+        let lane=if std::env::var("REDLIB_REDDIT_PRIMARY_LANE").as_deref()==Ok("tor"){RedditLane::Tor}else{RedditLane::Direct};
+        let profile=OauthTransportProfile::Chrome145Android;
+        let client=client_for_oauth_profile(lane,profile).unwrap();let mut backend=MobileSpoofAuth::new(lane);
+        let oauth=Oauth::authenticate_with_backend(&mut backend,client,profile).await.expect("anonymous authentication");
+        assert!(crate::client::install_oauth_client(oauth,true,None));
+        fn count(listing:&Value)->usize{listing["data"]["children"].as_array().into_iter().flatten().filter(|n|n["kind"]=="t1").map(|n|1+count(&n["data"]["replies"])).sum()}
+        let base="/r/gaming/comments/1xcfm9l/the_nintendo_switch_2_has_been_hacked_first/";
+        let mut first_ids=Vec::new();let mut cursor=None;
+        for (name,path,query,comment_id) in [
+            ("reported",base.to_string(),String::new(),None),
+            ("new",base.to_string(),"sort=new&limit=25".to_string(),None),
+            ("focused","/r/gaming/comments/1xcfm9l/_/19rhdq1tj77z9/".to_string(),"context=3&limit=25".to_string(),Some("19rhdq1tj77z9")),
+        ] {
+            let value=crate::client::json(format!("{path}.json?{query}"),false).await.expect("new anonymous comments JSON");
+            assert_eq!(value[0]["data"]["children"][0]["data"]["id"],"1xcfm9l");assert!(count(&value[1])>0,"{name}");
+            if name=="reported"{first_ids=value[1]["data"]["children"].as_array().unwrap().iter().map(|c|c["data"]["id"].as_str().unwrap().to_string()).collect();cursor=value[1]["data"]["after"].as_str().map(str::to_string);}
+            let mut req=hyper::Request::builder().uri(format!("{path}?{query}")).body(hyper::Body::empty()).unwrap();
+            let mut params=route_recognizer::Params::new();params.insert("sub".into(),"gaming".into());params.insert("id".into(),"1xcfm9l".into());if let Some(id)=comment_id{params.insert("comment_id".into(),id.into());}req.set_params(params);
+            let response=crate::post::item(req).await.unwrap();let status=response.status();let bytes=hyper::body::to_bytes(response.into_body()).await.unwrap();let body=String::from_utf8(bytes.to_vec()).unwrap();
+            assert_eq!(status,200,"{name}");assert!(body.contains("Nintendo Switch 2"));assert!(body.contains("class=\"comment\""));assert!(!body.contains("Still trying to load your page"));if let Some(id)=comment_id{assert!(body.contains(&format!("id=\"{id}\"")));}
+            println!("ANON_GQL_PAGE lane={} variant={name} status=200 api_comments={} rendered_comments={} next_link={}",lane.label(),count(&value[1]),body.matches("class=\"comment\"").count(),body.contains("More comments &rarr;"));
+        }
+        let cursor=cursor.expect("top-level pagination cursor");
+        let encoded=url::form_urlencoded::Serializer::new(String::new()).append_pair("after",&cursor).finish();
+        let next=crate::client::json(format!("{base}.json?limit=50&{encoded}"),false).await.expect("next comments page");
+        assert!(count(&next[1])>0);assert!(next[1]["data"]["children"].as_array().unwrap().iter().any(|c|!first_ids.contains(&c["data"]["id"].as_str().unwrap().to_string())));
+        println!("ANON_GQL_PAGE lane={} variant=next comments={} advanced=true",lane.label(),count(&next[1]));
+    }
+}
+
+#[cfg(test)]
+mod anonymous_graphql_media_diagnostic {
+    use super::*;
+    use crate::server::RequestExt;
+    use hyper::body::HttpBody;
+    #[tokio::test(flavor="multi_thread")]
+    #[ignore="isolated public post media through the production media proxy"]
+    async fn live_anonymous_graphql_media() {
+        let profile=OauthTransportProfile::Chrome145Android;
+        let client=client_for_oauth_profile(RedditLane::Direct,profile).unwrap();let mut backend=MobileSpoofAuth::new(RedditLane::Direct);
+        let oauth=Oauth::authenticate_with_backend(&mut backend,client,profile).await.expect("anonymous authentication");
+        assert!(crate::client::install_oauth_client(oauth,true,None));
+        async fn fetch(label:&str,url:&str,kind:&str) {
+            assert!(url.starts_with('/'),"{label}: must use local proxy");
+            let parsed=url::Url::parse(&format!("https://redlib.test{url}")).unwrap();
+            let mut params=route_recognizer::Params::new();
+            let format=if let Some(path)=parsed.path().strip_prefix("/packaged-video/"){params.insert("path".into(),path.into());"https://packaged-media.redd.it/{path}"}
+            else if let Some(path)=parsed.path().strip_prefix("/img/"){params.insert("path".into(),path.into());"https://i.redd.it/{path}"}
+            else if let Some(path)=parsed.path().strip_prefix("/preview/"){let (loc,id)=path.split_once('/').unwrap();params.insert("loc".into(),loc.into());params.insert("id".into(),id.into());"https://{loc}view.redd.it/{id}"}
+            else if let Some(path)=parsed.path().strip_prefix("/hls/"){let(id,path)=path.split_once('/').unwrap();params.insert("id".into(),id.into());params.insert("path".into(),path.into());"https://v.redd.it/{id}/{path}"}
+            else {panic!("unexpected proxy route {label}")};
+            let mut req=hyper::Request::builder().uri(url).header("Range","bytes=0-1023").body(hyper::Body::empty()).unwrap();req.set_params(params);
+            let mut response=crate::client::proxy(req,format).await.expect("media proxy");
+            let status=response.status();let ct=response.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+            assert!(status.is_success(),"{label}: status={status}");
+            let bytes=response.body_mut().data().await.unwrap().unwrap();
+            match kind {
+                "mp4"=>{assert!(ct.contains("video/mp4"),"{label}: {ct}");assert!(bytes.windows(4).take(32).any(|v|v==b"ftyp"),"{label}: mp4 signature");},
+                "hls"=>assert!(bytes.starts_with(b"#EXTM3U")),
+                "image"=>{assert!(ct.starts_with("image/"),"{label}: {ct}");assert!(bytes.starts_with(&[0xff,0xd8])||bytes.starts_with(b"\x89PNG")||bytes.starts_with(b"GIF8")||bytes.starts_with(b"RIFF"),"{label}: image signature");},
+                _=>unreachable!(),
+            }
+            println!("ANON_GQL_MEDIA variant={label} status={} content_type={ct} signature=verified proxy=true",status.as_u16());
+        }
+        for (kind,id) in [("video","1xcu15a"),("image","1xcsjsw"),("gif","1xcxepe"),("gallery","1xcju61")] {
+            let value=crate::client::json(format!("/comments/{id}.json?limit=1"),false).await.expect("comments metadata");
+            let post=crate::utils::parse_post(&value[0]["data"]["children"][0]).await;
+            assert_eq!(post.post_type,kind,"{id}");
+            if kind=="gallery" {
+                assert!(post.gallery.len()>=2);
+                for (i,image) in post.gallery.iter().enumerate(){fetch(&format!("gallery-{i}-preview"),&image.preview_url,"image").await;fetch(&format!("gallery-{i}-original"),&image.url,"image").await;}
+            } else {
+                fetch(kind,&post.media.url,if kind=="image"{"image"}else{"mp4"}).await;
+                if kind=="video"{fetch("video-hls",&post.media.alt_url,"hls").await;}
+            }
+        }
+    }
 }

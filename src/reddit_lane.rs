@@ -50,6 +50,15 @@ pub(crate) static PRIMARY_REDDIT_LANE: LazyLock<RedditLane> = LazyLock::new(|| m
 });
 
 impl RedditLane {
+	// Both transports use the official app's read API. The Tor client keeps its
+	// isolated SOCKS proxy and resolves this hostname remotely through Tor.
+	pub(crate) fn graphql_origin(self) -> RedditOrigin {
+		RedditOrigin {
+			base: "https://gql-fed.reddit.com",
+			host: "gql-fed.reddit.com",
+		}
+	}
+
 	fn parse_primary(value: Option<&str>) -> Result<Self, &'static str> {
 		match value {
 			None | Some("direct") => Ok(Self::Direct),
@@ -166,6 +175,10 @@ mod tests {
 
 	#[test]
 	fn each_lane_has_matching_origins_and_redirect_allowlist() {
+		for lane in [RedditLane::Direct, RedditLane::Tor] {
+			assert_eq!(lane.graphql_origin().base, "https://gql-fed.reddit.com");
+			assert_eq!(lane.graphql_origin().host, "gql-fed.reddit.com");
+		}
 		assert_eq!(RedditLane::Direct.api_origin().host, "oauth.reddit.com");
 		assert_eq!(RedditLane::Direct.auth_origin().host, "www.reddit.com");
 		assert!(RedditLane::Direct.accepts_redirect_host("redd.it"));
