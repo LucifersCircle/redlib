@@ -94,6 +94,9 @@
 			{{ c.render().unwrap()|safe }}
 		</div>
 		{%- endfor %}
+		{% if let Some(next) = next %}
+		<p class="thread_nav"><a href="{{ next }}">More comments &rarr;</a></p>
+		{% endif %}
 
 	</div>
 {% endblock %}

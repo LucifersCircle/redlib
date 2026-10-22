@@ -52,6 +52,7 @@ jobs:
           cargo test --locked --lib primary_lane_is_explicit_and_defaults_to_direct
           cargo test --locked --lib test_tor_first_
           cargo test --locked --lib test_direct_transport_cooldown_
+          cargo test --locked --lib test_graphql_comments_
           cargo test --locked --lib test_endpoint_edge_
           cargo test --locked --lib test_credential_rejection_
           cargo test --locked --lib test_rejection_
