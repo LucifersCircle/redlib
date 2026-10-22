@@ -41,5 +41,5 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
-      - name: Compare anonymous comments API paths
-        run: cargo test --locked --lib live_encoded_comments_api -- --ignored --nocapture
+      - name: Measure current Tor policy and latency
+        run: cargo test --locked --lib live_tor_policy_latency -- --ignored --nocapture

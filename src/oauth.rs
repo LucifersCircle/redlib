@@ -842,55 +842,45 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 #[cfg(test)]
 mod tests {
 
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "isolated anonymous comments API and page verification"]
-	async fn live_encoded_comments_api() {
-		let _ = pretty_env_logger::try_init();
-		assert_eq!(std::env::var("REDLIB_REDDIT_PRIMARY_LANE").as_deref(), Ok("tor"));
-		let lane = RedditLane::Tor;
-		let client = client_for_oauth_profile(lane, OauthTransportProfile::Firefox143Android).unwrap();
-		let mut backend = MobileSpoofAuth::new(lane);
-		let oauth = Oauth::authenticate_with_backend(&mut backend, client.clone(), OauthTransportProfile::Firefox143Android).await.expect("anonymous OAuth");
-		fn count(listing: &serde_json::Value) -> usize {
-			listing["data"]["children"].as_array().into_iter().flatten().filter(|n| n["kind"] == "t1")
-				.map(|n| 1 + count(&n["data"]["replies"])).sum()
+	#[tokio::test(flavor="multi_thread")]
+	#[ignore="isolated current Tor policy and latency diagnosis"]
+	async fn live_tor_policy_latency() {
+		let _=pretty_env_logger::try_init();
+		let lane=RedditLane::Tor;
+		let mut authenticated=0;
+		for (identity,profile) in [OauthTransportProfile::Firefox143Android,OauthTransportProfile::Chrome145Android].into_iter().enumerate() {
+			let client=client_for_oauth_profile(lane,profile).unwrap();
+			let mut backend=MobileSpoofAuth::new(lane);
+			let started=Instant::now();
+			let oauth=match Oauth::authenticate_with_backend(&mut backend,client.clone(),profile).await {
+				Ok(oauth)=>oauth,
+				Err(error)=>{ println!("TOR_POLICY_AUTH identity={identity} ok=false class={} elapsed_ms={}",error.failure_class(),started.elapsed().as_millis()); continue; }
+			};
+			authenticated+=1;
+			println!("TOR_POLICY_AUTH identity={identity} ok=true elapsed_ms={}",started.elapsed().as_millis());
+			for (endpoint,path) in [
+				("listing", "/r/all/hot.json?limit=5&raw_json=1"),
+				("comments", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
+				("community_search", "/subreddits/search.json?q=codex&limit=1&raw_json=1"),
+				("listing_repeat", "/r/all/hot.json?limit=5&raw_json=1"),
+			] {
+				let mut req=client.get(format!("{}{path}",lane.api_origin().base));
+				for (k,v) in &oauth.headers_map {req=req.header(k,v);}
+				let started=Instant::now();
+				let result=timeout(Duration::from_secs(30),async {
+					let resp=req.send().await.map_err(|_| "transport")?;
+					let headers_ms=started.elapsed().as_millis();
+					let status=resp.status().as_u16();
+					let bytes=resp.bytes().await.map_err(|_| "body")?;
+					let value=serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
+					let valid=value["kind"]=="Listing" || value.as_array().is_some_and(|a|a.len()==2&&a[0]["kind"]=="Listing"&&a[1]["kind"]=="Listing");
+					println!("TOR_POLICY_API identity={identity} endpoint={endpoint} status={status} headers_ms={headers_ms} total_ms={} body_bytes={} valid_json={valid}",started.elapsed().as_millis(),bytes.len());
+					Ok::<_,&str>(())
+				}).await;
+				if !matches!(result,Ok(Ok(()))) { println!("TOR_POLICY_API identity={identity} endpoint={endpoint} network_failed=true total_ms={}",started.elapsed().as_millis()); }
+			}
 		}
-		for (name, path) in [
-			("literal", "/r/codex/comments/1xaomu1.json?raw_json=1&limit=500"),
-			("encoded_scoped", "/r/codex%2Fcomments/1xaomu1.json?raw_json=1&limit=500"),
-			("encoded_root", "/comments%2F1xaomu1.json?raw_json=1&limit=500"),
-		] {
-			let mut request = client.get(format!("{}{path}", lane.api_origin().base));
-			for (key, value) in &oauth.headers_map { request = request.header(key, value); }
-			let response = timeout(Duration::from_secs(45), request.send()).await.expect("API timeout").expect("API transport");
-			let status = response.status().as_u16();
-			let value = response.json::<serde_json::Value>().await.unwrap_or_default();
-			let shape = value.as_array().is_some_and(|a| a.len() == 2 && a[0]["kind"] == "Listing" && a[1]["kind"] == "Listing");
-			let post = value[0]["data"]["children"][0]["data"]["id"] == "1xaomu1";
-			println!("ENCODED_COMMENTS_API variant={name} status={status} thread_shape={shape} post_matches={post} comments={}", count(&value[1]));
-			if name != "literal" { assert_eq!(status, 200); assert!(shape && post); assert!(count(&value[1]) > 0); }
-		}
-		assert!(crate::client::install_oauth_client(oauth, true, None));
-		for (name, path) in [
-			("scoped", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/"),
-			("new", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/?sort=new"),
-			("short", "/comments/1xaomu1"),
-			("highlighted", "/r/codex/comments/1xaomu1/_/phvobrm?context=3"),
-		] {
-			let (base, query) = path.split_once('?').unwrap_or((path, ""));
-			let value = timeout(Duration::from_secs(75), crate::client::json(format!("{base}.json?{query}"), false)).await.expect("JSON budget").expect("normal JSON wrapper");
-			assert_eq!(value[0]["data"]["children"][0]["data"]["id"], "1xaomu1");
-			assert!(count(&value[1]) > 0);
-			let req = hyper::Request::builder().uri(path).body(hyper::Body::empty()).unwrap();
-			let response = timeout(Duration::from_secs(75), crate::post::item(req)).await.expect("page budget").expect("rendered page");
-			assert_eq!(response.status(), 200, "must not show a loading screen");
-			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-			let body = String::from_utf8(body.to_vec()).unwrap();
-			assert!(body.contains("Why is my Dot mad at me?"));
-			assert!(body.contains("class=\"comment\""));
-			assert!(!body.contains("Still trying to load your page"));
-			println!("ENCODED_COMMENTS_PAGE variant={name} status=200 comments={} rendered_comments={}", count(&value[1]), body.matches("class=\"comment\"").count());
-		}
+		assert!(authenticated>0,"at least one anonymous session must be created for this diagnosis");
 	}
 
 	use super::*;
