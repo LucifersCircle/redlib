@@ -80,6 +80,7 @@ const TOR_QUOTA_REFRESH_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const MAX_TOR_QUOTA_REFRESH_RETRIES: u8 = 16;
 const TOR_QUOTA_SPILLOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const DIRECT_STANDBY_TIMEOUT: Duration = Duration::from_secs(15);
+const TOR_PRIMARY_STANDBY_DELAY: Duration = Duration::from_secs(8);
 const TOR_STANDBY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const TOR_FIRST_PAGE_BUDGET: Duration = Duration::from_secs(75);
 const REJECTED_SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -3281,19 +3282,13 @@ fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quo
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
-	let mut budget = RecoveryBudget::new(
-		tokio::time::Instant::now(),
-		CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + lane.request_timeout().min(Duration::from_secs(30)),
-	);
+	let initial_timeout = initial_lane_request_timeout(lane, configured_primary_lane(), lane_availability(RedditLane::Direct, Instant::now(), &path));
+	let mut budget = RecoveryBudget::new(tokio::time::Instant::now(), CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + initial_timeout);
 	let mut transport_retries = 0;
 	let mut cooldown_waits = 0;
 	let mut tor_refresh = TorQuotaRefreshRetryState::default();
 	loop {
-		let timeout_override = Some(if budget.started.is_some() {
-			TRANSPORT_RETRY_TIMEOUT
-		} else {
-			lane.request_timeout().min(Duration::from_secs(30))
-		});
+		let timeout_override = Some(if budget.started.is_some() { TRANSPORT_RETRY_TIMEOUT } else { initial_timeout });
 		let attempt_budget = budget.remaining(tokio::time::Instant::now());
 		let attempt = json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None, &mut tor_refresh);
 		let (result, tor_retry_reason, recovery_reason) = match tokio::time::timeout(attempt_budget, attempt).await {
@@ -3367,6 +3362,17 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 			return (result, tor_retry_reason);
 		}
 		tokio::time::sleep(delay).await;
+	}
+}
+
+fn initial_lane_request_timeout(lane: RedditLane, primary: RedditLane, direct: LaneAvailability) -> Duration {
+	// A healthy standby can recover a stalled Tor send before the old 30-second
+	// network deadline. Tor retains the longer budget when direct is unavailable;
+	// a failed standby still returns to the separately bounded Tor recovery.
+	if lane == RedditLane::Tor && primary == RedditLane::Tor && direct == LaneAvailability::Ready {
+		TOR_PRIMARY_STANDBY_DELAY
+	} else {
+		lane.request_timeout().min(Duration::from_secs(30))
 	}
 }
 
@@ -3988,6 +3994,32 @@ mod tests {
 		assert_eq!(*calls.lock().unwrap(), vec!["direct", "tor"]);
 		let result = recover_after_direct_standby(async { Ok::<_, String>("direct success") }, || async { panic!("successful standby must not retry Tor") }).await;
 		assert_eq!(result, Ok("direct success"));
+	}
+
+	#[test]
+	fn test_tor_first_stalled_send_uses_ready_standby_before_thirty_seconds() {
+		assert_eq!(
+			initial_lane_request_timeout(RedditLane::Tor, RedditLane::Tor, LaneAvailability::Ready),
+			Duration::from_secs(8)
+		);
+		for direct in [
+			LaneAvailability::Unavailable,
+			LaneAvailability::TransportCooldown,
+			LaneAvailability::LocalQuotaPause,
+			LaneAvailability::UpstreamQuotaCooldown,
+		] {
+			assert_eq!(initial_lane_request_timeout(RedditLane::Tor, RedditLane::Tor, direct), Duration::from_secs(30));
+		}
+		assert_eq!(
+			initial_lane_request_timeout(RedditLane::Direct, RedditLane::Tor, LaneAvailability::Ready),
+			Duration::from_secs(30)
+		);
+		assert_eq!(
+			initial_lane_request_timeout(RedditLane::Tor, RedditLane::Direct, LaneAvailability::Ready),
+			Duration::from_secs(30)
+		);
+		assert_eq!(TRANSPORT_RETRY_TIMEOUT, Duration::from_secs(15));
+		assert_eq!(TOR_STANDBY_RECOVERY_TIMEOUT, Duration::from_secs(30));
 	}
 
 	#[tokio::test]
