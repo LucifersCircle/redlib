@@ -21,9 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify, Semaphore, SemaphorePermit};
+use wreq::dns::{Addrs, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
-use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Proxy, Response as WreqResponse};
-use wreq_util::{Emulation, EmulationOS, EmulationOption};
+use wreq::{header as wreq_header, Client as WreqClient, Method, Proxy, Response as WreqResponse};
+use wreq_util::{Emulation, Platform, Profile};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
@@ -33,6 +34,7 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
+const ALTERNATIVE_REDDIT_DNS_HOST: &str = "dualstack.reddit.map.fastly.net";
 
 pub static CLIENT: LazyLock<Arc<WreqClient>> = LazyLock::new(|| Arc::new(build_client()));
 
@@ -78,6 +80,7 @@ const TOR_QUOTA_REFRESH_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const MAX_TOR_QUOTA_REFRESH_RETRIES: u8 = 16;
 const TOR_QUOTA_SPILLOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const DIRECT_STANDBY_TIMEOUT: Duration = Duration::from_secs(15);
+const TOR_PRIMARY_STANDBY_DELAY: Duration = Duration::from_secs(8);
 const TOR_STANDBY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const TOR_FIRST_PAGE_BUDGET: Duration = Duration::from_secs(75);
 const REJECTED_SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -2219,21 +2222,46 @@ impl OauthTransportProfile {
 		}
 	}
 
-	pub(crate) fn emulation(self) -> Emulation {
+	pub(crate) fn emulation(self) -> Profile {
 		match self {
-			Self::Chrome140Android => Emulation::Chrome140,
-			Self::Chrome141Android => Emulation::Chrome141,
-			Self::Chrome142Android => Emulation::Chrome142,
-			Self::Chrome143Android => Emulation::Chrome143,
-			Self::Chrome144Android => Emulation::Chrome144,
-			Self::Chrome145Android => Emulation::Chrome145,
-			Self::Firefox142Android => Emulation::Firefox142,
-			Self::Firefox143Android => Emulation::Firefox143,
-			Self::Firefox144Android => Emulation::Firefox144,
-			Self::Firefox145Android => Emulation::Firefox145,
-			Self::Firefox146Android => Emulation::Firefox146,
-			Self::Firefox147Android => Emulation::Firefox147,
+			Self::Chrome140Android => Profile::Chrome140,
+			Self::Chrome141Android => Profile::Chrome141,
+			Self::Chrome142Android => Profile::Chrome142,
+			Self::Chrome143Android => Profile::Chrome143,
+			Self::Chrome144Android => Profile::Chrome144,
+			Self::Chrome145Android => Profile::Chrome145,
+			Self::Firefox142Android => Profile::Firefox142,
+			Self::Firefox143Android => Profile::Firefox143,
+			Self::Firefox144Android => Profile::Firefox144,
+			Self::Firefox145Android => Profile::Firefox145,
+			Self::Firefox146Android => Profile::Firefox146,
+			Self::Firefox147Android => Profile::Firefox147,
 		}
+	}
+}
+
+#[derive(Debug)]
+struct RedditDnsResolver;
+
+// Keep Reddit's TLS/SNI and HTTP host while resolving direct www requests
+// through the upstream Fastly alias. Tor keeps remote SOCKS DNS resolution.
+fn reddit_dns_name(name: &str) -> &str {
+	if name.eq_ignore_ascii_case(ALTERNATIVE_REDDIT_URL_BASE_HOST) {
+		ALTERNATIVE_REDDIT_DNS_HOST
+	} else {
+		name
+	}
+}
+
+impl Resolve for RedditDnsResolver {
+	fn resolve(&self, name: Name) -> Resolving {
+		let dns_name = reddit_dns_name(name.as_str()).to_owned();
+		Box::pin(async move {
+			tokio::net::lookup_host((dns_name, 0))
+				.await
+				.map(|addresses| Box::new(addresses) as Addrs)
+				.map_err(Into::into)
+		})
 	}
 }
 
@@ -2338,15 +2366,15 @@ fn build_oauth_client(lane: RedditLane, proxy: Option<Proxy>, profile: OauthTran
 	// Mobile OAuth overrides the browser User-Agent and content type with its
 	// stable Reddit Android identity while retaining the selected browser's
 	// transport fingerprint and ordinary Accept headers.
-	build_emulated_client_with_profile(lane, proxy, profile.emulation(), EmulationOS::Android, false, profile.label())
+	build_emulated_client_with_profile(lane, proxy, profile.emulation(), Platform::Android, false, profile.label())
 }
 
-fn random_emulation_profile() -> (Emulation, EmulationOS) {
+fn random_emulation_profile() -> (Profile, Platform) {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
-	let emulations = [Emulation::Chrome145, Emulation::Firefox147];
-	let emulation_operating_systems = [EmulationOS::Android, EmulationOS::Windows];
+	let emulations = [Profile::Chrome145, Profile::Firefox147];
+	let emulation_operating_systems = [Platform::Android, Platform::Windows];
 
 	let rand = fastrand::usize(..);
 	let selected_emulation = emulations[rand % emulations.len()];
@@ -2357,17 +2385,16 @@ fn random_emulation_profile() -> (Emulation, EmulationOS) {
 fn build_emulated_client_with_profile(
 	lane: RedditLane,
 	proxy: Option<Proxy>,
-	selected_emulation: Emulation,
-	selected_operating_system: EmulationOS,
+	selected_emulation: Profile,
+	selected_operating_system: Platform,
 	skip_emulation_headers: bool,
 	profile_label: &'static str,
 ) -> Result<WreqClient, String> {
-	let emulation = EmulationOption::builder()
-		.emulation(selected_emulation)
-		.emulation_os(selected_operating_system)
-		.skip_headers(skip_emulation_headers)
-		.build()
-		.emulation();
+	let emulation = Emulation::builder()
+		.profile(selected_emulation)
+		.platform(selected_operating_system)
+		.headers(!skip_emulation_headers)
+		.build();
 
 	info!(
 		"Building Wreq client: lane={} profile={profile_label} emulation={selected_emulation:?} os={selected_operating_system:?} emulation_headers={}",
@@ -2375,6 +2402,9 @@ fn build_emulated_client_with_profile(
 		if skip_emulation_headers { "disabled" } else { "enabled" }
 	);
 	let mut builder = WreqClient::builder().emulation(emulation).redirect(Policy::none());
+	if lane == RedditLane::Direct {
+		builder = builder.dns_resolver(RedditDnsResolver);
+	}
 	if let Some(proxy) = proxy {
 		builder = builder.proxy(proxy);
 	}
@@ -2510,7 +2540,7 @@ async fn canonical_path_on_lane(path: String, tries: i8, lane: RedditLane) -> Re
 				// So we need to strip the .json suffix from the original path, and
 				// also remove all Reddit domain parts with format_url.
 				// Otherwise, it will literally redirect to Reddit.com.
-				let uri = format_url(stripped_uri);
+				let uri = comments_logical_path(&format_url(stripped_uri));
 
 				// Decrement tries and try again
 				canonical_path_on_lane(uri, tries - 1, lane).await
@@ -2702,7 +2732,7 @@ fn validated_reddit_redirect_path(location: &str, lane: RedditLane) -> Result<St
 	if path.is_empty() || !path.starts_with('/') {
 		return Err("Reddit returned an invalid redirect path".to_string());
 	}
-	Ok(normalize_reddit_api_path(&percent_encode(path.as_bytes(), CONTROLS).to_string()))
+	Ok(normalize_reddit_api_path(&comments_logical_path(&percent_encode(path.as_bytes(), CONTROLS).to_string())))
 }
 
 /// Makes exactly one request to an already-approved Reddit origin. Redirects
@@ -2786,6 +2816,32 @@ fn comments_transport_path(path: &str) -> Cow<'_, str> {
 		return Cow::Borrowed(path);
 	};
 	Cow::Owned(format!("{}%2F{}", &path[..separator], &path[separator + 1..]))
+}
+
+/// Remove the comments-route separator encoding if Reddit reflects our
+/// transport-only rewrite in a redirect.
+fn comments_logical_path(path: &str) -> String {
+	let (base, query) = path.split_once('?').map_or((path, None), |(base, query)| (base, Some(query)));
+	let logical = if let Some(tail) = base.strip_prefix("/comments%2F").or_else(|| base.strip_prefix("/comments%2f")) {
+		format!("/comments/{tail}")
+	} else if let Some(scoped) = base.strip_prefix("/r/") {
+		let Some((subreddit, tail)) = scoped.split_once("%2Fcomments/").or_else(|| scoped.split_once("%2fcomments/")) else {
+			return path.to_string();
+		};
+		if subreddit.is_empty() || subreddit.contains('/') {
+			return path.to_string();
+		}
+		format!("/r/{subreddit}/comments/{tail}")
+	} else {
+		return path.to_string();
+	};
+	if canonical_comments_base(&logical).is_none() {
+		return path.to_string();
+	}
+	match query {
+		Some(query) => format!("{logical}?{query}"),
+		None => logical,
+	}
 }
 
 /// Make a request to a Reddit API and parse the JSON response.
@@ -3226,19 +3282,13 @@ fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quo
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
-	let mut budget = RecoveryBudget::new(
-		tokio::time::Instant::now(),
-		CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + lane.request_timeout().min(Duration::from_secs(30)),
-	);
+	let initial_timeout = initial_lane_request_timeout(lane, configured_primary_lane(), lane_availability(RedditLane::Direct, Instant::now(), &path));
+	let mut budget = RecoveryBudget::new(tokio::time::Instant::now(), CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + initial_timeout);
 	let mut transport_retries = 0;
 	let mut cooldown_waits = 0;
 	let mut tor_refresh = TorQuotaRefreshRetryState::default();
 	loop {
-		let timeout_override = Some(if budget.started.is_some() {
-			TRANSPORT_RETRY_TIMEOUT
-		} else {
-			lane.request_timeout().min(Duration::from_secs(30))
-		});
+		let timeout_override = Some(if budget.started.is_some() { TRANSPORT_RETRY_TIMEOUT } else { initial_timeout });
 		let attempt_budget = budget.remaining(tokio::time::Instant::now());
 		let attempt = json_uncached_on_lane_with_options(path.clone(), quarantine, lane, AdmissionRetryMode::Bounded, timeout_override, None, &mut tor_refresh);
 		let (result, tor_retry_reason, recovery_reason) = match tokio::time::timeout(attempt_budget, attempt).await {
@@ -3312,6 +3362,17 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 			return (result, tor_retry_reason);
 		}
 		tokio::time::sleep(delay).await;
+	}
+}
+
+fn initial_lane_request_timeout(lane: RedditLane, primary: RedditLane, direct: LaneAvailability) -> Duration {
+	// A healthy standby can recover a stalled Tor send before the old 30-second
+	// network deadline. Tor retains the longer budget when direct is unavailable;
+	// a failed standby still returns to the separately bounded Tor recovery.
+	if lane == RedditLane::Tor && primary == RedditLane::Tor && direct == LaneAvailability::Ready {
+		TOR_PRIMARY_STANDBY_DELAY
+	} else {
+		lane.request_timeout().min(Duration::from_secs(30))
 	}
 }
 
@@ -3777,6 +3838,46 @@ mod tests {
 		assert_eq!(comments_transport_path(path), "/r/codex%2Fcomments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top");
 	}
 
+	#[test]
+	fn test_upstream_comments_redirect_preserves_query_and_endpoint_controls() {
+		let encoded = "/r/rust%2Fcomments/18t5968/title/kfbqlbc.json?context=3";
+		for lane in [RedditLane::Direct, RedditLane::Tor] {
+			let logical = validated_reddit_redirect_path(encoded, lane).unwrap();
+			assert_eq!(logical, "/r/rust/comments/18t5968/_/kfbqlbc.json?context=3&raw_json=1");
+			assert_eq!(json_cache_policy(&logical), JsonCachePolicy::Comments);
+			assert_eq!(endpoint_class(&logical), "comments");
+		}
+		let query = "sort=new&literal=/comments%2Fabc&other=/r/rust%2fcomments/id";
+		assert_eq!(comments_logical_path(&format!("/comments%2Fabc.json?{query}")), format!("/comments/abc.json?{query}"));
+		for unchanged in [
+			"/search.json?q=/comments%2Fabc",
+			"/r/rust%2Fwiki/page",
+			"https://example.com/comments%2Fabc.json",
+			"/r//rust%2Fcomments/abc.json",
+		] {
+			assert_eq!(comments_logical_path(unchanged), unchanged);
+		}
+	}
+
+	#[test]
+	fn test_reddit_dns_name_uses_fastly_dualstack_alias() {
+		assert_eq!(reddit_dns_name("www.reddit.com"), ALTERNATIVE_REDDIT_DNS_HOST);
+		assert_eq!(reddit_dns_name("WWW.REDDIT.COM"), ALTERNATIVE_REDDIT_DNS_HOST);
+		assert_eq!(reddit_dns_name("oauth.reddit.com"), "oauth.reddit.com");
+	}
+
+	#[test]
+	fn test_comments_logical_path_removes_transport_encoding() {
+		for (path, expected) in [
+			("/r/rust%2Fcomments/18t5968/title/kfbqlbc/", "/r/rust/comments/18t5968/title/kfbqlbc/"),
+			("/r/rust%2fcomments/18t5968/title/kfbqlbc/", "/r/rust/comments/18t5968/title/kfbqlbc/"),
+			("/comments%2F18t5968/title/", "/comments/18t5968/title/"),
+			("/r/rust%2Fwiki/page", "/r/rust%2Fwiki/page"),
+		] {
+			assert_eq!(comments_logical_path(path), expected);
+		}
+	}
+
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
 	static COALESCED_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 	static COALESCED_RESULT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -3893,6 +3994,32 @@ mod tests {
 		assert_eq!(*calls.lock().unwrap(), vec!["direct", "tor"]);
 		let result = recover_after_direct_standby(async { Ok::<_, String>("direct success") }, || async { panic!("successful standby must not retry Tor") }).await;
 		assert_eq!(result, Ok("direct success"));
+	}
+
+	#[test]
+	fn test_tor_first_stalled_send_uses_ready_standby_before_thirty_seconds() {
+		assert_eq!(
+			initial_lane_request_timeout(RedditLane::Tor, RedditLane::Tor, LaneAvailability::Ready),
+			Duration::from_secs(8)
+		);
+		for direct in [
+			LaneAvailability::Unavailable,
+			LaneAvailability::TransportCooldown,
+			LaneAvailability::LocalQuotaPause,
+			LaneAvailability::UpstreamQuotaCooldown,
+		] {
+			assert_eq!(initial_lane_request_timeout(RedditLane::Tor, RedditLane::Tor, direct), Duration::from_secs(30));
+		}
+		assert_eq!(
+			initial_lane_request_timeout(RedditLane::Direct, RedditLane::Tor, LaneAvailability::Ready),
+			Duration::from_secs(30)
+		);
+		assert_eq!(
+			initial_lane_request_timeout(RedditLane::Tor, RedditLane::Direct, LaneAvailability::Ready),
+			Duration::from_secs(30)
+		);
+		assert_eq!(TRANSPORT_RETRY_TIMEOUT, Duration::from_secs(15));
+		assert_eq!(TOR_STANDBY_RECOVERY_TIMEOUT, Duration::from_secs(30));
 	}
 
 	#[tokio::test]
