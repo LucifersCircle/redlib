@@ -41,5 +41,5 @@ jobs:
           echo 'Tor bootstrap did not complete within three minutes'
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
-      - name: Compare browser and documented API requests on Tor
-        run: cargo test --locked --lib live_tor_route_matrix -- --ignored --nocapture
+      - name: Verify Tor JSON wrapper, comments pages, and next-page rendering
+        run: cargo test --locked --lib live_tor_suffix_recovery -- --ignored --nocapture

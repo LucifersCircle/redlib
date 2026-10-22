@@ -842,51 +842,87 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 #[cfg(test)]
 mod tests {
 
-
-	#[tokio::test(flavor="multi_thread")]
-	#[ignore="isolated Tor browser and documented API route comparison"]
-	async fn live_tor_route_matrix() {
-		let _=pretty_env_logger::try_init();
-		let profile=OauthTransportProfile::Chrome145Android;
-		let client=client_for_oauth_profile(RedditLane::Tor,profile).unwrap();
-		let mut backend=MobileSpoofAuth::new(RedditLane::Tor);
-		let started=Instant::now();
-		let session=Oauth::authenticate_with_backend(&mut backend,client.clone(),profile).await.expect("anonymous Tor authentication");
-		println!("TOR_ROUTE_AUTH ok=true elapsed_ms={}",started.elapsed().as_millis());
-		let www=RedditLane::Tor.auth_origin().base;
-		let api=RedditLane::Tor.api_origin().base;
-		let mut rate_limited=std::collections::HashSet::new();
-		for(name,origin,path,authenticated)in [
-			("browser_home",www,"/",false),
-			("browser_json_listing",www,"/r/all/hot.json?limit=3&raw_json=1",false),
-			("browser_json_comments",www,"/r/codex/comments/1xaomu1.json?raw_json=1",false),
-			("app_listing_no_suffix",api,"/r/all/hot?limit=3&raw_json=1",true),
-			("app_comments_no_suffix",api,"/r/codex/comments/1xaomu1?raw_json=1",true),
-			("app_encoded_comments_no_suffix",api,"/r/codex%2Fcomments/1xaomu1?raw_json=1",true),
-			("app_json_listing_control",api,"/r/all/hot.json?limit=3&raw_json=1",true),
-		] {
-			if rate_limited.contains(&origin) {println!("TOR_ROUTE_SKIP route={name} reason=upstream_quota");continue;}
-			let mut request=client.get(format!("{origin}{path}"));
-			if authenticated {for(k,v)in &session.headers_map {request=request.header(k,v);}}
-			let started=Instant::now();
-			let result=timeout(Duration::from_secs(25),async {
-				let response=request.send().await.map_err(|_|"send")?;
-				let status=response.status().as_u16();
-				let headers_ms=started.elapsed().as_millis();
-				let headers=response.headers();
-				let quota=headers.contains_key("x-ratelimit-remaining")||headers.contains_key("x-ratelimit-reset");
-				let redirect=headers.contains_key("location");
-				let bytes=response.bytes().await.map_err(|_|"body")?;
-				let value=serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
-				let shape=value["kind"]=="Listing"||value.as_array().is_some_and(|a|a.len()==2&&a[0]["kind"]=="Listing"&&a[1]["kind"]=="Listing");
-				let text=String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-				let network_block=text.contains("blocked by network security")||text.contains("blocked due to a network policy");
-				let reddit_html=text.contains("<html")&&text.contains("reddit");
-				println!("TOR_ROUTE_API route={name} status={status} headers_ms={headers_ms} total_ms={} body_bytes={} valid_listing={shape} reddit_html={reddit_html} network_block={network_block} redirect={redirect} quota_headers={quota}",started.elapsed().as_millis(),bytes.len());
-				Ok::<_,&str>(status==429 || status==403&&quota)
-			}).await;
-			match result {Ok(Ok(true))=>{rate_limited.insert(origin);},Ok(Ok(false))=>{},_=>println!("TOR_ROUTE_API route={name} network_failed=true elapsed_ms={}",started.elapsed().as_millis())}
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated Tor API suffix compatibility and rendered page verification"]
+	async fn live_tor_suffix_recovery() {
+		use crate::server::RequestExt;
+		let _ = pretty_env_logger::try_init();
+		assert_eq!(std::env::var("REDLIB_REDDIT_PRIMARY_LANE").as_deref(), Ok("tor"));
+		let lane = RedditLane::Tor;
+		let profile = OauthTransportProfile::Chrome145Android;
+		let client = client_for_oauth_profile(lane, profile).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let oauth = Oauth::authenticate_with_backend(&mut backend, client, profile).await.expect("anonymous Tor OAuth");
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		assert!(crate::client::oauth_client(RedditLane::Direct).is_none(), "all content must be verified on Tor");
+		async fn fetch(path: String) -> serde_json::Value {
+			timeout(Duration::from_secs(75), crate::client::json(path, false)).await.expect("JSON budget").expect("normal Tor JSON wrapper")
 		}
+		fn count(listing: &serde_json::Value) -> usize {
+			listing["data"]["children"].as_array().into_iter().flatten().filter(|n| n["kind"] == "t1")
+				.map(|n| 1 + count(&n["data"]["replies"])).sum()
+		}
+		let listing = fetch("/r/all/hot.json?limit=3&raw_json=1".to_string()).await;
+		assert_eq!(listing["kind"], "Listing");
+		let children = listing["data"]["children"].as_array().expect("listing children");
+		assert!(!children.is_empty());
+		let after = listing["data"]["after"].as_str().expect("pagination cursor");
+		let next = fetch(format!("/r/all/hot.json?sort=hot&t=&after={after}&limit=3&raw_json=1")).await;
+		assert_eq!(next["kind"], "Listing");
+		let next_children = next["data"]["children"].as_array().expect("next listing children");
+		assert!(!next_children.is_empty());
+		assert!(next_children.iter().all(|n| !children.iter().any(|first| first["data"]["id"] == n["data"]["id"])), "next must advance the listing");
+		println!("TOR_SUFFIX_JSON route=listing children={} next_children={} advanced=true", children.len(), next_children.len());
+		let historical = fetch("/r/all/hot.json?sort=hot&t=&after=t3_1xay0pv&limit=3&raw_json=1".to_string()).await;
+		assert_eq!(historical["kind"], "Listing");
+		println!("TOR_SUFFIX_JSON route=reported_next valid_listing=true children={}", historical["data"]["children"].as_array().unwrap().len());
+		for (name, path) in [
+			("search", "/search.json?q=rust&limit=3&raw_json=1"),
+			("community_search", "/subreddits/search.json?q=rust&limit=3&raw_json=1"),
+		] {
+			let value=fetch(path.to_string()).await;
+			assert_eq!(value["kind"], "Listing");
+			let children=value["data"]["children"].as_array().expect("search children").len();
+			assert!(children>0);
+			println!("TOR_SUFFIX_JSON route={name} valid_listing=true children={children}");
+		}
+		let user=fetch("/user/reddit/about.json?raw_json=1".to_string()).await;
+		assert_eq!(user["kind"], "t2");
+		assert!(user["data"]["name"].is_string());
+		println!("TOR_SUFFIX_JSON route=user valid_user=true");
+		for (name, path) in [
+			("scoped", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/"),
+			("new", "/r/codex/comments/1xaomu1/why_is_my_dot_mad_at_me/?sort=new"),
+			("short", "/comments/1xaomu1"),
+			("highlighted", "/r/codex/comments/1xaomu1/_/phvobrm?context=3"),
+		] {
+			let (base, query) = path.split_once('?').unwrap_or((path, ""));
+			let value=fetch(format!("{base}.json?{query}")).await;
+			assert_eq!(value[0]["data"]["children"][0]["data"]["id"], "1xaomu1");
+			assert!(count(&value[1]) > 0);
+			let req=hyper::Request::builder().uri(path).body(hyper::Body::empty()).unwrap();
+			let response=timeout(Duration::from_secs(75), crate::post::item(req)).await.expect("page budget").expect("rendered comments page");
+			assert_eq!(response.status(), 200, "must not show a loading screen");
+			let body=hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let body=String::from_utf8(body.to_vec()).unwrap();
+			assert!(body.contains("Why is my Dot mad at me?"));
+			assert!(body.contains("class=\"comment\""));
+			assert!(!body.contains("Still trying to load your page"));
+			println!("TOR_SUFFIX_PAGE route=comments variant={name} status=200 api_comments={} rendered_comments={}", count(&value[1]), body.matches("class=\"comment\"").count());
+		}
+		let mut req=hyper::Request::builder().uri(format!("/r/all?sort=hot&t=&after={after}&limit=3")).body(hyper::Body::empty()).unwrap();
+		let mut params=route_recognizer::Params::new();
+		params.insert("sub".to_string(),"all".to_string());
+		params.insert("sort".to_string(),"hot".to_string());
+		req.set_params(params);
+		let response=timeout(Duration::from_secs(75), crate::subreddit::community(req)).await.expect("listing page budget").expect("rendered next page");
+		assert_eq!(response.status(), 200);
+		let body=hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let body=String::from_utf8(body.to_vec()).unwrap();
+		assert!(!body.contains("Still trying to load your page"));
+		assert!(next_children.iter().any(|n| body.contains(n["data"]["id"].as_str().unwrap())), "next page must render a returned post");
+		println!("TOR_SUFFIX_PAGE route=next status=200 returned_posts_rendered=true");
+		assert!(crate::client::oauth_client(RedditLane::Direct).is_none());
 	}
 
 	use super::*;
