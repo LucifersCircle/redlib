@@ -842,55 +842,51 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 #[cfg(test)]
 mod tests {
 
+
 	#[tokio::test(flavor="multi_thread")]
-	#[ignore="isolated anonymous token and Tor origin policy comparison"]
-	async fn live_tor_block_matrix() {
+	#[ignore="isolated Tor browser and documented API route comparison"]
+	async fn live_tor_route_matrix() {
 		let _=pretty_env_logger::try_init();
 		let profile=OauthTransportProfile::Chrome145Android;
-		let direct=client_for_oauth_profile(RedditLane::Direct,profile).unwrap();
-		let tor=client_for_oauth_profile(RedditLane::Tor,profile).unwrap();
-		let mut sessions=Vec::new();
-		for(lane,client)in [(RedditLane::Direct,direct.clone()),(RedditLane::Tor,tor.clone())] {
-			let mut backend=MobileSpoofAuth::new(lane);let started=Instant::now();
-			match Oauth::authenticate_with_backend(&mut backend,client,profile).await {
-				Ok(oauth)=>{ println!("TOR_BLOCK_AUTH minted={} ok=true elapsed_ms={}",lane.label(),started.elapsed().as_millis());sessions.push(oauth); },
-				Err(e)=>println!("TOR_BLOCK_AUTH minted={} ok=false class={} elapsed_ms={}",lane.label(),e.failure_class(),started.elapsed().as_millis()),
-			}
-		}
+		let client=client_for_oauth_profile(RedditLane::Tor,profile).unwrap();
+		let mut backend=MobileSpoofAuth::new(RedditLane::Tor);
+		let started=Instant::now();
+		let session=Oauth::authenticate_with_backend(&mut backend,client.clone(),profile).await.expect("anonymous Tor authentication");
+		println!("TOR_ROUTE_AUTH ok=true elapsed_ms={}",started.elapsed().as_millis());
+		let www=RedditLane::Tor.auth_origin().base;
+		let api=RedditLane::Tor.api_origin().base;
 		let mut rate_limited=std::collections::HashSet::new();
-		for session in &sessions {
-			for(name,client,origin,path)in [
-				("direct_oauth_listing",direct.clone(),RedditLane::Direct.api_origin().base,"/r/all/hot.json?limit=3&raw_json=1"),
-				("tor_onion_oauth_listing",tor.clone(),RedditLane::Tor.api_origin().base,"/r/all/hot.json?limit=3&raw_json=1"),
-				("tor_onion_www_listing",tor.clone(),RedditLane::Tor.auth_origin().base,"/r/all/hot.json?limit=3&raw_json=1"),
-				("tor_onion_www_comments",tor.clone(),RedditLane::Tor.auth_origin().base,"/r/codex%2Fcomments/1xaomu1.json?raw_json=1"),
-				("tor_onion_oauth_comments",tor.clone(),RedditLane::Tor.api_origin().base,"/r/codex%2Fcomments/1xaomu1.json?raw_json=1"),
-			] {
-				let route=if name.starts_with("direct_"){format!("direct:{origin}")}else{format!("tor:{origin}")};
-				if rate_limited.contains(&route) {println!("TOR_BLOCK_SKIP minted={} route={name} reason=upstream_quota",session.lane.label());continue;}
-				let mut request=client.get(format!("{origin}{path}"));
-				for(k,v)in &session.headers_map {request=request.header(k,v);}
-				let started=Instant::now();
-				let result=timeout(Duration::from_secs(25),async {
-					let response=request.send().await.map_err(|_|"send")?;
-					let status=response.status().as_u16();
-					let headers_ms=started.elapsed().as_millis();
-					let headers=response.headers();
-					let retry=headers.get("retry-after").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);
-					let quota=headers.contains_key("x-ratelimit-remaining")||headers.contains_key("x-ratelimit-reset");
-					let bytes=response.bytes().await.map_err(|_|"body")?;
-					let value=serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
-					let shape=value["kind"]=="Listing"||value.as_array().is_some_and(|a|a.len()==2&&a[0]["kind"]=="Listing"&&a[1]["kind"]=="Listing");
-					let text=String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-					let network_block=text.contains("blocked by network security")||text.contains("blocked due to a network policy");
-					let login_required=text.contains("log in or create an account")||text.contains("log in to your reddit account");
-					println!("TOR_BLOCK_API minted={} route={name} status={status} headers_ms={headers_ms} total_ms={} body_bytes={} valid_listing={shape} network_block={network_block} login_required={login_required} retry_after_seconds={retry} quota_headers={quota}",session.lane.label(),started.elapsed().as_millis(),bytes.len());
-					Ok::<_,&str>(status==429 || status==403&&quota)
-				}).await;
-				match result {Ok(Ok(true))=>{rate_limited.insert(route);},Ok(Ok(false))=>{},_=>println!("TOR_BLOCK_API minted={} route={name} network_failed=true elapsed_ms={}",session.lane.label(),started.elapsed().as_millis())}
-			}
+		for(name,origin,path,authenticated)in [
+			("browser_home",www,"/",false),
+			("browser_json_listing",www,"/r/all/hot.json?limit=3&raw_json=1",false),
+			("browser_json_comments",www,"/r/codex/comments/1xaomu1.json?raw_json=1",false),
+			("app_listing_no_suffix",api,"/r/all/hot?limit=3&raw_json=1",true),
+			("app_comments_no_suffix",api,"/r/codex/comments/1xaomu1?raw_json=1",true),
+			("app_encoded_comments_no_suffix",api,"/r/codex%2Fcomments/1xaomu1?raw_json=1",true),
+			("app_json_listing_control",api,"/r/all/hot.json?limit=3&raw_json=1",true),
+		] {
+			if rate_limited.contains(&origin) {println!("TOR_ROUTE_SKIP route={name} reason=upstream_quota");continue;}
+			let mut request=client.get(format!("{origin}{path}"));
+			if authenticated {for(k,v)in &session.headers_map {request=request.header(k,v);}}
+			let started=Instant::now();
+			let result=timeout(Duration::from_secs(25),async {
+				let response=request.send().await.map_err(|_|"send")?;
+				let status=response.status().as_u16();
+				let headers_ms=started.elapsed().as_millis();
+				let headers=response.headers();
+				let quota=headers.contains_key("x-ratelimit-remaining")||headers.contains_key("x-ratelimit-reset");
+				let redirect=headers.contains_key("location");
+				let bytes=response.bytes().await.map_err(|_|"body")?;
+				let value=serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
+				let shape=value["kind"]=="Listing"||value.as_array().is_some_and(|a|a.len()==2&&a[0]["kind"]=="Listing"&&a[1]["kind"]=="Listing");
+				let text=String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+				let network_block=text.contains("blocked by network security")||text.contains("blocked due to a network policy");
+				let reddit_html=text.contains("<html")&&text.contains("reddit");
+				println!("TOR_ROUTE_API route={name} status={status} headers_ms={headers_ms} total_ms={} body_bytes={} valid_listing={shape} reddit_html={reddit_html} network_block={network_block} redirect={redirect} quota_headers={quota}",started.elapsed().as_millis(),bytes.len());
+				Ok::<_,&str>(status==429 || status==403&&quota)
+			}).await;
+			match result {Ok(Ok(true))=>{rate_limited.insert(origin);},Ok(Ok(false))=>{},_=>println!("TOR_ROUTE_API route={name} network_failed=true elapsed_ms={}",started.elapsed().as_millis())}
 		}
-		assert!(!sessions.is_empty(),"anonymous authentication must succeed for this comparison");
 	}
 
 	use super::*;
