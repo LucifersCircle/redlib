@@ -88,6 +88,19 @@ fn shuffled_oauth_profiles() -> [OauthTransportProfile; OAUTH_BROWSER_PROFILES.l
 }
 
 impl Oauth {
+	#[cfg(test)]
+	pub(crate) fn request_fixture(lane: RedditLane, client: Arc<wreq::Client>) -> Self {
+		Self {
+			headers_map: HashMap::from([("Authorization".into(), "Bearer local-test-fixture".into())]),
+			http_client: client,
+			refresh_at: Instant::now() + Duration::from_secs(3600),
+			backend: MobileSpoofAuth::new(lane),
+			transport_profile: OauthTransportProfile::Chrome145Android,
+			generation: 0,
+			lane,
+		}
+	}
+
 	/// Create a new OAuth client
 	pub(crate) async fn new(lane: RedditLane) -> Self {
 		let mut failure_cycles = 0_u32;
