@@ -862,8 +862,8 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "requires live Reddit MobileSpoof OAuth access"]
 	async fn test_mobile_spoof_browser_transport_matrix() {
-		use wreq::{redirect::Policy, EmulationFactory};
-		use wreq_util::{EmulationOS, EmulationOption};
+		use wreq::redirect::Policy;
+		use wreq_util::{Emulation, Platform};
 
 		let identity = MobileSpoofAuth::new(RedditLane::Direct);
 		let mut failures = Vec::new();
@@ -871,23 +871,18 @@ mod tests {
 
 		for profile in OAUTH_BROWSER_PROFILES {
 			let label = profile.label();
-			let emulation = EmulationOption::builder()
-				.emulation(profile.emulation())
-				.emulation_os(EmulationOS::Android)
-				.skip_headers(false)
-				.build()
-				.emulation();
+			let emulation = Emulation::builder().profile(profile.emulation()).platform(Platform::Android).build();
 			let mut client_builder = wreq::Client::builder().emulation(emulation).redirect(Policy::none());
 			if let Some(proxy_url) = &proxy_url {
 				client_builder = client_builder.proxy(wreq::Proxy::all(proxy_url).unwrap_or_else(|error| panic!("invalid HTTPS proxy: {error}")));
 			}
 			if let Ok(cert_path) = std::env::var("SSL_CERT_FILE") {
 				let certs = std::fs::read(&cert_path).unwrap_or_else(|error| panic!("could not read {cert_path}: {error}"));
-				let cert_store = wreq::tls::CertStore::builder()
+				let cert_store = wreq::tls::trust::CertStore::builder()
 					.add_stack_pem_certs(certs)
 					.build()
 					.unwrap_or_else(|error| panic!("could not build test certificate store: {error}"));
-				client_builder = client_builder.cert_store(cert_store);
+				client_builder = client_builder.tls_cert_store(cert_store);
 			}
 			let client = client_builder.build().unwrap_or_else(|error| panic!("could not build {label}: {error}"));
 			let mut backend = identity.clone();
