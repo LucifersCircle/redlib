@@ -841,14 +841,13 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-
 	#[tokio::test(flavor="multi_thread")]
 	#[ignore="isolated current Tor policy and latency diagnosis"]
-	async fn live_tor_origin_policy() {
+	async fn live_tor_policy_latency() {
 		let _=pretty_env_logger::try_init();
 		let lane=RedditLane::Tor;
 		let mut authenticated=0;
-		for (identity,profile) in [OauthTransportProfile::Chrome145Android].into_iter().enumerate() {
+		for (identity,profile) in [OauthTransportProfile::Firefox143Android,OauthTransportProfile::Chrome145Android].into_iter().enumerate() {
 			let client=client_for_oauth_profile(lane,profile).unwrap();
 			let mut backend=MobileSpoofAuth::new(lane);
 			let started=Instant::now();
@@ -858,15 +857,13 @@ mod tests {
 			};
 			authenticated+=1;
 			println!("TOR_POLICY_AUTH identity={identity} ok=true elapsed_ms={}",started.elapsed().as_millis());
-			for (endpoint,origin,path) in [
-				("onion_listing", lane.api_origin().base, "/r/all/hot.json?limit=5&raw_json=1"),
-				("exit_oauth_listing", "https://oauth.reddit.com", "/r/all/hot.json?limit=5&raw_json=1"),
-				("exit_www_listing", "https://www.reddit.com", "/r/all/hot.json?limit=5&raw_json=1"),
-				("exit_oauth_comments", "https://oauth.reddit.com", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
-				("exit_www_comments", "https://www.reddit.com", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
-				("exit_api_listing", "https://api.reddit.com", "/r/all/hot.json?limit=5&raw_json=1"),
+			for (endpoint,path) in [
+				("listing", "/r/all/hot.json?limit=5&raw_json=1"),
+				("comments", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
+				("community_search", "/subreddits/search.json?q=codex&limit=1&raw_json=1"),
+				("listing_repeat", "/r/all/hot.json?limit=5&raw_json=1"),
 			] {
-				let mut req=client.get(format!("{origin}{path}"));
+				let mut req=client.get(format!("{}{path}",lane.api_origin().base));
 				for (k,v) in &oauth.headers_map {req=req.header(k,v);}
 				let started=Instant::now();
 				let result=timeout(Duration::from_secs(30),async {
@@ -881,6 +878,23 @@ mod tests {
 				}).await;
 				if !matches!(result,Ok(Ok(()))) { println!("TOR_POLICY_API identity={identity} endpoint={endpoint} network_failed=true total_ms={}",started.elapsed().as_millis()); }
 			}
+		}
+
+		let lane=RedditLane::Direct;
+		let profile=OauthTransportProfile::Chrome145Android;
+		let client=client_for_oauth_profile(lane,profile).unwrap();
+		let mut backend=MobileSpoofAuth::new(lane);
+		let started=Instant::now();
+		match Oauth::authenticate_with_backend(&mut backend,client.clone(),profile).await {
+			Ok(oauth)=>{
+				println!("DIRECT_POLICY_AUTH ok=true elapsed_ms={}",started.elapsed().as_millis());
+				let mut req=client.get(format!("{}/r/all/hot.json?limit=5&raw_json=1",lane.api_origin().base));
+				for(k,v) in &oauth.headers_map {req=req.header(k,v);}
+				let result=timeout(Duration::from_secs(15),req.send()).await;
+				if let Ok(Ok(resp))=result { println!("DIRECT_POLICY_API status={}",resp.status().as_u16()); }
+				else { println!("DIRECT_POLICY_API network_failed=true"); }
+			},
+			Err(error)=>println!("DIRECT_POLICY_AUTH ok=false class={} elapsed_ms={}",error.failure_class(),started.elapsed().as_millis()),
 		}
 		assert!(authenticated>0,"at least one anonymous session must be created for this diagnosis");
 	}
@@ -906,8 +920,8 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "requires live Reddit MobileSpoof OAuth access"]
 	async fn test_mobile_spoof_browser_transport_matrix() {
-		use wreq::{redirect::Policy, EmulationFactory};
-		use wreq_util::{EmulationOS, EmulationOption};
+		use wreq::redirect::Policy;
+		use wreq_util::{Emulation, Platform};
 
 		let identity = MobileSpoofAuth::new(RedditLane::Direct);
 		let mut failures = Vec::new();
@@ -915,23 +929,18 @@ mod tests {
 
 		for profile in OAUTH_BROWSER_PROFILES {
 			let label = profile.label();
-			let emulation = EmulationOption::builder()
-				.emulation(profile.emulation())
-				.emulation_os(EmulationOS::Android)
-				.skip_headers(false)
-				.build()
-				.emulation();
+			let emulation = Emulation::builder().profile(profile.emulation()).platform(Platform::Android).build();
 			let mut client_builder = wreq::Client::builder().emulation(emulation).redirect(Policy::none());
 			if let Some(proxy_url) = &proxy_url {
 				client_builder = client_builder.proxy(wreq::Proxy::all(proxy_url).unwrap_or_else(|error| panic!("invalid HTTPS proxy: {error}")));
 			}
 			if let Ok(cert_path) = std::env::var("SSL_CERT_FILE") {
 				let certs = std::fs::read(&cert_path).unwrap_or_else(|error| panic!("could not read {cert_path}: {error}"));
-				let cert_store = wreq::tls::CertStore::builder()
+				let cert_store = wreq::tls::trust::CertStore::builder()
 					.add_stack_pem_certs(certs)
 					.build()
 					.unwrap_or_else(|error| panic!("could not build test certificate store: {error}"));
-				client_builder = client_builder.cert_store(cert_store);
+				client_builder = client_builder.tls_cert_store(cert_store);
 			}
 			let client = client_builder.build().unwrap_or_else(|error| panic!("could not build {label}: {error}"));
 			let mut backend = identity.clone();

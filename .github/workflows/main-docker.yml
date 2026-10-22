@@ -42,4 +42,4 @@ jobs:
           tail -8 "$RUNNER_TEMP/comments-tor.log"
           exit 1
       - name: Measure current Tor policy and latency
-        run: cargo test --locked --lib live_tor_origin_policy -- --ignored --nocapture
+        run: cargo test --locked --lib live_tor_policy_latency -- --ignored --nocapture
