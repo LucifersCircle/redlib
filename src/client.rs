@@ -1649,7 +1649,7 @@ fn select_api_lane(primary: RedditLane, direct: LaneAvailability, tor: LaneAvail
 	// local reserve keeps the existing bounded spillover policy.
 	if preferred == LaneAvailability::Ready
 		|| preferred == LaneAvailability::UpstreamQuotaCooldown
-		|| primary == RedditLane::Direct && matches!(preferred, LaneAvailability::LocalQuotaPause | LaneAvailability::TransportCooldown)
+		|| primary == RedditLane::Direct && preferred == LaneAvailability::LocalQuotaPause
 	{
 		return primary;
 	}
@@ -3103,12 +3103,13 @@ async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, S
 	let now = Instant::now();
 	let tor_ready = tor_fallback_ready(&path);
 	let direct_edge_active = direct_edge_fallback_active(now, &path);
+	let direct = lane_availability(RedditLane::Direct, now, &path);
 	let direct_refreshing = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
 	let quota_spillover_valid = match retry_reason {
 		TorRetryReason::QuotaReserve(ticket) if !direct_refreshing => direct_quota_spillover_valid(ticket, now),
 		_ => false,
 	};
-	if !should_retry_on_tor(lane, retry_reason, tor_ready, direct_edge_active, direct_refreshing, quota_spillover_valid) {
+	if !should_retry_on_tor(lane, retry_reason, tor_ready, direct_edge_active, direct, direct_refreshing, quota_spillover_valid) {
 		return result;
 	}
 
@@ -3116,6 +3117,11 @@ async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, S
 		TorRetryReason::EdgeRejected => {
 			TOR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 			info!("Retrying edge-rejected Reddit API request on the Tor lane: endpoint={}", endpoint_class(&path));
+			json_uncached_on_lane(path, quarantine, RedditLane::Tor).await.0
+		}
+		TorRetryReason::TransportUnavailable => {
+			TOR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+			info!("Using ready Tor after direct entered a connection cooldown: endpoint={}", endpoint_class(&path));
 			json_uncached_on_lane(path, quarantine, RedditLane::Tor).await.0
 		}
 		TorRetryReason::QuotaReserve(ticket) => {
@@ -3147,7 +3153,7 @@ async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, S
 				}
 			}
 		}
-		TorRetryReason::None | TorRetryReason::TransportUnavailable | TorRetryReason::SessionUnavailable => result,
+		TorRetryReason::None | TorRetryReason::SessionUnavailable => result,
 	}
 }
 
@@ -3236,14 +3242,23 @@ fn should_use_direct_standby(primary: RedditLane, lane: RedditLane, reason: TorR
 		)
 }
 
-fn should_retry_on_tor(lane: RedditLane, reason: TorRetryReason, tor_ready: bool, direct_edge_active: bool, direct_refreshing: bool, quota_spillover_valid: bool) -> bool {
+fn should_retry_on_tor(
+	lane: RedditLane,
+	reason: TorRetryReason,
+	tor_ready: bool,
+	direct_edge_active: bool,
+	direct: LaneAvailability,
+	direct_refreshing: bool,
+	quota_spillover_valid: bool,
+) -> bool {
 	if lane != RedditLane::Direct || !tor_ready {
 		return false;
 	}
 	match reason {
 		TorRetryReason::EdgeRejected => direct_edge_active,
+		TorRetryReason::TransportUnavailable => direct == LaneAvailability::TransportCooldown,
 		TorRetryReason::QuotaReserve(_) => !direct_refreshing && quota_spillover_valid,
-		TorRetryReason::None | TorRetryReason::TransportUnavailable | TorRetryReason::SessionUnavailable => false,
+		TorRetryReason::None | TorRetryReason::SessionUnavailable => false,
 	}
 }
 
@@ -3313,6 +3328,18 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 			Ok(result) => result,
 			Err(_) => return (Err("Reddit API request timed out after bounded server-side recovery".to_string()), TorRetryReason::None),
 		};
+		// A request can open direct's failure cooldown after initial routing.
+		// Yield before sleeping so the caller can hand it to an already-ready Tor
+		// lane. The caller rechecks availability and never routes recursively.
+		let now = Instant::now();
+		if lane == RedditLane::Direct
+			&& (matches!(recovery_reason, LaneRecoveryReason::TransportFailure | LaneRecoveryReason::UpstreamCooldown(_))
+				|| tor_retry_reason == TorRetryReason::TransportUnavailable)
+			&& lane_availability(RedditLane::Direct, now, &path) == LaneAvailability::TransportCooldown
+			&& lane_availability(RedditLane::Tor, now, &path) == LaneAvailability::Ready
+		{
+			return (result, TorRetryReason::TransportUnavailable);
+		}
 		if lane == RedditLane::Tor
 			&& configured_primary_lane() == RedditLane::Tor
 			&& (matches!(recovery_reason, LaneRecoveryReason::TransportFailure) || tor_retry_reason == TorRetryReason::TransportUnavailable)
@@ -4087,6 +4114,74 @@ mod tests {
 	}
 
 	#[test]
+	fn test_direct_transport_cooldown_uses_ready_tor() {
+		let now = Instant::now();
+		let mut direct = UpstreamGuard::new(RedditLane::Direct);
+		let mut tor = UpstreamGuard::new(RedditLane::Tor);
+		direct.install_oauth_generation(7, true);
+		tor.install_oauth_generation(7, true);
+		for _ in 0..FAILURE_THRESHOLD {
+			direct.record_failure(now);
+		}
+		let direct_state = direct.routing_availability(now, 7, 0);
+		let tor_state = tor.routing_availability(now, 7, 0);
+		assert_eq!(direct_state, LaneAvailability::TransportCooldown);
+		assert_eq!(tor_state, LaneAvailability::Ready);
+		assert_eq!(select_api_lane(RedditLane::Direct, direct_state, tor_state), RedditLane::Tor);
+		assert_eq!(select_api_lane(RedditLane::Direct, LaneAvailability::Ready, tor_state), RedditLane::Direct);
+		for tor_state in [
+			LaneAvailability::Unavailable,
+			LaneAvailability::TransportCooldown,
+			LaneAvailability::LocalQuotaPause,
+			LaneAvailability::UpstreamQuotaCooldown,
+		] {
+			assert_eq!(select_api_lane(RedditLane::Direct, direct_state, tor_state), RedditLane::Direct);
+		}
+		let recovered_at = now + Duration::from_secs(60);
+		assert_eq!(direct.routing_availability(recovered_at, 7, 0), LaneAvailability::Ready);
+		assert_eq!(
+			select_api_lane(RedditLane::Direct, direct.routing_availability(recovered_at, 7, 0), tor_state),
+			RedditLane::Direct
+		);
+		direct.block_for_rate_limit(now, Duration::from_secs(30));
+		assert_eq!(
+			select_api_lane(RedditLane::Direct, direct.routing_availability(now, 7, 0), LaneAvailability::Ready),
+			RedditLane::Direct
+		);
+	}
+
+	#[test]
+	fn test_direct_transport_cooldown_handoff_requires_ready_tor_and_active_cooldown() {
+		for direct in [
+			LaneAvailability::Ready,
+			LaneAvailability::Unavailable,
+			LaneAvailability::TransportCooldown,
+			LaneAvailability::LocalQuotaPause,
+			LaneAvailability::UpstreamQuotaCooldown,
+		] {
+			for tor_ready in [false, true] {
+				for lane in [RedditLane::Direct, RedditLane::Tor] {
+					assert_eq!(
+						should_retry_on_tor(lane, TorRetryReason::TransportUnavailable, tor_ready, false, direct, false, false),
+						lane == RedditLane::Direct && tor_ready && direct == LaneAvailability::TransportCooldown
+					);
+				}
+			}
+		}
+		for reason in [TorRetryReason::None, TorRetryReason::SessionUnavailable] {
+			assert!(!should_retry_on_tor(
+				RedditLane::Direct,
+				reason,
+				true,
+				false,
+				LaneAvailability::TransportCooldown,
+				false,
+				false
+			));
+		}
+	}
+
+	#[test]
 	fn test_tor_first_routing_respects_availability_and_upstream_quota() {
 		use LaneAvailability::*;
 		for (direct, tor, expected) in [
@@ -4104,7 +4199,7 @@ mod tests {
 		}
 		assert_eq!(select_api_lane(RedditLane::Direct, LocalQuotaPause, Ready), RedditLane::Direct);
 		assert_eq!(select_api_lane(RedditLane::Direct, UpstreamQuotaCooldown, Ready), RedditLane::Direct);
-		assert_eq!(select_api_lane(RedditLane::Direct, TransportCooldown, Ready), RedditLane::Direct);
+		assert_eq!(select_api_lane(RedditLane::Direct, TransportCooldown, Ready), RedditLane::Tor);
 	}
 
 	#[test]
@@ -6265,16 +6360,41 @@ mod tests {
 
 	#[test]
 	fn test_tor_retry_policy_distinguishes_edge_and_quota_spillover() {
+		use LaneAvailability::Ready;
 		let ticket = QuotaSpilloverTicket { generation: 7, quota_epoch: 2 };
-		assert!(should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, true, true, false, false,));
-		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, true, false, false, false,));
-		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, false, true, false, false,));
-		assert!(!should_retry_on_tor(RedditLane::Tor, TorRetryReason::EdgeRejected, true, true, false, false,));
-		assert!(should_retry_on_tor(RedditLane::Direct, TorRetryReason::QuotaReserve(ticket), true, false, false, true,));
-		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::QuotaReserve(ticket), true, false, true, true,));
-		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::QuotaReserve(ticket), false, false, false, true,));
-		assert!(!should_retry_on_tor(RedditLane::Tor, TorRetryReason::QuotaReserve(ticket), true, false, false, true,));
-		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::None, true, true, false, true,));
+		assert!(should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, true, true, Ready, false, false,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, true, false, Ready, false, false,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::EdgeRejected, false, true, Ready, false, false,));
+		assert!(!should_retry_on_tor(RedditLane::Tor, TorRetryReason::EdgeRejected, true, true, Ready, false, false,));
+		assert!(should_retry_on_tor(
+			RedditLane::Direct,
+			TorRetryReason::QuotaReserve(ticket),
+			true,
+			false,
+			Ready,
+			false,
+			true,
+		));
+		assert!(!should_retry_on_tor(
+			RedditLane::Direct,
+			TorRetryReason::QuotaReserve(ticket),
+			true,
+			false,
+			Ready,
+			true,
+			true,
+		));
+		assert!(!should_retry_on_tor(
+			RedditLane::Direct,
+			TorRetryReason::QuotaReserve(ticket),
+			false,
+			false,
+			Ready,
+			false,
+			true,
+		));
+		assert!(!should_retry_on_tor(RedditLane::Tor, TorRetryReason::QuotaReserve(ticket), true, false, Ready, false, true,));
+		assert!(!should_retry_on_tor(RedditLane::Direct, TorRetryReason::None, true, true, Ready, false, true,));
 	}
 
 	#[test]
