@@ -844,11 +844,11 @@ mod tests {
 
 	#[tokio::test(flavor="multi_thread")]
 	#[ignore="isolated current Tor policy and latency diagnosis"]
-	async fn live_tor_policy_latency() {
+	async fn live_tor_origin_policy() {
 		let _=pretty_env_logger::try_init();
 		let lane=RedditLane::Tor;
 		let mut authenticated=0;
-		for (identity,profile) in [OauthTransportProfile::Firefox143Android,OauthTransportProfile::Chrome145Android].into_iter().enumerate() {
+		for (identity,profile) in [OauthTransportProfile::Chrome145Android].into_iter().enumerate() {
 			let client=client_for_oauth_profile(lane,profile).unwrap();
 			let mut backend=MobileSpoofAuth::new(lane);
 			let started=Instant::now();
@@ -858,13 +858,15 @@ mod tests {
 			};
 			authenticated+=1;
 			println!("TOR_POLICY_AUTH identity={identity} ok=true elapsed_ms={}",started.elapsed().as_millis());
-			for (endpoint,path) in [
-				("listing", "/r/all/hot.json?limit=5&raw_json=1"),
-				("comments", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
-				("community_search", "/subreddits/search.json?q=codex&limit=1&raw_json=1"),
-				("listing_repeat", "/r/all/hot.json?limit=5&raw_json=1"),
+			for (endpoint,origin,path) in [
+				("onion_listing", lane.api_origin().base, "/r/all/hot.json?limit=5&raw_json=1"),
+				("exit_oauth_listing", "https://oauth.reddit.com", "/r/all/hot.json?limit=5&raw_json=1"),
+				("exit_www_listing", "https://www.reddit.com", "/r/all/hot.json?limit=5&raw_json=1"),
+				("exit_oauth_comments", "https://oauth.reddit.com", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
+				("exit_www_comments", "https://www.reddit.com", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
+				("exit_api_listing", "https://api.reddit.com", "/r/all/hot.json?limit=5&raw_json=1"),
 			] {
-				let mut req=client.get(format!("{}{path}",lane.api_origin().base));
+				let mut req=client.get(format!("{origin}{path}"));
 				for (k,v) in &oauth.headers_map {req=req.header(k,v);}
 				let started=Instant::now();
 				let result=timeout(Duration::from_secs(30),async {
