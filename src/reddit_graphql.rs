@@ -14,6 +14,7 @@ pub(crate) struct CommentsRequest {
 	sort: String,
 	limit: u16,
 	depth: u8,
+	context: u16,
 	after: Option<String>,
 }
 
@@ -102,6 +103,7 @@ impl CommentsRequest {
 			sort,
 			limit: pairs.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200).min(500),
 			depth: pairs.get("depth").and_then(|v| v.parse().ok()).unwrap_or(10).min(10),
+			context: pairs.get("context").and_then(|v| v.parse().ok()).unwrap_or(0),
 			after: pairs.get("after").filter(|v| !v.is_empty() && v.len() <= 8192 && !v.chars().any(char::is_control)).cloned(),
 		})
 	}
@@ -115,7 +117,7 @@ impl CommentsRequest {
 	pub(crate) fn comments_payload(&self) -> Value {
 		let mut variables = json!({"id":self.post_id, "sortType":self.sort, "count":self.limit.max(1), "maxDepth":self.depth, "includePremiumAvatarTreatment":false,"includeConsistencyToken":false});
 		if let Some(id) = &self.comment_id {
-			variables["focusedCommentContext"] = json!({"commentId":format!("t1_{id}"),"isFocusedThreadOnly":true});
+			variables["focusedCommentContext"] = json!({"commentId":format!("t1_{id}"),"isFocusedThreadOnly":self.context == 0});
 		}
 		if let Some(after) = &self.after {
 			variables["after"] = json!(after);
@@ -504,6 +506,9 @@ mod tests {
 		assert_eq!(payload["variables"]["sortType"], "NEW");
 		assert_eq!(payload["variables"]["after"], "a+b");
 		assert_eq!(payload["variables"]["count"], 300);
+		assert_eq!(payload["variables"]["focusedCommentContext"]["isFocusedThreadOnly"], true);
+		let context = CommentsRequest::from_path("/comments/abc/_/reply.json?context=3").unwrap();
+		assert_eq!(context.comments_payload()["variables"]["focusedCommentContext"]["isFocusedThreadOnly"], false);
 		assert!(CommentsRequest::from_path("/r/gaming/hot.json").is_none());
 		assert!(CommentsRequest::from_path("/comments/invalid-id.json").is_none());
 	}

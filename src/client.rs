@@ -2632,8 +2632,7 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	}
 }
 
-/// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
-/// 3xx codes Reddit returns and will automatically redirect.
+/// A REST listing or the final response of an anonymous comments read.
 enum RedditReadResponse {
 	Rest(WreqResponse),
 	Comments {
@@ -3750,27 +3749,32 @@ async fn json_uncached_on_lane_with_options(
 						match serde_json::from_reader(body.reader()) {
 							Ok(value) => {
 								let json: Value = value;
-								let json = if status.is_success() {
-									if let Some((post, request)) = graphql {
-										let post = post.ok_or_else(|| "Reddit comments API returned incomplete metadata".to_string())?;
-										match request.finish(post, &json) {
-											Ok(json) => json,
-											Err(error) => {
-                                            if error.kind == GraphqlErrorKind::Invalid {
-                                                record_upstream_failure(lane, "comments_schema", Some(status_code), &path, request_generation);
-                                                if quota_spillover_ticket.is_none() { recovery_reason = LaneRecoveryReason::TransportFailure; }
-                                            }
-
-												if error.kind == GraphqlErrorKind::Session { retry_reason = TorRetryReason::SessionUnavailable; }
-												if error.kind == GraphqlErrorKind::RateLimit {
-													let (delay, current) = block_for_rate_limit(lane, request_generation, retry_after.or(Some("30")), reset);
-													if current { recovery_reason = LaneRecoveryReason::QuotaCooldown(delay); }
+								let json = if let Some((post, request)) = graphql {
+									match request.finish(post.unwrap_or(Value::Null), &json) {
+										Ok(json) => json,
+										Err(error) => {
+											if error.kind == GraphqlErrorKind::Invalid {
+												record_upstream_failure(lane, "comments_schema", Some(status_code), &path, request_generation);
+												if quota_spillover_ticket.is_none() {
+													recovery_reason = LaneRecoveryReason::TransportFailure;
 												}
-												return Err(error.message);
 											}
+											if error.kind == GraphqlErrorKind::Session {
+												start_rejected_session_refresh(lane, request_generation);
+												retry_reason = TorRetryReason::SessionUnavailable;
+											}
+											if error.kind == GraphqlErrorKind::RateLimit {
+												let (delay, current) = block_for_rate_limit(lane, request_generation, retry_after.or(Some("30")), reset);
+												if current {
+													recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
+												}
+											}
+											return Err(error.message);
 										}
-									} else { json }
-								} else { json };
+									}
+								} else {
+									json
+								};
 
 								// If user is suspended
 								if let Some(data) = json.get("data") {
@@ -3859,7 +3863,10 @@ async fn json_uncached_on_lane_with_options(
 				Err(message)
 			}
 			Err(ApiRequestError::Terminal { message, session_unavailable }) => {
-				if session_unavailable { retry_reason = TorRetryReason::SessionUnavailable; }
+				if session_unavailable {
+					start_rejected_session_refresh(lane, request_generation);
+					retry_reason = TorRetryReason::SessionUnavailable;
+				}
 				Err(message)
 			}
 			Err(ApiRequestError::Upstream(error)) => {

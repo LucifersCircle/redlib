@@ -1189,6 +1189,7 @@ mod anonymous_graphql_page_diagnostic {
             ("reported",base.to_string(),String::new(),None),
             ("new",base.to_string(),"sort=new&limit=25".to_string(),None),
             ("focused","/r/gaming/comments/1xcfm9l/_/19rhdq1tj77z9/".to_string(),"context=3&limit=25".to_string(),Some("19rhdq1tj77z9")),
+            ("nested","/r/gaming/comments/1xcfm9l/_/19rhfaa7drbc1/".to_string(),"context=9999&limit=25".to_string(),Some("19rhfaa7drbc1")),
         ] {
             let value=crate::client::json(format!("{path}.json?{query}"),false).await.expect("new anonymous comments JSON");
             assert_eq!(value[0]["data"]["children"][0]["data"]["id"],"1xcfm9l");assert!(count(&value[1])>0,"{name}");
@@ -1197,6 +1198,7 @@ mod anonymous_graphql_page_diagnostic {
             let mut params=route_recognizer::Params::new();params.insert("sub".into(),"gaming".into());params.insert("id".into(),"1xcfm9l".into());if let Some(id)=comment_id{params.insert("comment_id".into(),id.into());}req.set_params(params);
             let response=crate::post::item(req).await.unwrap();let status=response.status();let bytes=hyper::body::to_bytes(response.into_body()).await.unwrap();let body=String::from_utf8(bytes.to_vec()).unwrap();
             assert_eq!(status,200,"{name}");assert!(body.contains("Nintendo Switch 2"));assert!(body.contains("class=\"comment\""));assert!(!body.contains("Still trying to load your page"));if let Some(id)=comment_id{assert!(body.contains(&format!("id=\"{id}\"")));}
+            if name=="nested" {assert!(body.contains("id=\"19rhdq1tj77z9\""),"ancestor context must be present");}
             println!("ANON_GQL_PAGE lane={} variant={name} status=200 api_comments={} rendered_comments={} next_link={}",lane.label(),count(&value[1]),body.matches("class=\"comment\"").count(),body.contains("More comments &rarr;"));
         }
         let cursor=cursor.expect("top-level pagination cursor");
