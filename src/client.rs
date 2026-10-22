@@ -2650,7 +2650,8 @@ async fn reddit_get(
 
 		attempt.mark_sent();
 		record_api_send(&path, redirect_count > 0, lane);
-		let response = request_once(&Method::GET, path.clone(), quarantine, origin.base, origin.host, oauth_client.clone(), lane)
+		let transport_path = api_transport_path(&path, lane);
+		let response = request_once(&Method::GET, transport_path.into_owned(), quarantine, origin.base, origin.host, oauth_client.clone(), lane)
 			.await
 			.map_err(ApiRequestError::Upstream)?;
 		if !response.status().is_redirection() {
@@ -2792,6 +2793,23 @@ fn request_once(
 		}
 	}
 	.boxed()
+}
+
+/// The Tor OAuth API returns JSON without a `.json` suffix, while its edge
+/// rejects the suffixed route. Keep logical paths intact for caches, admission,
+/// redirects and endpoint classification; change only the outgoing API GET.
+fn api_transport_path(path: &str, lane: RedditLane) -> Cow<'_, str> {
+	if lane != RedditLane::Tor {
+		return Cow::Borrowed(path);
+	}
+	let (base, query) = path.split_once('?').map_or((path, None), |(base, query)| (base, Some(query)));
+	let Some(base) = base.strip_suffix(".json") else {
+		return Cow::Borrowed(path);
+	};
+	Cow::Owned(match query {
+		Some(query) => format!("{base}?{query}"),
+		None => base.to_string(),
+	})
 }
 
 /// Reddit currently rejects literal anonymous comments routes while accepting
@@ -3794,6 +3812,43 @@ mod tests {
 	use super::*;
 	use std::sync::atomic::AtomicUsize;
 	use {crate::config::get_setting, sealed_test::prelude::*};
+
+	#[test]
+	fn test_tor_api_transport_path_preserves_logical_routes_and_queries() {
+		for (logical, wire) in [
+			("/r/all/hot.json?sort=hot&t=&after=t3_1xay0pv", "/r/all/hot?sort=hot&t=&after=t3_1xay0pv"),
+			("/search.json?q=example.json&sort=new", "/search?q=example.json&sort=new"),
+			("/subreddits/search.json?q=rust", "/subreddits/search?q=rust"),
+			("/user/example/about.json", "/user/example/about"),
+			("/r/example/wiki/index.json?", "/r/example/wiki/index?"),
+			("/r/example.json/hot.json", "/r/example.json/hot"),
+			("/.json?raw_json=1", "/?raw_json=1"),
+		] {
+			assert_eq!(api_transport_path(logical, RedditLane::Tor), wire);
+			assert_eq!(api_transport_path(logical, RedditLane::Direct), logical);
+			assert_eq!(api_transport_path(wire, RedditLane::Tor), wire);
+		}
+		for path in [
+			"/api/morechildren?children=a,b",
+			"/r/all/hot?after=t3_abc.json",
+			"/r/example.json/hot",
+			"/r/example/about.json/",
+			"/r/example/.rss",
+		] {
+			assert!(matches!(api_transport_path(path, RedditLane::Tor), Cow::Borrowed(_)), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_tor_api_transport_path_keeps_comments_encoding_and_context() {
+		for (logical, wire) in [
+			("/r/codex/comments/1xaomu1.json?sort=new&limit=500", "/r/codex%2Fcomments/1xaomu1?sort=new&limit=500"),
+			("/comments/1xaomu1/_/phvobrm.json?context=3", "/comments%2F1xaomu1/_/phvobrm?context=3"),
+		] {
+			assert_eq!(comments_transport_path(&api_transport_path(logical, RedditLane::Tor)), wire);
+			assert_eq!(comments_transport_path(&api_transport_path(logical, RedditLane::Direct)), comments_transport_path(logical));
+		}
+	}
 
 	#[test]
 	fn test_comments_transport_path_scoped_and_short_threads() {
