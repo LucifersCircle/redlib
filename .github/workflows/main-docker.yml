@@ -26,7 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Tor and build dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends tor cmake pkg-config libclang-dev
+          sudo timeout 60s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update || true
+          sudo timeout 120s apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends tor cmake pkg-config libclang-dev
       - name: Start isolated diagnostic Tor
         run: |
           mkdir -p "$RUNNER_TEMP/comments-tor"
