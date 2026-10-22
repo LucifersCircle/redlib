@@ -38,8 +38,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Cache Rust build
+        id: rust_cache
         uses: Swatinem/rust-cache@v2
       - name: Install native build dependencies
+        if: steps.rust_cache.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
