@@ -114,6 +114,7 @@ jobs:
           cargo test --locked --lib test_expired_half_open_probe_cannot_block_or_recover_circuit
           cargo test --locked --lib test_api_path_normalization_is_conservative_and_deterministic
           cargo test --locked --lib test_comments_transport_path_
+          cargo test --locked --lib test_tor_api_transport_path_
           cargo test --locked --lib test_comments_logical_path_
           cargo test --locked --lib test_upstream_comments_redirect_
           cargo test --locked --lib test_reddit_dns_name_

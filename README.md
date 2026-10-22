@@ -200,6 +200,8 @@ docker logs -f redlib
 
 This fork can keep an independently authenticated Tor lane and use it when Reddit returns the narrow edge-throttle signature that Redlib classifies as `403 + Retry-After + no quota headers`. Direct access remains primary by default, and a half-open probe checks for recovery after cooldown. After bounded local retries, one request may also spill to an already-ready Tor lane when only the direct identity's locally tracked quota reserve is exhausted. That spillover is capped at three seconds, does not create a new identity merely to obtain admission, and never bypasses an explicit upstream rate-limit rejection or cooldown. Media proxy requests remain direct. Reddit share-link resolution follows the selected lane and permits one bounded fallback.
 
+Tor OAuth API GETs omit the `.json` suffix because Reddit's onion edge rejects that suffix even with a valid anonymous token. The OAuth API still returns the full JSON response, including comments and pagination. Comments retain their encoded route separator. This rewrite applies only to outgoing Tor API requests; logical cache keys, query parameters, direct requests, and share-link HEAD requests retain their existing behavior.
+
 The fallback is disabled by default. For the supplied Portainer stack:
 
 1. Deploy [`compose.portainer-tor.yaml`](compose.portainer-tor.yaml). It preserves the external `cloudflare_tunnel` network, adds a private Redlib-to-Tor network, and does not publish the SOCKS or Tor control ports. The supplied sidecar image is version- and digest-pinned for reproducible deployment.
