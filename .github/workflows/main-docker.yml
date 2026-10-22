@@ -1,4 +1,4 @@
-name: Reported Tor comments diagnostic
+name: Anonymous comments API diagnostic
 
 on:
   workflow_dispatch:
@@ -46,4 +46,11 @@ jobs:
           curl --socks5-hostname 127.0.0.1:19050 --max-time 60 --silent --show-error --head --output /dev/null --write-out 'ONION_PREFLIGHT origin=www status=%{http_code} connect_seconds=%{time_connect} total_seconds=%{time_total}\n' https://www.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/ || true
           curl --socks5-hostname 127.0.0.1:19050 --max-time 60 --silent --show-error --head --output /dev/null --write-out 'ONION_PREFLIGHT origin=oauth status=%{http_code} connect_seconds=%{time_connect} total_seconds=%{time_total}\n' https://oauth.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion/ || true
       - name: Compare exact reported comments API route
-        run: cargo test --locked --lib live_reported_tor_comments -- --ignored --nocapture
+        run: cargo test --locked --lib live_anonymous_gql_comments -- --ignored --nocapture
+      - name: Save successful public comments responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anonymous-public-comments-json
+          path: /tmp/reported-gql-*.json
+          if-no-files-found: ignore

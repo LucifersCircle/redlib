@@ -1279,3 +1279,85 @@ mod reported_tor_comments_diagnostic {
 		assert!(authenticated > 0, "onion OAuth did not complete; comments comparison is inconclusive");
 	}
 }
+
+#[cfg(test)]
+mod anonymous_comments_graphql_diagnostic {
+	use super::*;
+
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "read-only official comments query using an anonymous OAuth token over Tor"]
+	async fn live_anonymous_gql_comments() {
+		let _ = pretty_env_logger::try_init();
+		let lane = RedditLane::Tor;
+		let profile = OauthTransportProfile::Chrome145Android;
+		let client = client_for_oauth_profile(lane, profile).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let oauth = Oauth::authenticate_with_backend(&mut backend, client, profile).await.expect("anonymous Tor authentication");
+		println!("ANON_GQL_AUTH ok=true");
+		for (label, host) in [
+			("onion", "gql-fed.reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion"),
+			("public_via_tor", "gql-fed.reddit.com"),
+			("public_cf_via_tor", "cf.gql-fed.reddit.com"),
+		] {
+			for (name, hash, variables) in [
+				(
+					"PostComments",
+					"314f29c2494fd78c7844ef2c6b09acb4bef5b37ab50b4ddc01691d6d5c8433f8",
+					json!({
+							"id":"t3_1xcfm9l", "sortType":"CONFIDENCE", "count":50, "maxDepth":8,
+							"includePremiumAvatarTreatment":false, "includeConsistencyToken":false
+					}),
+				),
+				(
+					"PostsByIds",
+					"0e471495bcba33554b6c540b3cf1cae23dd5432a8b741dddc7fd6717dc2520a7",
+					json!({
+							"ids":["t3_1xcfm9l"], "includePostContentPostHint":true, "includePostContentThumbnailEnabled":true
+					}),
+				),
+			] {
+				let payload = json!({"operationName":name,"variables":variables,"extensions":{"persistedQuery":{"version":1,"sha256Hash":hash}}});
+				let mut headers: Vec<(String, String)> = vec![("Host".into(), host.into()), ("Cookie".into(), String::new()), ("Accept".into(), "application/json".into())];
+				headers.extend(oauth.headers_map.clone());
+				fastrand::shuffle(&mut headers);
+				let mut request = oauth.http_client.post(format!("https://{host}/"));
+				for (key, value) in headers {
+					request = request.header(key, value);
+				}
+				let started = Instant::now();
+				let result = timeout(Duration::from_secs(40), async {
+                    let response = request.json(&payload).send().await.map_err(|_| "send")?;
+                    let status = response.status().as_u16();
+                    let quota = response.headers().contains_key("x-ratelimit-remaining");
+                    let remaining = response.headers().get("x-ratelimit-remaining").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<f64>().ok());
+                    let bytes = response.bytes().await.map_err(|_| "body")?;
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                    let errors = value["errors"].as_array().map_or(0, Vec::len);
+                    let error_code = value["errors"][0]["extensions"]["code"].as_str().unwrap_or("none");
+                    let message = value["errors"][0]["message"].as_str().unwrap_or("none").chars().take(200).collect::<String>();
+                    let trees = value["data"]["postInfoById"]["commentForest"]["trees"].as_array().map_or(0, Vec::len);
+                    let posts = value["data"]["postsInfoByIds"].as_array().map_or(0, Vec::len);
+                    let data_keys = value["data"].as_object().map(|o|o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                    let network_policy = String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains("blocked by network security");
+                    println!("ANON_GQL origin={label} operation={name} status={status} elapsed_ms={} bytes={} quota={quota} errors={errors} error_code={error_code} message={message:?} trees={trees} posts={posts} data_keys={data_keys:?} network_policy={network_policy}", started.elapsed().as_millis(), bytes.len());
+                    if status == 200 && errors == 0 && (trees > 0 || posts > 0) {
+                        std::fs::write(format!("/tmp/reported-gql-{label}-{name}.json"),serde_json::to_vec_pretty(&value["data"]).unwrap()).unwrap();
+                    }
+                    Ok::<_, &str>(status == 429 || remaining.is_some_and(|n| n <= 0.0))
+                }).await;
+				match result {
+					Ok(Ok(true)) => {
+						println!("ANON_GQL_STOP reason=upstream_rate_limit");
+						return;
+					}
+					Ok(Ok(false)) => {}
+					_ => println!(
+						"ANON_GQL origin={label} operation={name} transport_failed=true elapsed_ms={}",
+						started.elapsed().as_millis()
+					),
+				}
+				tokio::time::sleep(Duration::from_secs(1)).await;
+			}
+		}
+	}
+}
