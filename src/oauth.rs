@@ -841,62 +841,39 @@ fn choose_newest_android_app_version<'a>(versions: &'a [&'a str]) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+
 	#[tokio::test(flavor="multi_thread")]
-	#[ignore="isolated current Tor policy and latency diagnosis"]
-	async fn live_tor_policy_latency() {
-		let _=pretty_env_logger::try_init();
+	#[ignore="isolated Tor HTTP protocol comparison"]
+	async fn live_tor_http_protocol() {
 		let lane=RedditLane::Tor;
-		let mut authenticated=0;
-		for (identity,profile) in [OauthTransportProfile::Firefox143Android,OauthTransportProfile::Chrome145Android].into_iter().enumerate() {
-			let client=client_for_oauth_profile(lane,profile).unwrap();
+		for http1 in [true,false] {
+			let profile=OauthTransportProfile::Chrome145Android;
+			let emulation=wreq_util::Emulation::builder().profile(profile.emulation()).platform(wreq_util::Platform::Android).http2(!http1).build();
+			let config=crate::reddit_lane::TOR_FALLBACK_CONFIG.as_ref().unwrap().as_ref().unwrap();
+			let mut proxy_url=url::Url::parse(&config.proxy_url).unwrap();
+			let isolation=format!("redlib-diagnostic-{:016x}",fastrand::u64(..));
+			proxy_url.set_username(&isolation).unwrap();proxy_url.set_password(Some(&isolation)).unwrap();
+			let mut builder=wreq::Client::builder().emulation(emulation).redirect(wreq::redirect::Policy::none()).proxy(wreq::Proxy::all(proxy_url.as_str()).unwrap());
+			if http1 {builder=builder.http1_only();}
+			let client=Arc::new(builder.build().unwrap());
 			let mut backend=MobileSpoofAuth::new(lane);
 			let started=Instant::now();
 			let oauth=match Oauth::authenticate_with_backend(&mut backend,client.clone(),profile).await {
 				Ok(oauth)=>oauth,
-				Err(error)=>{ println!("TOR_POLICY_AUTH identity={identity} ok=false class={} elapsed_ms={}",error.failure_class(),started.elapsed().as_millis()); continue; }
+				Err(e)=>{println!("TOR_PROTOCOL_AUTH http1={http1} ok=false class={} elapsed_ms={}",e.failure_class(),started.elapsed().as_millis());continue;}
 			};
-			authenticated+=1;
-			println!("TOR_POLICY_AUTH identity={identity} ok=true elapsed_ms={}",started.elapsed().as_millis());
-			for (endpoint,path) in [
-				("listing", "/r/all/hot.json?limit=5&raw_json=1"),
-				("comments", "/r/codex%2Fcomments/1xaomu1.json?limit=500&raw_json=1"),
-				("community_search", "/subreddits/search.json?q=codex&limit=1&raw_json=1"),
-				("listing_repeat", "/r/all/hot.json?limit=5&raw_json=1"),
-			] {
-				let mut req=client.get(format!("{}{path}",lane.api_origin().base));
-				for (k,v) in &oauth.headers_map {req=req.header(k,v);}
+			println!("TOR_PROTOCOL_AUTH http1={http1} ok=true elapsed_ms={}",started.elapsed().as_millis());
+			for (endpoint,path) in [("listing","/r/all/hot.json?limit=5&raw_json=1"),("comments","/r/codex%2Fcomments/1xaomu1.json?raw_json=1")] {
+				let mut request=client.get(format!("{}{path}",lane.api_origin().base));
+				for(k,v)in &oauth.headers_map {request=request.header(k,v);}
 				let started=Instant::now();
-				let result=timeout(Duration::from_secs(30),async {
-					let resp=req.send().await.map_err(|_| "transport")?;
-					let headers_ms=started.elapsed().as_millis();
-					let status=resp.status().as_u16();
-					let bytes=resp.bytes().await.map_err(|_| "body")?;
-					let value=serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
-					let valid=value["kind"]=="Listing" || value.as_array().is_some_and(|a|a.len()==2&&a[0]["kind"]=="Listing"&&a[1]["kind"]=="Listing");
-					println!("TOR_POLICY_API identity={identity} endpoint={endpoint} status={status} headers_ms={headers_ms} total_ms={} body_bytes={} valid_json={valid}",started.elapsed().as_millis(),bytes.len());
-					Ok::<_,&str>(())
-				}).await;
-				if !matches!(result,Ok(Ok(()))) { println!("TOR_POLICY_API identity={identity} endpoint={endpoint} network_failed=true total_ms={}",started.elapsed().as_millis()); }
+				match timeout(Duration::from_secs(20),request.send()).await {
+					Ok(Ok(response))=>println!("TOR_PROTOCOL_API http1={http1} endpoint={endpoint} status={} elapsed_ms={}",response.status().as_u16(),started.elapsed().as_millis()),
+					Ok(Err(e))=>println!("TOR_PROTOCOL_API http1={http1} endpoint={endpoint} transport_failed=true connect={} elapsed_ms={}",e.is_connect(),started.elapsed().as_millis()),
+					Err(_)=>println!("TOR_PROTOCOL_API http1={http1} endpoint={endpoint} timed_out=true elapsed_ms={}",started.elapsed().as_millis()),
+				}
 			}
 		}
-
-		let lane=RedditLane::Direct;
-		let profile=OauthTransportProfile::Chrome145Android;
-		let client=client_for_oauth_profile(lane,profile).unwrap();
-		let mut backend=MobileSpoofAuth::new(lane);
-		let started=Instant::now();
-		match Oauth::authenticate_with_backend(&mut backend,client.clone(),profile).await {
-			Ok(oauth)=>{
-				println!("DIRECT_POLICY_AUTH ok=true elapsed_ms={}",started.elapsed().as_millis());
-				let mut req=client.get(format!("{}/r/all/hot.json?limit=5&raw_json=1",lane.api_origin().base));
-				for(k,v) in &oauth.headers_map {req=req.header(k,v);}
-				let result=timeout(Duration::from_secs(15),req.send()).await;
-				if let Ok(Ok(resp))=result { println!("DIRECT_POLICY_API status={}",resp.status().as_u16()); }
-				else { println!("DIRECT_POLICY_API network_failed=true"); }
-			},
-			Err(error)=>println!("DIRECT_POLICY_AUTH ok=false class={} elapsed_ms={}",error.failure_class(),started.elapsed().as_millis()),
-		}
-		assert!(authenticated>0,"at least one anonymous session must be created for this diagnosis");
 	}
 
 	use super::*;
