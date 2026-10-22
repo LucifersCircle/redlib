@@ -1153,3 +1153,118 @@ mod tests {
 		assert_ne!(rotated_device_id, original_device_id);
 	}
 }
+
+#[cfg(test)]
+mod reported_tor_comments_diagnostic {
+	use super::*;
+
+	fn comments(value: &serde_json::Value) -> usize {
+		value["data"]["children"]
+			.as_array()
+			.into_iter()
+			.flatten()
+			.filter(|node| node["kind"] == "t1")
+			.map(|node| 1 + comments(&node["data"]["replies"]))
+			.sum()
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated anonymous Tor comparison for the reported gaming comments URL"]
+	async fn live_reported_tor_comments() {
+		let _ = pretty_env_logger::try_init();
+		assert!(crate::client::oauth_client(RedditLane::Direct).is_none());
+		for profile in [OauthTransportProfile::Chrome140Android, OauthTransportProfile::Chrome145Android] {
+			let lane = RedditLane::Tor;
+			let client = client_for_oauth_profile(lane, profile).unwrap();
+			let mut backend = MobileSpoofAuth::new(lane);
+			let oauth = match Oauth::authenticate_with_backend(&mut backend, client, profile).await {
+				Ok(oauth) => oauth,
+				Err(error) => {
+					println!("REPORTED_AUTH profile={} ok=false class={}", profile.label(), error.failure_class());
+					continue;
+				}
+			};
+			println!("REPORTED_AUTH profile={} ok=true", profile.label());
+			let origin = lane.api_origin();
+			let mut current_works = false;
+			for (name, path) in [
+				("current_scoped_encoding", "/r/gaming%2Fcomments/1xcfm9l?raw_json=1"),
+				("listing_control", "/r/gaming/hot?limit=1&raw_json=1"),
+				("literal_scoped", "/r/gaming/comments/1xcfm9l?raw_json=1"),
+				("short_encoded", "/comments%2F1xcfm9l?raw_json=1"),
+				("short_literal", "/comments/1xcfm9l?raw_json=1"),
+				("after_comments_encoding", "/r/gaming/comments%2F1xcfm9l?raw_json=1"),
+				("prior_codex_control", "/r/codex%2Fcomments/1xaomu1?raw_json=1"),
+			] {
+				let mut headers: Vec<(String, String)> = vec![("Host".into(), origin.host.into()), ("Cookie".into(), String::new())];
+				headers.extend(oauth.headers_map.clone());
+				fastrand::shuffle(&mut headers);
+				let mut request = oauth.http_client.get(format!("{}{path}", origin.base));
+				for (key, value) in headers {
+					request = request.header(key, value);
+				}
+				let started = Instant::now();
+				let result = timeout(Duration::from_secs(35), async {
+                    let response = request.send().await.map_err(|_| "send")?;
+                    let status = response.status().as_u16();
+                    let headers = response.headers();
+                    let quota = headers.contains_key("x-ratelimit-remaining") || headers.contains_key("x-ratelimit-reset");
+                    let retry = headers.get("retry-after").and_then(|v| v.to_str().ok()).unwrap_or("none").to_owned();
+                    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("none").to_owned();
+                    let location = headers.get("location").and_then(|v| v.to_str().ok()).unwrap_or("none").to_owned();
+                    let bytes = response.bytes().await.map_err(|_| "body")?;
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                    let comments_shape = value.as_array().is_some_and(|a| a.len() == 2 && a[0]["kind"] == "Listing" && a[1]["kind"] == "Listing");
+                    let id = value[0]["data"]["children"][0]["data"]["id"].as_str().unwrap_or("none");
+                    let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                    let html_kind = if text.contains("blocked by network security") || text.contains("blocked due to a network policy") { "network_policy" }
+                        else if text.contains("captcha") || text.contains("verify you are human") { "challenge" }
+                        else if text.contains("<html") { "html_other" } else { "none" };
+                    let title = text.split_once("<title>").and_then(|(_, rest)| rest.split_once("</title>")).map(|(title, _)| title.chars().take(100).collect::<String>()).unwrap_or_default();
+                    println!("REPORTED_API profile={} route={name} status={status} elapsed_ms={} bytes={} content_type={content_type:?} quota={quota} retry={retry:?} comments_shape={comments_shape} post_id={id} comment_count={} html_kind={html_kind} html_title={title:?} location={location:?}", profile.label(), started.elapsed().as_millis(), bytes.len(), comments(&value[1]));
+                    Ok::<_, &str>((status == 429 || status == 403 && quota, status == 200 && comments_shape && id == "1xcfm9l"))
+                }).await;
+				match result {
+					Ok(Ok((true, _))) => {
+						println!("REPORTED_STOP reason=explicit_upstream_rate_limit");
+						return;
+					}
+					Ok(Ok((false, valid))) => {
+						if name == "current_scoped_encoding" {
+							current_works = valid;
+						}
+					}
+					_ => println!(
+						"REPORTED_API profile={} route={name} transport_failed=true elapsed_ms={}",
+						profile.label(),
+						started.elapsed().as_millis()
+					),
+				}
+				tokio::time::sleep(Duration::from_secs(1)).await;
+			}
+			if current_works {
+				assert!(crate::client::install_oauth_client(oauth, true, None));
+				let request = hyper::Request::builder()
+					.uri("/r/gaming/comments/1xcfm9l/the_nintendo_switch_2_has_been_hacked_first/")
+					.body(hyper::Body::empty())
+					.unwrap();
+				match timeout(Duration::from_secs(75), crate::post::item(request)).await {
+					Ok(Ok(response)) => {
+						let status = response.status().as_u16();
+						let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+						let body = String::from_utf8_lossy(&bytes);
+						println!(
+							"REPORTED_PAGE profile={} status={status} rendered_comments={} loading={} expected_title={}",
+							profile.label(),
+							body.matches("class=\"comment\"").count(),
+							body.contains("Still trying to load your page"),
+							body.contains("Nintendo Switch 2")
+						);
+					}
+					_ => println!("REPORTED_PAGE profile={} failed=true", profile.label()),
+				}
+			}
+		}
+		assert!(crate::client::oauth_client(RedditLane::Direct).is_none());
+	}
+}
