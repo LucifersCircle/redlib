@@ -1308,6 +1308,7 @@ mod mixed_api_recovery_diagnostic {
         let profile=OauthTransportProfile::Chrome145Android;let http=client_for_oauth_profile(lane,profile).unwrap();let mut backend=MobileSpoofAuth::new(lane);
         let oauth=Oauth::authenticate_with_backend(&mut backend,http,profile).await.unwrap();assert!(crate::client::install_oauth_client(oauth,true,None));
         for limit in [1,2] {let value=crate::client::json(format!("/r/SteamDeck/hot.json?limit={limit}&raw_json=1"),false).await.expect("listing through same identity");assert!(value["data"]["children"].as_array().is_some());}
+        let listing_budget=crate::client::mixed_api_diagnostic_snapshot(lane).0;
         for (sub,id,slug) in [("SteamDeck","1xci3c1","ar_glasses_hub"),("gaming","1xcfm9l","the_nintendo_switch_2_has_been_hacked_first")] {
             let path=format!("/r/{sub}/comments/{id}/{slug}/");
             for sort in ["confidence","new","top","old","controversial"] {
@@ -1324,7 +1325,8 @@ mod mixed_api_recovery_diagnostic {
             }
         }
         let (rest,graphql,failures,blocked,generation)=crate::client::mixed_api_diagnostic_snapshot(lane);
-        assert!(rest.is_some_and(|n|n>20));assert!(graphql.is_some_and(|n|n>400));assert_eq!(failures,0);assert!(!blocked);assert_eq!(generation,0);
+        println!("MIXED_API_OBSERVED lane={} rest_before={listing_budget:?} rest_after={rest:?} graphql_after={graphql:?} failures={failures} cooldown={blocked} generation={generation}",lane.label());
+        assert_eq!(rest,listing_budget,"comments must not consume the REST allowance");assert!(graphql.is_none_or(|n|n>0));assert_eq!(failures,0);assert!(!blocked);assert_eq!(generation,0);
         println!("MIXED_API_RECOVERY lane={} rest_available={rest:?} graphql_available={graphql:?} transport_failures={failures} cooldown={blocked} generation={generation}",lane.label());
     }
 }

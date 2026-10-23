@@ -2761,6 +2761,7 @@ async fn reddit_comments(
 			return Ok(RedditReadResponse::Comments { response, post, request });
 		}
 		let headers = response.headers().clone();
+		println!("API_BUDGET_WIRE lane={} stage=metadata remaining={:?} reset={:?} used={:?}",lane.label(),headers.get("x-ratelimit-remaining"),headers.get("x-ratelimit-reset"),headers.get("x-ratelimit-used"));
 		let remaining = headers
 			.get("x-ratelimit-remaining")
 			.and_then(|v| v.to_str().ok())
@@ -3702,6 +3703,7 @@ async fn json_uncached_on_lane_with_options(
 				let content_kind = response_headers.get(wreq_header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map_or("missing", |value| {
 					if value.starts_with("application/json") { "json" } else if value.starts_with("text/html") { "html" } else { "other" }
 				});
+				println!("API_BUDGET_WIRE lane={} stage=final endpoint={} remaining={:?} reset={:?} used={:?}",lane.label(),endpoint_class(&path),response.headers().get("x-ratelimit-remaining"),response.headers().get("x-ratelimit-reset"),response.headers().get("x-ratelimit-used"));
 				let mut response = response.into_hyper_response();
 				let rejection = if status_code == 403 { Some(read_rejection_details(response.body_mut()).await) } else { None };
 				let resource_reason = rejection.as_ref().and_then(|details| details.resource_reason);
