@@ -26,10 +26,6 @@ jobs:
         env:
           REDLIB_REDDIT_PRIMARY_LANE: direct
         run: cargo test --locked --lib live_mixed_api_comment_recovery -- --ignored --nocapture
-      - name: Verify public media through production proxy
-        env:
-          REDLIB_REDDIT_PRIMARY_LANE: direct
-        run: cargo test --locked --lib live_anonymous_graphql_media -- --ignored --nocapture
       - name: Install Tor
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tor
       - name: Bootstrap isolated Tor
@@ -47,3 +43,7 @@ jobs:
           exit 1
       - name: Verify mixed listings and comments through Tor lane
         run: cargo test --locked --lib live_mixed_api_comment_recovery -- --ignored --nocapture
+      - name: Verify public media through production proxy
+        env:
+          REDLIB_REDDIT_PRIMARY_LANE: direct
+        run: cargo test --locked --lib live_anonymous_graphql_media -- --ignored --nocapture
