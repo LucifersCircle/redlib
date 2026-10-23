@@ -30,17 +30,20 @@ pub(crate) enum ErrorKind {
 pub(crate) struct GraphqlError {
 	pub(crate) kind: ErrorKind,
 	pub(crate) message: String,
+	pub(crate) reason: &'static str,
 }
 impl GraphqlError {
-	fn invalid() -> Self {
+	fn invalid(reason: &'static str) -> Self {
 		Self {
 			kind: ErrorKind::Invalid,
+			reason,
 			message: "Reddit is temporarily unable to load comments. Retry in 30 seconds".into(),
 		}
 	}
 	fn resource(message: &str) -> Self {
 		Self {
 			kind: ErrorKind::Resource,
+			reason: "resource",
 			message: message.into(),
 		}
 	}
@@ -52,16 +55,18 @@ pub(crate) fn response_error(value: &Value) -> Option<GraphqlError> {
 	Some(match code {
 		"NOT_AUTHENTICATED" | "UNAUTHENTICATED" | "UNAUTHORIZED" => GraphqlError {
 			kind: ErrorKind::Session,
+			reason: "session",
 			message: "Reddit's anonymous comments session is unavailable. Retry in 5 seconds".into(),
 		},
 		"TOO_MANY_REQUESTS" | "RATE_LIMITED" | "RATELIMIT" => GraphqlError {
 			kind: ErrorKind::RateLimit,
+			reason: "rate_limit",
 			message: "Reddit rate limit exceeded. Retry in 30 seconds".into(),
 		},
 		"NOT_FOUND" => GraphqlError::resource("Post not found"),
 		"PRIVATE_SUBREDDIT" => GraphqlError::resource("private"),
 		"QUARANTINED" => GraphqlError::resource("quarantined"),
-		_ => GraphqlError::invalid(),
+		_ => GraphqlError::invalid("graphql_error"),
 	})
 }
 
@@ -149,23 +154,39 @@ impl CommentsRequest {
 		}
 		let info = &response["data"]["postInfoById"];
 		if info["id"] != self.post_id {
-			return Err(GraphqlError::invalid());
+			return Err(GraphqlError::invalid("post_id_mismatch"));
 		}
-		let trees = info["commentForest"]["trees"].as_array().ok_or_else(GraphqlError::invalid)?;
+		let trees = info["commentForest"]["trees"].as_array().ok_or_else(|| GraphqlError::invalid("missing_comment_forest"))?;
 		let mut entries = Vec::new();
 		let mut ids = HashSet::new();
 		let mut after = None;
-		for tree in trees {
+		for (position, tree) in trees.iter().enumerate() {
 			let parent = tree["parentId"].as_str().unwrap_or(&self.post_id).to_string();
 			let node = if tree["node"].is_object() {
-				let id = tree["node"]["id"].as_str().ok_or_else(GraphqlError::invalid)?.to_string();
+				let id = if let Some(id) = tree["node"]["id"].as_str() {
+					id.to_string()
+				} else if tree["node"]["__typename"] == "DeletedComment" {
+					// Deleted placeholders intentionally omit their ID. In the ordered
+					// forest, a loaded immediate reply still supplies that parent ID.
+					// Leaf placeholders without an address have no navigable content.
+					let Some(id) = trees
+						.get(position + 1)
+						.filter(|next| tree["depth"].as_u64().zip(next["depth"].as_u64()).is_some_and(|(depth, next)| next == depth + 1))
+						.and_then(|next| next["parentId"].as_str())
+						.filter(|id| id.starts_with("t1_"))
+					else {
+						continue;
+					};
+					id.to_string()
+				} else {
+					return Err(GraphqlError::invalid("missing_comment_id"));
+				};
 				if !ids.insert(id.clone()) {
-					return Err(GraphqlError::invalid());
+					return Err(GraphqlError::invalid("duplicate_comment_id"));
 				}
-				(
-					id,
-					json!({"kind":"t1", "data":legacy_comment(&tree["node"], &parent, &self.post_id, &post["data"]["permalink"])}),
-				)
+				let mut node = tree["node"].clone();
+				node["id"] = json!(id);
+				(id, json!({"kind":"t1", "data":legacy_comment(&node, &parent, &self.post_id, &post["data"]["permalink"])}))
 			} else if tree["more"].is_object() {
 				if tree["parentId"].is_null() {
 					after = tree["more"]["cursor"].as_str().map(str::to_string);
@@ -197,7 +218,7 @@ impl CommentsRequest {
 			depth: usize,
 		) -> Result<Value, GraphqlError> {
 			if depth > 64 || !visiting.insert(index) {
-				return Err(GraphqlError::invalid());
+				return Err(GraphqlError::invalid("cyclic_or_deep_comment_tree"));
 			}
 			let (id, _, entry) = &entries[index];
 			let mut result = entry.clone();
@@ -222,7 +243,7 @@ impl CommentsRequest {
 				.collect::<Result<Vec<_>, _>>()?
 		};
 		if self.limit > 0 && visited.len() != entries.len() {
-			return Err(GraphqlError::invalid());
+			return Err(GraphqlError::invalid("unreachable_comment_tree"));
 		}
 		Ok(json!([listing(vec![post], None), listing(comments, after)]))
 	}
@@ -497,6 +518,33 @@ pub(crate) fn markdown(text: &str, content: &Value) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn test_graphql_comments_deleted_placeholder_without_id_keeps_its_replies() {
+		let request = CommentsRequest::from_path("/comments/abc.json").unwrap();
+		let post = json!({"kind":"t3","data":{"id":"abc","permalink":"/r/test/comments/abc/_/"}});
+		let response = json!({"data":{"postInfoById":{"id":"t3_abc","commentForest":{"trees":[
+				{"depth":0,"parentId":null,"node":{"__typename":"Comment","id":"t1_parent","content":{"markdown":"parent"}}},
+				{"depth":1,"parentId":"t1_parent","childCount":2,"node":{"__typename":"DeletedComment","createdAt":"2026-10-22T13:25:19.437000+0000","removedByCategory":"DELETED"}},
+				{"depth":2,"parentId":"t1_deleted","node":{"__typename":"Comment","id":"t1_reply","content":{"markdown":"reply remains"}}},
+				{"depth":3,"parentId":"t1_reply","node":{"__typename":"Comment","id":"t1_child","content":{"markdown":"nested reply"}}},
+				{"depth":1,"parentId":"t1_parent","node":{"__typename":"DeletedComment","removedByCategory":"DELETED"}},
+				{"depth":0,"parentId":null,"node":{"__typename":"Comment","id":"t1_other","content":{"markdown":"another thread"}}}
+		]}}}});
+		let value = request.finish(post.clone(), &response).unwrap();
+		let parent = &value[1]["data"]["children"][0];
+		let deleted = &parent["data"]["replies"]["data"]["children"][0];
+		assert_eq!(deleted["data"]["id"], "deleted");
+		assert_eq!(deleted["data"]["body"], "[deleted]");
+		assert_eq!(deleted["data"]["author"], "[deleted]");
+		let reply = &deleted["data"]["replies"]["data"]["children"][0];
+		assert_eq!(reply["data"]["body"], "reply remains");
+		assert_eq!(reply["data"]["replies"]["data"]["children"][0]["data"]["body"], "nested reply");
+		assert_eq!(value[1]["data"]["children"][1]["data"]["id"], "other");
+		let mut malformed = response.clone();
+		malformed["data"]["postInfoById"]["commentForest"]["trees"][1]["node"]["__typename"] = json!("Comment");
+		assert_eq!(request.finish(post, &malformed).unwrap_err().reason, "missing_comment_id");
+	}
+
 	#[test]
 	fn test_graphql_comments_request_preserves_scope_sort_and_focus() {
 		let request = CommentsRequest::from_path("/r/gaming/comments/abc/_/reply.json?sort=new&limit=300&depth=7&after=a%2Bb").unwrap();
