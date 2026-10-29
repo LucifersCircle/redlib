@@ -33,14 +33,14 @@ pub(crate) struct GraphqlError {
 	pub(crate) reason: &'static str,
 }
 impl GraphqlError {
-	fn invalid(reason: &'static str) -> Self {
+	pub(crate) fn invalid(reason: &'static str) -> Self {
 		Self {
 			kind: ErrorKind::Invalid,
 			reason,
 			message: "Reddit is temporarily unable to load comments. Retry in 30 seconds".into(),
 		}
 	}
-	fn resource(message: &str) -> Self {
+	pub(crate) fn resource(message: &str) -> Self {
 		Self {
 			kind: ErrorKind::Resource,
 			reason: "resource",
@@ -249,17 +249,17 @@ impl CommentsRequest {
 	}
 }
 
-fn operation(name: &str, hash: &str, variables: Value) -> Value {
+pub(crate) fn operation(name: &str, hash: &str, variables: Value) -> Value {
 	json!({"operationName":name,"variables":variables,"extensions":{"persistedQuery":{"version":1,"sha256Hash":hash}}})
 }
-fn listing(children: Vec<Value>, after: Option<String>) -> Value {
+pub(crate) fn listing(children: Vec<Value>, after: Option<String>) -> Value {
 	json!({"kind":"Listing","data":{"children":children,"after":after,"before":null}})
 }
 fn short_id(id: &Value) -> &str {
 	let id = id.as_str().unwrap_or_default();
 	id.strip_prefix("t3_").or_else(|| id.strip_prefix("t1_")).unwrap_or(id)
 }
-fn timestamp(value: &Value) -> f64 {
+pub(crate) fn timestamp(value: &Value) -> f64 {
 	value
 		.as_str()
 		.and_then(|v| {
@@ -300,7 +300,7 @@ fn add_flair(data: &mut Value, prefix: &str, flair: &Value) {
 			.collect::<Vec<_>>());
 	}
 }
-fn legacy_comment(node: &Value, parent: &str, post_id: &str, permalink: &Value) -> Value {
+pub(crate) fn legacy_comment(node: &Value, parent: &str, post_id: &str, permalink: &Value) -> Value {
 	let removed = node["isRemoved"] == true || node["isAdminTakedown"] == true || node["__typename"] == "DeletedComment";
 	let text = if removed {
 		if matches!(node["removedByCategory"].as_str(), Some("AUTHOR" | "DELETED")) {
@@ -341,11 +341,11 @@ fn asset_metadata(asset: &Value) -> Value {
 		.collect::<Vec<_>>();
 	json!({"status":"valid","e":if animated {"AnimatedImage"} else {"Image"},"m":asset["mimetype"],"s":source,"p":previews})
 }
-fn legacy_post(post: &Value, depth: usize) -> Value {
+pub(crate) fn legacy_post(post: &Value, depth: usize) -> Value {
 	let content = &post["content"];
 	let text = content["markdown"].as_str().unwrap_or_default();
 	let mut data = json!({"id":short_id(&post["id"]),"name":post["id"],"title":post["postTitle"].as_str().or_else(||post["title"].as_str()).unwrap_or_default(),
-        "author":author(&post["authorInfo"]),"subreddit":post["subreddit"]["name"],"subreddit_id":post["subreddit"]["id"],"permalink":post["permalink"],
+        "author":author(&post["authorInfo"]),"subreddit":post["subreddit"]["name"].as_str().or_else(||post["profile"]["name"].as_str()),"subreddit_id":post["subreddit"]["id"],"permalink":post["permalink"],
         "created_utc":timestamp(&post["createdAt"]),"score":post["score"],"upvote_ratio":post["upvoteRatio"],"num_comments":post["commentCount"],
         "domain":post["domain"],"url":post["url"],"url_overridden_by_dest":post["url"],"selftext":text,"selftext_html":markdown(text,content),
         "is_self":post["isSelfPost"] == true,"over_18":post["isNsfw"] == true,"spoiler":post["isSpoiler"] == true,"stickied":post["isStickied"] == true,
@@ -407,8 +407,13 @@ fn legacy_post(post: &Value, depth: usize) -> Value {
 	if let Some(options) = post["poll"]["options"].as_array() {
 		data["poll_data"] = json!({"options":options.iter().map(|option|json!({"id":option["id"],"text":option["text"],"vote_count":option["voteCount"]})).collect::<Vec<_>>(),"total_vote_count":post["poll"]["totalVoteCount"],"voting_end_timestamp":timestamp(&post["poll"]["votingEndsAt"])*1000.0});
 	}
-	if depth < 4 && post["crosspostRoot"]["postInfo"].is_object() {
-		data["crosspost_parent_list"] = json!([legacy_post(&post["crosspostRoot"]["postInfo"], depth + 1)]);
+	let root = if post["crosspostRoot"]["postInfo"].is_object() {
+		&post["crosspostRoot"]["postInfo"]
+	} else {
+		&post["crosspostRoot"]["post"]
+	};
+	if depth < 4 && root.is_object() {
+		data["crosspost_parent_list"] = json!([legacy_post(root, depth + 1)]);
 	}
 	data
 }
