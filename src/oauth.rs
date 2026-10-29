@@ -1539,3 +1539,99 @@ mod live_tor_page_operations {
 		println!("LIVE_PAGE_OPERATION completed=true operations=12");
 	}
 }
+#[cfg(test)]
+mod live_rendered_pages {
+	use super::*;
+	use crate::server::RequestExt;
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated live Tor full page rendering and pagination"]
+	async fn live_tor_page_rendered_recovery() {
+		let _ = pretty_env_logger::try_init();
+		let lane = RedditLane::Tor;
+		let profile = OauthTransportProfile::Chrome145Android;
+		let http = client_for_oauth_profile(lane, profile).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let oauth = Oauth::authenticate_with_backend(&mut backend, http, profile).await.expect("anonymous Tor OAuth");
+		println!("LIVE_RENDERED anonymous_auth=true public_auth={}", oauth.backend.public_auth);
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		crate::client::live_pages_isolation_state(true);
+		for (label, path, paginate) in [
+			("popular", "/r/popular/hot.json?limit=5", true),
+			("all", "/r/all/hot.json?limit=5", false),
+			("subreddit", "/r/rust/new.json?limit=5", true),
+			("subscriptions", "/r/rust%2Bgaming/new.json?limit=5", true),
+			("search", "/search.json?q=rust&sort=relevance&limit=5", true),
+			("communities", "/subreddits/search.json?q=rust&limit=3", false),
+			("user_posts", "/user/reddit/submitted.json?limit=5", false),
+			("user_comments", "/user/spez/comments.json?limit=5", false),
+			("user_overview", "/user/spez/overview.json?limit=5", true),
+		] {
+			let started = Instant::now();
+			let value = tokio::time::timeout(Duration::from_secs(75), crate::client::json(path.into(), false))
+				.await
+				.unwrap()
+				.expect(label);
+			let children = value["data"]["children"].as_array().expect("listing");
+			assert!(!children.is_empty(), "{label} must have real items");
+			println!("LIVE_RENDERED json={label} items={} elapsed_ms={}", children.len(), started.elapsed().as_millis());
+			if paginate {
+				if let Some(cursor) = value["data"]["after"].as_str() {
+					let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+					serializer.append_pair("after", cursor);
+					let second = crate::client::json(format!("{path}&{}", serializer.finish()), false).await.expect("second page");
+					let next = second["data"]["children"].as_array().expect("next listing");
+					assert!(!next.is_empty(), "{label} second page");
+					let ids: std::collections::HashSet<_> = children.iter().map(|p| p["data"]["name"].as_str().unwrap()).collect();
+					assert!(next.iter().all(|p| !ids.contains(p["data"]["name"].as_str().unwrap())), "{label} repeated first-page items");
+					println!("LIVE_RENDERED pagination={label} items={} duplicates=0", next.len());
+				}
+			}
+		}
+		for (label, uri, params) in [
+			("home", "/", &[][..]),
+			("subreddit", "/r/rust/new", &[("sub", "rust"), ("sort", "new")][..]),
+			("search", "/search?q=rust&sort=relevance", &[][..]),
+			("profile", "/user/spez", &[("name", "spez")][..]),
+			("comments", "/r/SteamDeck/comments/1xci3c1/ar_glasses_hub/", &[("sub", "SteamDeck"), ("id", "1xci3c1")][..]),
+			("rss", "/r/rust/new.rss", &[("sub", "rust"), ("sort", "new")][..]),
+		] {
+			let started = Instant::now();
+			let mut request = hyper::Request::builder().uri(uri).body(hyper::Body::empty()).unwrap();
+			let mut route = route_recognizer::Params::new();
+			for (key, value) in params {
+				route.insert((*key).into(), (*value).into());
+			}
+			request.set_params(route);
+			let response = tokio::time::timeout(Duration::from_secs(90), async {
+				match label {
+					"home" | "subreddit" => crate::subreddit::community(request).await,
+					"search" => crate::search::find(request).await,
+					"profile" => crate::user::profile(request).await,
+					"comments" => crate::post::item(request).await,
+					"rss" => crate::subreddit::rss(request).await,
+					_ => unreachable!(),
+				}
+			})
+			.await
+			.unwrap()
+			.unwrap();
+			let status = response.status();
+			let body = String::from_utf8(hyper::body::to_bytes(response.into_body()).await.unwrap().to_vec()).unwrap();
+			assert_eq!(status, 200, "{label}: {}", body.chars().take(200).collect::<String>());
+			assert!(body.len() > 1000, "{label} must render content");
+			assert!(!body.contains("Still trying to load your page"), "{label}");
+			if label == "rss" {
+				assert!(body.contains("<rss"));
+			}
+			if label == "comments" {
+				assert!(body.matches("class=\"comment\"").count() > 0);
+			}
+			println!("LIVE_RENDERED page={label} status=200 bytes={} elapsed_ms={}", body.len(), started.elapsed().as_millis());
+		}
+		let (direct, tor, onion) = crate::client::live_pages_isolation_state(false);
+		assert_eq!(direct, 0);
+		assert!(tor > 15);
+		assert!(onion);
+		println!("LIVE_RENDERED completed=true direct_sends={direct} tor_sends={tor} onion_failure_preserved={onion}");
+	}
+}

@@ -15,6 +15,7 @@ jobs:
       REDLIB_TOR_PROXY: socks5h://127.0.0.1:19050
       REDLIB_REDDIT_MAX_CONCURRENCY: "4"
       RUST_LOG: redlib=info
+      REDLIB_ENABLE_RSS: "on"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +40,7 @@ jobs:
           tail -15 "$RUNNER_TEMP/tor-isolation.log"
           exit 1
       - name: Verify anonymous listing, search and profile operations
-        run: cargo test --locked --lib live_tor_page_operations_probe -- --ignored --nocapture
+        run: cargo test --locked --lib live_tor_page_rendered_recovery -- --ignored --nocapture
       - name: Tor notices
         if: always()
         run: tail -20 "$RUNNER_TEMP/tor-isolation.log"
