@@ -4,7 +4,7 @@ use crate::{
 		OauthTransportProfile, QuotaRotationTicket, OAUTH_BROWSER_PROFILES, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
-	reddit_lane::RedditLane,
+	reddit_lane::{RedditLane, RedditOrigin},
 	timing::{positive_jitter, proportional_positive_jitter},
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -19,6 +19,7 @@ const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const TOR_OAUTH_TIMEOUT: Duration = Duration::from_secs(45);
+const TOR_ONION_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(300);
 const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(600);
@@ -250,6 +251,14 @@ enum AuthError {
 }
 
 impl AuthError {
+	fn allows_tor_auth_fallback(&self) -> bool {
+		match self {
+			Self::Timeout(_) => true,
+			Self::Wreq(error) => error.is_connect() || error.is_proxy_connect() || error.is_timeout(),
+			_ => false,
+		}
+	}
+
 	fn retry_after(&self) -> Option<Duration> {
 		match self {
 			Self::HttpStatus { retry_after, .. } => *retry_after,
@@ -389,7 +398,7 @@ fn refresh_backoff(lane: RedditLane) -> std::sync::MutexGuard<'static, RefreshBa
 	.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn token_refresh_notify(lane: RedditLane) -> &'static Notify {
+pub(crate) fn token_refresh_notify(lane: RedditLane) -> &'static Notify {
 	match lane {
 		RedditLane::Direct => &DIRECT_TOKEN_REFRESH_NOTIFY,
 		RedditLane::Tor => &TOR_TOKEN_REFRESH_NOTIFY,
@@ -469,8 +478,13 @@ fn token_refresh_delay(expires_in: u64, early_by: u64) -> Duration {
 	Duration::from_secs(expires_in.saturating_sub(early_by.min(expires_in / 2)).max(1))
 }
 
-fn refresh_backoff_remaining(lane: RedditLane) -> Option<Duration> {
+pub(crate) fn refresh_backoff_remaining(lane: RedditLane) -> Option<Duration> {
 	refresh_backoff(lane).retry_remaining(Instant::now())
+}
+
+#[cfg(test)]
+pub(crate) fn set_refresh_backoff_for_test(lane: RedditLane, delay: Option<Duration>) {
+	refresh_backoff(lane).retry_not_before = delay.map(|delay| Instant::now() + delay);
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -654,6 +668,7 @@ struct Device {
 #[derive(Debug, Clone)]
 pub struct MobileSpoofAuth {
 	lane: RedditLane,
+	public_auth: bool,
 	device: Device,
 	additional_headers: HashMap<String, String>,
 }
@@ -662,16 +677,43 @@ impl MobileSpoofAuth {
 	fn new(lane: RedditLane) -> Self {
 		Self {
 			lane,
+			public_auth: false,
 			device: Device::new(lane),
 			additional_headers: HashMap::new(),
 		}
 	}
-}
 
-impl OauthBackend for MobileSpoofAuth {
-	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
-		// Construct URL for OAuth token
-		let origin = self.lane.auth_origin();
+	async fn authenticate_with_origins(
+		&mut self,
+		client: &wreq::Client,
+		onion: RedditOrigin,
+		public: RedditOrigin,
+		onion_timeout: Duration,
+	) -> Result<OauthResponse, AuthError> {
+		if self.lane != RedditLane::Tor || self.public_auth {
+			return self.authenticate_at(client, if self.public_auth { public } else { onion }).await;
+		}
+		let result = timeout(onion_timeout, self.authenticate_at(client, onion))
+			.await
+			.unwrap_or(Err(AuthError::Timeout(onion_timeout)));
+		match result {
+			Err(error) if error.allows_tor_auth_fallback() => {
+				warn!(
+					"Tor onion OAuth connection failed; trying public HTTPS on the same isolated SOCKS transport: class={}",
+					error.failure_class()
+				);
+				// Keep the same client, device and credentials. Redirects remain
+				// disabled; this fixed HTTPS origin still resolves through Tor.
+				let response = self.authenticate_at(client, public).await?;
+				self.public_auth = true;
+				info!("Tor OAuth recovered through public HTTPS; retaining this origin for session renewal");
+				Ok(response)
+			}
+			result => result,
+		}
+	}
+
+	async fn authenticate_at(&mut self, client: &wreq::Client, origin: RedditOrigin) -> Result<OauthResponse, AuthError> {
 		let url = format!("{}/auth/v2/oauth/access-token/loid", origin.base);
 		record_oauth_send(self.lane);
 		let mut builder = client.post(&url);
@@ -762,6 +804,14 @@ impl OauthBackend for MobileSpoofAuth {
 			expires_in,
 			additional_headers: self.additional_headers.clone(),
 		})
+	}
+}
+
+impl OauthBackend for MobileSpoofAuth {
+	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
+		self
+			.authenticate_with_origins(client, self.lane.auth_origin(), RedditLane::Direct.auth_origin(), TOR_ONION_AUTH_TIMEOUT)
+			.await
 	}
 
 	fn user_agent(&self) -> &str {
@@ -1020,6 +1070,180 @@ mod tests {
 	#[test]
 	fn test_creating_mobile_backend() {
 		MobileSpoofAuth::new(RedditLane::Direct);
+	}
+
+	#[tokio::test]
+	async fn test_tor_oauth_fallback_keeps_socks_transport_and_stable_identity() {
+		use hyper::service::{make_service_fn, service_fn};
+		use std::convert::Infallible;
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let requests = Arc::new(Mutex::new(Vec::new()));
+		let recorded = requests.clone();
+		let service = make_service_fn(move |_| {
+			let recorded = recorded.clone();
+			async move {
+				Ok::<_, Infallible>(service_fn(move |request: hyper::Request<hyper::Body>| {
+					let recorded = recorded.clone();
+					async move {
+						assert_eq!(request.uri().path(), "/auth/v2/oauth/access-token/loid");
+						assert_eq!(request.method(), hyper::Method::POST);
+						let host = request.headers()["host"].to_str().unwrap().to_string();
+						let device = request.headers()["x-reddit-device-id"].to_str().unwrap().to_string();
+						let loid = request.headers().get("x-reddit-loid").map(|v| v.to_str().unwrap().to_string());
+						let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
+						assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!({"scopes":["*","email","pii"]}));
+						recorded.lock().unwrap().push((host.clone(), device, loid));
+						let response = if host == "unavailable.onion" {
+							hyper::Response::builder().status(429).header("retry-after", "60").body(hyper::Body::from("{}"))
+						} else {
+							hyper::Response::builder()
+								.header("content-type", "application/json")
+								.header("x-reddit-loid", "fixture-loid")
+								.body(hyper::Body::from(r#"{"access_token":"fixture-token","expires_in":3600}"#))
+						};
+						Ok::<_, Infallible>(response.unwrap())
+					}
+				}))
+			}
+		});
+		let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+		let http_address = server.local_addr();
+		let server = tokio::spawn(server);
+		let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+		let proxy_address = proxy.local_addr().unwrap();
+		let destinations = Arc::new(Mutex::new(Vec::new()));
+		let recorded_destinations = destinations.clone();
+		// 0: onion descriptor failure, 1: HTTP rejection, 2: stalled onion.
+		let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+		let proxy_mode = mode.clone();
+		let proxy = tokio::spawn(async move {
+			loop {
+				let (mut stream, _) = proxy.accept().await.unwrap();
+				let mode = proxy_mode.clone();
+				let destinations = recorded_destinations.clone();
+				tokio::spawn(async move {
+					let version = stream.read_u8().await.unwrap();
+					assert_eq!(version, 5);
+					let methods_len = stream.read_u8().await.unwrap() as usize;
+					let mut methods = vec![0; methods_len];
+					stream.read_exact(&mut methods).await.unwrap();
+					assert!(methods.contains(&2));
+					stream.write_all(&[5, 2]).await.unwrap();
+					assert_eq!(stream.read_u8().await.unwrap(), 1);
+					let len = stream.read_u8().await.unwrap() as usize;
+					let mut username = vec![0; len];
+					stream.read_exact(&mut username).await.unwrap();
+					let len = stream.read_u8().await.unwrap() as usize;
+					let mut password = vec![0; len];
+					stream.read_exact(&mut password).await.unwrap();
+					assert_eq!(username, b"identity-fixture");
+					assert_eq!(password, b"identity-fixture");
+					stream.write_all(&[1, 0]).await.unwrap();
+					let mut command = [0; 4];
+					stream.read_exact(&mut command).await.unwrap();
+					assert_eq!(command, [5, 1, 0, 3]);
+					let len = stream.read_u8().await.unwrap() as usize;
+					let mut host = vec![0; len];
+					stream.read_exact(&mut host).await.unwrap();
+					let host = String::from_utf8(host).unwrap();
+					let _port = stream.read_u16().await.unwrap();
+					assert!(matches!(host.as_str(), "unavailable.onion" | "public.fixture.invalid"));
+					destinations.lock().unwrap().push(host.clone());
+					if host == "unavailable.onion" {
+						match mode.load(Ordering::SeqCst) {
+							0 => {
+								let _ = stream.write_all(&[5, 0xf0, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+								return;
+							}
+							2 => {
+								tokio::time::sleep(Duration::from_secs(1)).await;
+								return;
+							}
+							_ => {}
+						}
+					}
+					let mut upstream = tokio::net::TcpStream::connect(http_address).await.unwrap();
+					stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).await.unwrap();
+					let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+				});
+			}
+		});
+		let client = wreq::Client::builder()
+			.proxy(wreq::Proxy::all(format!("socks5h://identity-fixture:identity-fixture@{proxy_address}")).unwrap())
+			.redirect(wreq::redirect::Policy::none())
+			.pool_max_idle_per_host(0)
+			.build()
+			.unwrap();
+		let onion = RedditOrigin {
+			base: "http://unavailable.onion",
+			host: "unavailable.onion",
+		};
+		let public = RedditOrigin {
+			base: "http://public.fixture.invalid",
+			host: "public.fixture.invalid",
+		};
+		let mut backend = MobileSpoofAuth::new(RedditLane::Tor);
+		let original_device = backend.device.headers["X-Reddit-Device-Id"].clone();
+		let response = backend.authenticate_with_origins(&client, onion, public, Duration::from_millis(200)).await.unwrap();
+		assert_eq!(response.token, "fixture-token");
+		assert!(backend.public_auth);
+		let mut stable = backend.clone();
+		stable.authenticate_with_origins(&client, onion, public, Duration::from_millis(200)).await.unwrap();
+		assert_eq!(*destinations.lock().unwrap(), ["unavailable.onion", "public.fixture.invalid", "public.fixture.invalid"]);
+		let recorded = requests.lock().unwrap().clone();
+		assert_eq!(recorded.len(), 2);
+		assert!(recorded.iter().all(|(_, device, _)| device == &original_device));
+		assert_eq!(recorded[1].2.as_deref(), Some("fixture-loid"));
+
+		// A stalled descriptor lookup cannot consume the complete OAuth deadline.
+		mode.store(2, Ordering::SeqCst);
+		let mut replacement = MobileSpoofAuth::new(RedditLane::Tor);
+		tokio::time::timeout(
+			Duration::from_millis(500),
+			replacement.authenticate_with_origins(&client, onion, public, Duration::from_millis(20)),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert!(replacement.public_auth);
+		assert_ne!(replacement.device.headers["X-Reddit-Device-Id"], original_device);
+
+		// An actual HTTP response keeps the server's rejection/backoff policy.
+		mode.store(1, Ordering::SeqCst);
+		let mut rejected = MobileSpoofAuth::new(RedditLane::Tor);
+		let count = destinations.lock().unwrap().len();
+		assert!(matches!(
+			rejected.authenticate_with_origins(&client, onion, public, Duration::from_millis(200)).await,
+			Err(AuthError::HttpStatus { status: 429, .. })
+		));
+		assert!(!rejected.public_auth);
+		assert_eq!(destinations.lock().unwrap().len(), count + 1);
+		// Direct auth never acquires a second origin on connection failure.
+		mode.store(0, Ordering::SeqCst);
+		let mut direct = MobileSpoofAuth::new(RedditLane::Direct);
+		let count = destinations.lock().unwrap().len();
+		assert!(direct.authenticate_with_origins(&client, onion, public, Duration::from_millis(200)).await.is_err());
+		assert_eq!(destinations.lock().unwrap().len(), count + 1);
+		proxy.abort();
+		server.abort();
+	}
+
+	#[test]
+	fn test_tor_oauth_fallback_does_not_retry_http_or_invalid_responses() {
+		assert!(AuthError::Timeout(TOR_ONION_AUTH_TIMEOUT).allows_tor_auth_fallback());
+		assert!(TOR_ONION_AUTH_TIMEOUT < TOR_OAUTH_TIMEOUT);
+		for status in [400, 401, 403, 429, 500, 503] {
+			assert!(!AuthError::HttpStatus {
+				status,
+				retry_after: None,
+				retry_after_present: false,
+				quota_headers_present: false,
+				www_authenticate_present: false
+			}
+			.allows_tor_auth_fallback());
+		}
+		assert!(!AuthError::Configuration("fixture".into()).allows_tor_auth_fallback());
+		assert!(!AuthError::Field("access_token").allows_tor_auth_fallback());
 	}
 
 	#[test]

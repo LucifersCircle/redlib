@@ -1,5 +1,7 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, quota_rotation_in_progress, spawn_rate_limit_refresh, token_daemon, Oauth, RefreshReason};
+use crate::oauth::{
+	force_refresh_token, quota_rotation_in_progress, refresh_backoff_remaining, spawn_rate_limit_refresh, token_daemon, token_refresh_notify, Oauth, RefreshReason,
+};
 use crate::reddit_graphql::{CommentsRequest, ErrorKind as GraphqlErrorKind, GraphqlError};
 use crate::reddit_lane::{RedditLane, RedditOrigin, PRIMARY_REDDIT_LANE, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
@@ -1863,7 +1865,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 	if guard.rejected_oauth_generation == Some(generation) {
 		return Err(BeginAttemptDenied {
 			admission: None,
-			message: "Refreshing the anonymous Reddit session. Retry in 2 seconds".to_string(),
+			message: session_refresh_wait_message(refresh_backoff_remaining(lane)),
 			edge_deferred: false,
 			quota_spillover: None,
 			tor_quota_refresh: None,
@@ -2545,7 +2547,7 @@ async fn canonical_direct_then_tor(path: String, tries: i8) -> Result<Option<Str
 	};
 	recover_after_direct_standby(direct, || async {
 		let recovery = async {
-			wait_for_tor_recovery(&path).await;
+			wait_for_tor_recovery(&path).await?;
 			canonical_path_on_lane(path.clone(), tries, RedditLane::Tor).await.map_err(CanonicalPathError::into_message)
 		};
 		match tokio::time::timeout(TOR_STANDBY_RECOVERY_TIMEOUT, recovery).await {
@@ -3341,24 +3343,42 @@ where
 	}
 }
 
-async fn wait_for_tor_recovery(path: &str) {
+fn session_refresh_wait_message(backoff: Option<Duration>) -> String {
+	match backoff {
+		Some(delay) => format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", retry_after_seconds(delay)),
+		None => "Refreshing the anonymous Reddit session. Retry in 2 seconds".to_string(),
+	}
+}
+
+async fn wait_for_tor_recovery(path: &str) -> Result<(), String> {
 	loop {
 		// No transport permits are held while waiting for cooldown or OAuth.
 		let changed = quota_notify(RedditLane::Tor).notified();
-		let delay = {
+		let refresh_changed = token_refresh_notify(RedditLane::Tor).notified();
+		let (delay, rejected) = {
 			let guard = upstream_guard(RedditLane::Tor);
-			guard
+			let delay = guard
 				.active_endpoint_cooldown(Instant::now(), endpoint_class_index(path))
 				.map(|(delay, _)| delay)
-				.or_else(|| guard.rejected_oauth_generation.map(|_| LOCAL_QUOTA_RETRY_INTERVAL))
+				.or_else(|| guard.rejected_oauth_generation.map(|_| LOCAL_QUOTA_RETRY_INTERVAL));
+			(delay, guard.rejected_oauth_generation.is_some())
 		};
-		let Some(delay) = delay else { return };
-		tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed => {} }
+		if rejected {
+			if let Some(backoff) = refresh_backoff_remaining(RedditLane::Tor) {
+				return Err(session_refresh_wait_message(Some(backoff)));
+			}
+		}
+		let Some(delay) = delay else { return Ok(()) };
+		tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed => {}, _ = refresh_changed => {} }
 	}
 }
 
 fn tor_recovery_wait_message(path: &str) -> String {
-	let delay = upstream_guard(RedditLane::Tor)
+	let guard = upstream_guard(RedditLane::Tor);
+	if guard.rejected_oauth_generation.is_some() {
+		return session_refresh_wait_message(refresh_backoff_remaining(RedditLane::Tor));
+	}
+	let delay = guard
 		.active_endpoint_cooldown(Instant::now(), endpoint_class_index(path))
 		.map_or(Duration::from_secs(5), |(delay, _)| delay);
 	format!(
@@ -3371,7 +3391,7 @@ async fn direct_then_tor_request(path: String, quarantine: bool) -> Result<Value
 	recover_after_direct_standby(direct_standby_request(path.clone(), quarantine), || async move {
 		info!("Returning to Tor after direct standby did not recover the page: endpoint={}", endpoint_class(&path));
 		let recovery = async {
-			wait_for_tor_recovery(&path).await;
+			wait_for_tor_recovery(&path).await?;
 			json_uncached_on_lane(path.clone(), quarantine, RedditLane::Tor).await.0
 		};
 		match tokio::time::timeout(TOR_STANDBY_RECOVERY_TIMEOUT, recovery).await {
@@ -3799,7 +3819,7 @@ async fn json_uncached_on_lane_with_options(
 					if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Tor {
 						start_rejected_session_refresh(lane, request_generation);
 						retry_reason = TorRetryReason::SessionUnavailable;
-						return Err("Refreshing the anonymous Reddit session. Retry in 2 seconds".to_string());
+						return Err(session_refresh_wait_message(refresh_backoff_remaining(lane)));
 					}
 					error!("Reddit rejected the OAuth token; forcing a refresh");
 					let outcome = force_refresh_token(lane, RefreshReason::Unauthorized).await;
@@ -4457,6 +4477,44 @@ mod tests {
 		assert_eq!(parsed.port(), Some(9050));
 		assert_eq!(parsed.username(), "identity-17");
 		assert_eq!(parsed.password(), Some("identity-17"));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "off")])]
+	fn test_tor_first_refresh_backoff_returns_without_another_recovery_wait() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			let client = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			install_oauth_client(Oauth::request_fixture(lane, client), true, None);
+			assert!(upstream_guard(lane).reject_oauth_generation(0));
+			crate::oauth::set_refresh_backoff_for_test(lane, Some(Duration::from_secs(120)));
+			let denied = begin_upstream_attempt_once(lane, false, 0).err().expect("rejected credentials must not be admitted");
+			assert_eq!(denied.message, "OAuth token refresh is temporarily unavailable. Retry in 120 seconds");
+			let result = tokio::time::timeout(Duration::from_millis(100), wait_for_tor_recovery("/r/rust/hot.json"))
+				.await
+				.expect("backoff must not wait thirty seconds");
+			assert_eq!(result, Err(denied.message.clone()));
+			assert_eq!(tor_recovery_wait_message("/r/rust/hot.json"), denied.message);
+
+			// A failure wakes existing waiters; it must not leave them polling
+			// a two-second message throughout the six-minute retry pause.
+			crate::oauth::set_refresh_backoff_for_test(lane, None);
+			let waiter = tokio::spawn(wait_for_tor_recovery("/r/rust/hot.json"));
+			tokio::task::yield_now().await;
+			crate::oauth::set_refresh_backoff_for_test(lane, Some(Duration::from_secs(300)));
+			token_refresh_notify(lane).notify_waiters();
+			let result = tokio::time::timeout(Duration::from_millis(100), waiter).await.expect("failure must wake recovery").unwrap();
+			assert_eq!(result, Err("OAuth token refresh is temporarily unavailable. Retry in 300 seconds".into()));
+
+			crate::oauth::set_refresh_backoff_for_test(lane, None);
+			let waiter = tokio::spawn(wait_for_tor_recovery("/r/rust/hot.json"));
+			tokio::task::yield_now().await;
+			let mut replacement = Oauth::request_fixture(lane, Arc::new(WreqClient::builder().no_proxy().build().unwrap()));
+			replacement.generation = 1;
+			install_oauth_client(replacement, false, None);
+			assert_eq!(tokio::time::timeout(Duration::from_millis(100), waiter).await.unwrap().unwrap(), Ok(()));
+			assert_eq!(session_refresh_wait_message(None), "Refreshing the anonymous Reddit session. Retry in 2 seconds");
+		});
 	}
 
 	#[tokio::test]
