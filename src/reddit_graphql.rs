@@ -345,7 +345,7 @@ pub(crate) fn legacy_post(post: &Value, depth: usize) -> Value {
 	let content = &post["content"];
 	let text = content["markdown"].as_str().unwrap_or_default();
 	let mut data = json!({"id":short_id(&post["id"]),"name":post["id"],"title":post["postTitle"].as_str().or_else(||post["title"].as_str()).unwrap_or_default(),
-        "author":author(&post["authorInfo"]),"subreddit":post["subreddit"]["name"],"subreddit_id":post["subreddit"]["id"],"permalink":post["permalink"],
+        "author":author(&post["authorInfo"]),"subreddit":post["subreddit"]["name"].as_str().or_else(||post["profile"]["name"].as_str()),"subreddit_id":post["subreddit"]["id"],"permalink":post["permalink"],
         "created_utc":timestamp(&post["createdAt"]),"score":post["score"],"upvote_ratio":post["upvoteRatio"],"num_comments":post["commentCount"],
         "domain":post["domain"],"url":post["url"],"url_overridden_by_dest":post["url"],"selftext":text,"selftext_html":markdown(text,content),
         "is_self":post["isSelfPost"] == true,"over_18":post["isNsfw"] == true,"spoiler":post["isSpoiler"] == true,"stickied":post["isStickied"] == true,

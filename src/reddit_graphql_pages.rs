@@ -417,6 +417,7 @@ fn post_items(posts: &[Value], quarantine: bool) -> Result<Vec<Value>, GraphqlEr
 	let mut result = Vec::new();
 	let mut seen = HashSet::new();
 	for post in posts {
+		let post = if post["postInfo"].is_object() { &post["postInfo"] } else { post };
 		if !matches!(post["__typename"].as_str(), Some("SubredditPost" | "ProfilePost")) {
 			continue;
 		}

@@ -159,3 +159,13 @@ fn test_graphql_pages_search_and_metadata_keep_resource_restrictions() {
 	assert_eq!(page["data"]["children"].as_array().unwrap().len(), 1);
 	assert_eq!(page["data"]["after"], "opaque-search-cursor");
 }
+
+#[test]
+fn test_graphql_pages_popular_feed_unwraps_post_info_envelopes() {
+	let request = PageRequest::from_path("/r/popular/hot.json", false).unwrap();
+	let page = request
+		.finish(&[json!({"data":{"popular":{"elements":conn(vec![json!({"__typename":"PostFeedElement","postInfo":post("wrapped",1)})],Some("t3_wrapped"))}}})])
+		.unwrap();
+	assert_eq!(page["data"]["children"][0]["data"]["name"], "t3_wrapped");
+	assert_eq!(page["data"]["after"], "t3_wrapped");
+}
