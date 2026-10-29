@@ -1390,3 +1390,86 @@ mod tests {
 		assert_ne!(rotated_device_id, original_device_id);
 	}
 }
+
+#[cfg(test)]
+mod live_tor_transport_isolation {
+	use super::*;
+	use crate::server::RequestExt;
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated live Tor listing outage and concurrent rendered comments"]
+	async fn live_tor_transport_isolation_under_onion_failure() {
+		let _ = pretty_env_logger::try_init();
+		let lane = RedditLane::Tor;
+		let profile = OauthTransportProfile::Chrome145Android;
+		let http = client_for_oauth_profile(lane, profile).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let oauth = Oauth::authenticate_with_backend(&mut backend, http, profile).await.expect("anonymous Tor OAuth");
+		assert!(oauth.backend.public_auth, "exercise the real onion outage");
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		let before = crate::client::live_isolation_snapshot();
+		assert_eq!(before.0, 4);
+		assert_eq!(before.1, 2);
+		let mut listings = Vec::new();
+		for path in [
+			"/r/rust/hot.json?limit=1&raw_json=1",
+			"/r/popular/hot.json?limit=1&raw_json=1",
+			"/r/gaming/hot.json?limit=1&raw_json=1",
+			"/user/spez/about.json?raw_json=1",
+		] {
+			listings.push(tokio::spawn(async move {
+				let started = Instant::now();
+				let result = tokio::time::timeout(Duration::from_secs(35), crate::client::json(path.into(), false)).await;
+				let failed = !matches!(result, Ok(Ok(_)));
+				println!("LIVE_ISOLATION onion_failed={} elapsed_ms={}", failed, started.elapsed().as_millis());
+				assert!(failed, "known descriptor outage should fail onion reads");
+			}));
+		}
+		tokio::time::timeout(Duration::from_secs(2), async {
+			while crate::client::live_isolation_snapshot().1 != 0 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("two real onion requests must be in flight");
+		let loaded = crate::client::live_isolation_snapshot();
+		assert!(loaded.0 >= 2, "onion traffic must leave comment capacity");
+		println!(
+			"LIVE_ISOLATION concurrent_onion=2 total_slots_available={} direct_sends={} tor_sends={}",
+			loaded.0, loaded.4, loaded.5
+		);
+		for (sub, id, slug) in [
+			("SteamDeck", "1xci3c1", "ar_glasses_hub"),
+			("gaming", "1xcfm9l", "the_nintendo_switch_2_has_been_hacked_first"),
+		] {
+			let started = Instant::now();
+			let path = format!("/r/{sub}/comments/{id}/{slug}/?sort=new");
+			let mut request = hyper::Request::builder().uri(path).body(hyper::Body::empty()).unwrap();
+			let mut params = route_recognizer::Params::new();
+			params.insert("sub".into(), sub.into());
+			params.insert("id".into(), id.into());
+			request.set_params(params);
+			let response = tokio::time::timeout(Duration::from_secs(30), crate::post::item(request)).await.unwrap().unwrap();
+			assert_eq!(response.status(), 200);
+			let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let body = String::from_utf8(bytes.to_vec()).unwrap();
+			let comments = body.matches("class=\"comment\"").count();
+			assert!(comments > 0);
+			assert!(!body.contains("Still trying to load your page"));
+			println!("LIVE_ISOLATION page={} status=200 comments={} elapsed_ms={}", id, comments, started.elapsed().as_millis());
+		}
+		for listing in listings {
+			listing.await.unwrap();
+		}
+		let after = crate::client::live_isolation_snapshot();
+		assert!(after.2, "comments must not clear the failed onion service's cooldown");
+		assert!(!after.3, "onion failure must not open comments cooldown");
+		assert_eq!(after.0, 4);
+		assert_eq!(after.1, 2);
+		assert_eq!(after.4, 0);
+		assert!(after.5 <= 6, "only two initial onion sends plus four comment reads should reach Reddit");
+		println!(
+			"LIVE_ISOLATION completed onion_cooldown={} comments_cooldown={} direct_sends={} tor_sends={} all_slots_released=true",
+			after.2, after.3, after.4, after.5
+		);
+	}
+}

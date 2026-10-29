@@ -7406,3 +7406,17 @@ mod tests {
 		assert_eq!(link, Err("gated".into()));
 	}
 }
+
+#[cfg(test)]
+pub(crate) fn live_isolation_snapshot() -> (usize, usize, bool, bool, u64, u64) {
+	let guard = upstream_guard(RedditLane::Tor);
+	let now = Instant::now();
+	(
+		api_concurrency(RedditLane::Tor).available_permits(),
+		TOR_ONION_CONCURRENCY.available_permits(),
+		guard.active_endpoint_cooldown(now, 0).is_some(),
+		guard.active_endpoint_cooldown(now, 4).is_some(),
+		API_LANE_SENDS[0].load(Ordering::Relaxed),
+		API_LANE_SENDS[1].load(Ordering::Relaxed),
+	)
+}

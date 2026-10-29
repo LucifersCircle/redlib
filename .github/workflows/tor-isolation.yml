@@ -1,0 +1,45 @@
+name: Verify comments during concurrent Tor onion failures
+on:
+  push:
+    branches: [diagnostics/tor-transport-isolation-20261029]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REDLIB_TOR_FALLBACK: "on"
+      REDLIB_REDDIT_PRIMARY_LANE: tor
+      REDLIB_TOR_PROXY: socks5h://127.0.0.1:19050
+      REDLIB_REDDIT_MAX_CONCURRENCY: "4"
+      RUST_LOG: redlib=info
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        id: rust_cache
+      - name: Install native build dependencies
+        if: steps.rust_cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libclang-dev
+      - name: Install Tor
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tor
+      - name: Bootstrap isolated Tor
+        run: |
+          mkdir -p "$RUNNER_TEMP/tor-isolation"
+          tor --SocksPort "127.0.0.1:19050 IsolateSOCKSAuth ExtendedErrors" --DataDirectory "$RUNNER_TEMP/tor-isolation" --Log "notice file $RUNNER_TEMP/tor-isolation.log" &
+          for attempt in $(seq 1 240); do
+            if grep -q 'Bootstrapped 100%' "$RUNNER_TEMP/tor-isolation.log"; then
+              echo 'Tor bootstrap complete'
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -15 "$RUNNER_TEMP/tor-isolation.log"
+          exit 1
+      - name: Render comments alongside failing and queued onion listings
+        run: cargo test --locked --lib live_tor_transport_isolation_under_onion_failure -- --ignored --nocapture
+      - name: Tor notices
+        if: always()
+        run: tail -20 "$RUNNER_TEMP/tor-isolation.log"
