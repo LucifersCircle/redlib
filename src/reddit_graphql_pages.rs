@@ -33,7 +33,9 @@ enum Page {
 	Feed(&'static str),
 	All,
 	About,
-	Search,
+	Search {
+		community_only: bool,
+	},
 	Profile(String),
 	UserPosts,
 	UserComments,
@@ -174,7 +176,11 @@ impl PageRequest {
 				if let Some(sort) = request.query.get("sort").filter(|s| !s.is_empty()) {
 					filters.push(json!({"key":"sort","value":sort.to_uppercase()}));
 				}
-				if let Some(range) = request.query.get("t").filter(|s| !s.is_empty() && !matches!(request.sort.as_str(), "hot" | "new")) {
+				if let Some(range) = request
+					.query
+					.get("t")
+					.filter(|s| !s.is_empty() && !matches!(request.query.get("sort").map(String::as_str), Some("hot" | "new")))
+				{
 					filters.push(json!({"key":"time_range","value":range}));
 				}
 				let options = [
@@ -189,7 +195,9 @@ impl PageRequest {
 				text.hash(&mut hasher);
 				let hash = hasher.finish();
 				let query_id = uuid::Uuid::from_bytes(((u128::from(hash) << 64) | u128::from(hash.rotate_left(32))).to_le_bytes());
-				request.page = Page::Search;
+				request.page = Page::Search {
+					community_only: pane == "communities",
+				};
 				request.push(
 					"DynamicSearch",
 					SEARCH,
@@ -308,11 +316,12 @@ impl PageRequest {
 				values.push(json!({"data":{key:[]}}));
 				continue;
 			}
-			return Ok(Some(operation(
-				name,
-				hash,
-				json!({"ids":ids,"includePremiumAvatarTreatment":false,"includePostContentPostHint":true,"includePostContentThumbnailEnabled":true}),
-			)));
+			let variables = if name == "PostsByIds" {
+				json!({"ids":ids,"includePostContentPostHint":true,"includePostContentThumbnailEnabled":true})
+			} else {
+				json!({"ids":ids,"includePremiumAvatarTreatment":false})
+			};
+			return Ok(Some(operation(name, hash, variables)));
 		}
 	}
 	pub(crate) fn finish(&self, values: &[Value]) -> Result<Value, GraphqlError> {
@@ -323,7 +332,7 @@ impl PageRequest {
 				listing(post_items(posts, self.quarantine)?, cursor(connection(&values[0], "/data/allV3/elements")?)?)
 			}
 			Page::About => subreddit(&values[0]["data"]["subredditInfoByName"], self.quarantine)?,
-			Page::Search => {
+			Page::Search { community_only } => {
 				let main = connection(&values[0], "/data/search/dynamic/components/main")?;
 				let edges = main["edges"].as_array().ok_or_else(|| invalid("missing_search_results"))?;
 				let mut children = Vec::new();
@@ -334,7 +343,10 @@ impl PageRequest {
 						_ => {}
 					}
 				}
-				listing(children, cursor(main)?)
+				if *community_only {
+					children.truncate(self.limit);
+				}
+				listing(children, raw_cursor(main)?)
 			}
 			Page::Profile(name) => {
 				let profile = &values[0]["data"]["profileByName"];
@@ -392,7 +404,7 @@ fn connection<'a>(value: &'a Value, pointer: &str) -> Result<&'a Value, GraphqlE
 	}
 	value.pointer(pointer).filter(|v| v.is_object()).ok_or_else(|| invalid("missing_page_connection"))
 }
-fn cursor(connection: &Value) -> Result<Option<String>, GraphqlError> {
+fn raw_cursor(connection: &Value) -> Result<Option<String>, GraphqlError> {
 	if connection["pageInfo"]["hasNextPage"] == false {
 		return Ok(None);
 	}
@@ -403,16 +415,12 @@ fn cursor(connection: &Value) -> Result<Option<String>, GraphqlError> {
 			Err(invalid("missing_page_cursor"))
 		};
 	};
-	// Feed endpoints use base64 fullnames; search cursors are already opaque.
-	Ok(Some(
-		STANDARD
-			.decode(end)
-			.ok()
-			.and_then(|v| String::from_utf8(v).ok())
-			.filter(|s| s.starts_with("t3_") || s.starts_with("t1_"))
-			.unwrap_or_else(|| end.into()),
-	))
+	Ok(Some(end.into()))
 }
+fn cursor(connection: &Value) -> Result<Option<String>, GraphqlError> {
+	Ok(raw_cursor(connection)?.map(|end| STANDARD.decode(&end).ok().and_then(|v| String::from_utf8(v).ok()).unwrap_or(end)))
+}
+
 fn post_items(posts: &[Value], quarantine: bool) -> Result<Vec<Value>, GraphqlError> {
 	let mut result = Vec::new();
 	let mut seen = HashSet::new();
@@ -434,6 +442,9 @@ fn post_items(posts: &[Value], quarantine: bool) -> Result<Vec<Value>, GraphqlEr
 			return Err(GraphqlError::resource("private"));
 		}
 		result.push(json!({"kind":"t3","data":legacy_post(post,0)}));
+	}
+	if !posts.is_empty() && result.is_empty() {
+		return Err(invalid("missing_feed_posts"));
 	}
 	Ok(result)
 }

@@ -169,3 +169,26 @@ fn test_graphql_pages_popular_feed_unwraps_post_info_envelopes() {
 	assert_eq!(page["data"]["children"][0]["data"]["name"], "t3_wrapped");
 	assert_eq!(page["data"]["after"], "t3_wrapped");
 }
+
+#[test]
+fn test_graphql_pages_changed_post_envelope_is_an_error_not_an_empty_page() {
+	let request = PageRequest::from_path("/r/rust/new.json", false).unwrap();
+	assert!(request.finish(&[feed_value(vec![json!({"unexpectedPostEnvelope":post("a",1)})], None)]).is_err());
+	let cursor = STANDARD.encode("opaque cursor containing rank metadata");
+	assert_eq!(
+		super::cursor(&json!({"edges":[{}],"pageInfo":{"hasNextPage":true,"endCursor":cursor}})).unwrap(),
+		Some("opaque cursor containing rank metadata".into())
+	);
+}
+
+#[test]
+fn test_graphql_pages_community_summary_respects_limit() {
+	let request = PageRequest::from_path("/subreddits/search.json?q=rust&limit=1", false).unwrap();
+	let results = ["alpha", "beta"].map(|name| json!({"__typename":"SearchCommunity","community":{"name":name}}));
+	let page = request
+		.finish(&[json!({"data":{"search":{"dynamic":{"components":{"main":{
+				"edges":[{"node":{"children":results}}],"pageInfo":{"hasNextPage":false}
+		}}}}}})])
+		.unwrap();
+	assert_eq!(page["data"]["children"].as_array().unwrap().len(), 1);
+}
