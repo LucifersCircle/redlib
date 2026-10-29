@@ -54,6 +54,8 @@ const MAX_CONFIGURED_API_REQUESTS: usize = 64;
 const FAILURE_WINDOW: Duration = Duration::from_secs(10);
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 const FAILURE_THRESHOLD: u8 = 3;
+const TOR_ONION_FAILURE_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const TOR_ONION_FAILURE_MAX_DELAY: Duration = Duration::from_secs(60);
 const MAX_TRANSPORT_RETRIES: u8 = 2;
 const TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const TRANSPORT_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -62,6 +64,8 @@ const UPSTREAM_RECOVERY_BUDGET: Duration = Duration::from_secs(45);
 const CAPACITY_WAIT_BUDGET: Duration = Duration::from_secs(15);
 static DIRECT_RECOVERY_PROBE: Semaphore = Semaphore::const_new(1);
 static TOR_RECOVERY_PROBE: Semaphore = Semaphore::const_new(1);
+static TOR_ONION_RECOVERY_PROBE: Semaphore = Semaphore::const_new(1);
+static TOR_ONION_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(onion_concurrency_limit(max_concurrent_api_requests())));
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_COOLDOWN_MARGIN: Duration = Duration::from_secs(2);
@@ -587,6 +591,52 @@ struct EdgeCircuit {
 	episode_started_at: Option<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct TransportHealth {
+	failure_window_started: Option<Instant>,
+	failures_in_window: u8,
+	blocked_until: Option<Instant>,
+	consecutive_onion_failures: u8,
+}
+
+impl TransportHealth {
+	fn record_failure(&mut self, now: Instant, onion: bool) -> bool {
+		if onion {
+			self.consecutive_onion_failures = self.consecutive_onion_failures.saturating_add(1);
+			let exponent = u32::from(self.consecutive_onion_failures.saturating_sub(1).min(4));
+			let delay = Duration::from_secs(TOR_ONION_FAILURE_INITIAL_DELAY.as_secs() << exponent).min(TOR_ONION_FAILURE_MAX_DELAY);
+			UpstreamGuard::extend_deadline(&mut self.blocked_until, now, proportional_positive_jitter(delay));
+			return true;
+		}
+		if self.failure_window_started.map_or(true, |started| now.duration_since(started) > FAILURE_WINDOW) {
+			self.failure_window_started = Some(now);
+			self.failures_in_window = 0;
+		}
+		self.failures_in_window = self.failures_in_window.saturating_add(1);
+		if self.failures_in_window >= FAILURE_THRESHOLD {
+			UpstreamGuard::extend_deadline(&mut self.blocked_until, now, proportional_positive_jitter(FAILURE_COOLDOWN));
+			self.reset_failure_window();
+			true
+		} else {
+			false
+		}
+	}
+
+	fn reset_failure_window(&mut self) {
+		self.failure_window_started = None;
+		self.failures_in_window = 0;
+	}
+
+	fn record_success(&mut self, now: Instant) {
+		// A late successful request cannot erase a more recent failure pause.
+		self.reset_failure_window();
+		if self.blocked_until.map_or(true, |until| until <= now) {
+			self.blocked_until = None;
+			self.consecutive_onion_failures = 0;
+		}
+	}
+}
+
 #[derive(Debug)]
 struct UpstreamGuard {
 	lane: RedditLane,
@@ -596,9 +646,8 @@ struct UpstreamGuard {
 	quota_rotation_armed: bool,
 	quota_wait_logged_epoch: Option<u64>,
 	emergency_rotation_claimed_epoch: Option<u64>,
-	failure_window_started: Option<Instant>,
-	failures_in_window: u8,
-	upstream_failure_blocked_until: Option<Instant>,
+	transport: TransportHealth,
+	onion_transport: TransportHealth,
 	rate_limit_blocked_until: Option<Instant>,
 	edges: [EdgeCircuit; 7],
 	identity_installed_at: Instant,
@@ -622,9 +671,8 @@ impl UpstreamGuard {
 			quota_rotation_armed: false,
 			quota_wait_logged_epoch: None,
 			emergency_rotation_claimed_epoch: None,
-			failure_window_started: None,
-			failures_in_window: 0,
-			upstream_failure_blocked_until: None,
+			transport: TransportHealth::default(),
+			onion_transport: TransportHealth::default(),
 			rate_limit_blocked_until: None,
 			edges: std::array::from_fn(|_| EdgeCircuit::default()),
 			identity_installed_at: Instant::now(),
@@ -652,6 +700,41 @@ impl UpstreamGuard {
 		}
 	}
 
+	fn uses_onion_transport(&self, endpoint: usize) -> bool {
+		self.lane == RedditLane::Tor && QuotaBudget::for_endpoint(endpoint) == QuotaBudget::Rest
+	}
+
+	fn transport_health(&self, endpoint: usize) -> &TransportHealth {
+		if self.uses_onion_transport(endpoint) {
+			&self.onion_transport
+		} else {
+			&self.transport
+		}
+	}
+
+	fn transport_health_mut(&mut self, endpoint: usize) -> &mut TransportHealth {
+		if self.uses_onion_transport(endpoint) {
+			&mut self.onion_transport
+		} else {
+			&mut self.transport
+		}
+	}
+
+	fn record_endpoint_failure(&mut self, now: Instant, endpoint: usize) -> bool {
+		let onion = self.uses_onion_transport(endpoint);
+		self.transport_health_mut(endpoint).record_failure(now, onion)
+	}
+
+	#[cfg(test)]
+	fn record_failure(&mut self, now: Instant) -> bool {
+		self.record_endpoint_failure(now, 0)
+	}
+
+	#[cfg(test)]
+	fn reset_failure_window(&mut self) {
+		self.transport_health_mut(0).reset_failure_window();
+	}
+
 	fn routing_availability(&self, now: Instant, generation: u64, endpoint: usize) -> LaneAvailability {
 		if generation != self.quota.generation {
 			return LaneAvailability::Unavailable;
@@ -659,7 +742,7 @@ impl UpstreamGuard {
 		if self.rate_limit_deadline(QuotaBudget::for_endpoint(endpoint)).is_some_and(|until| until > now) {
 			return LaneAvailability::UpstreamQuotaCooldown;
 		}
-		if self.upstream_failure_blocked_until.is_some_and(|until| until > now) {
+		if self.transport_health(endpoint).blocked_until.is_some_and(|until| until > now) {
 			return LaneAvailability::TransportCooldown;
 		}
 		if self.rejected_oauth_generation == Some(generation) || self.active_endpoint_cooldown(now, endpoint).is_some() {
@@ -716,7 +799,7 @@ impl UpstreamGuard {
 			return false;
 		}
 		if self.rate_limit_blocked_until.is_some_and(|deadline| deadline > now)
-			|| self.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now)
+			|| self.transport_health(0).blocked_until.is_some_and(|deadline| deadline > now)
 			|| self.edges.iter().any(|edge| !matches!(edge.state, EdgeCircuitState::Closed))
 		{
 			return false;
@@ -943,7 +1026,7 @@ impl UpstreamGuard {
 		};
 
 		consider(self.rate_limit_deadline(QuotaBudget::for_endpoint(endpoint)), CooldownReason::RateLimit);
-		consider(self.upstream_failure_blocked_until, CooldownReason::UpstreamFailures);
+		consider(self.transport_health(endpoint).blocked_until, CooldownReason::UpstreamFailures);
 		match self.edges[endpoint].state {
 			EdgeCircuitState::Open { until } => consider(Some(until), CooldownReason::EdgeThrottle),
 			EdgeCircuitState::HalfOpen { expires_at, .. } => consider(Some(expires_at), CooldownReason::EdgeThrottle),
@@ -962,7 +1045,7 @@ impl UpstreamGuard {
 			}
 		};
 		consider(self.rate_limit_deadline(QuotaBudget::for_endpoint(attempt.endpoint)), CooldownReason::RateLimit);
-		consider(self.upstream_failure_blocked_until, CooldownReason::UpstreamFailures);
+		consider(self.transport_health(attempt.endpoint).blocked_until, CooldownReason::UpstreamFailures);
 		match self.edges[attempt.endpoint].state {
 			EdgeCircuitState::Closed if attempt.epoch == self.edges[attempt.endpoint].epoch => {}
 			EdgeCircuitState::HalfOpen { epoch, .. } if attempt.half_open && attempt.epoch == epoch => {}
@@ -1023,35 +1106,9 @@ impl UpstreamGuard {
 		}
 	}
 
-	fn record_failure(&mut self, now: Instant) -> bool {
-		if self.failure_window_started.map_or(true, |started| now.duration_since(started) > FAILURE_WINDOW) {
-			self.failure_window_started = Some(now);
-			self.failures_in_window = 0;
-		}
-
-		self.failures_in_window = self.failures_in_window.saturating_add(1);
-		if self.failures_in_window >= FAILURE_THRESHOLD {
-			Self::extend_deadline(&mut self.upstream_failure_blocked_until, now, proportional_positive_jitter(FAILURE_COOLDOWN));
-			self.failure_window_started = None;
-			self.failures_in_window = 0;
-			true
-		} else {
-			false
-		}
-	}
-
-	fn reset_failure_window(&mut self) {
-		self.failure_window_started = None;
-		self.failures_in_window = 0;
-	}
-
 	fn record_api_success(&mut self, now: Instant, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
-		self.reset_failure_window();
+		self.transport_health_mut(attempt.endpoint).record_success(now);
 		let closes_probe = matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
-		// A success cannot end a cooldown extended by another in-flight failure.
-		if self.upstream_failure_blocked_until.is_some_and(|until| now >= until) {
-			self.upstream_failure_blocked_until = None;
-		}
 		if self.rate_limit_blocked_until.is_some_and(|until| now >= until) {
 			self.rate_limit_blocked_until = None;
 		}
@@ -1643,6 +1700,16 @@ fn quota_notify(lane: RedditLane) -> &'static Notify {
 	}
 }
 
+fn onion_concurrency_limit(total: usize) -> usize {
+	// Keep capacity for public HTTPS comments while onion streams stall.
+	(total / 2).max(1)
+}
+
+struct ApiCapacityPermit {
+	_total: SemaphorePermit<'static>,
+	_onion: Option<SemaphorePermit<'static>>,
+}
+
 fn api_concurrency(lane: RedditLane) -> &'static Semaphore {
 	match lane {
 		RedditLane::Direct => &DIRECT_REDDIT_API_CONCURRENCY,
@@ -1690,7 +1757,7 @@ fn tor_fallback_ready(path: &str) -> bool {
 
 fn edge_fallback_active(guard: &UpstreamGuard, now: Instant, endpoint: usize) -> bool {
 	if guard.rate_limit_deadline(QuotaBudget::for_endpoint(endpoint)).is_some_and(|deadline| deadline > now)
-		|| guard.upstream_failure_blocked_until.is_some_and(|deadline| deadline > now)
+		|| guard.transport_health(endpoint).blocked_until.is_some_and(|deadline| deadline > now)
 	{
 		return false;
 	}
@@ -1923,7 +1990,7 @@ async fn begin_upstream_attempt(
 	endpoint: usize,
 	mode: AdmissionRetryMode,
 	tor_refresh: &mut TorQuotaRefreshRetryState,
-) -> Result<(Arc<Oauth>, UpstreamAttempt, SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
+) -> Result<(Arc<Oauth>, UpstreamAttempt, ApiCapacityPermit, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
 	let started = Instant::now();
 	let capacity_deadline = tokio::time::Instant::now() + CAPACITY_WAIT_BUDGET;
 	let mut retry_count = 0;
@@ -1992,7 +2059,7 @@ async fn acquire_attempt_capacity(
 	endpoint: usize,
 	mode: AdmissionRetryMode,
 	deadline: tokio::time::Instant,
-) -> Result<(SemaphorePermit<'static>, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
+) -> Result<(ApiCapacityPermit, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
 	let denied = || BeginAttemptDenied {
 		message: "Reddit API request timed out while waiting for transport capacity".to_string(),
 		edge_deferred: false,
@@ -2011,16 +2078,40 @@ async fn acquire_attempt_capacity(
 	// a preceding probe may already have restored normal service.
 	let recovery = || {
 		let guard = upstream_guard(lane);
-		guard.upstream_failure_blocked_until.is_some() || guard.rate_limit_deadline(QuotaBudget::for_endpoint(endpoint)).is_some()
+		guard.transport_health(endpoint).blocked_until.is_some() || guard.rate_limit_deadline(QuotaBudget::for_endpoint(endpoint)).is_some()
 	};
-	let gate = match lane {
-		RedditLane::Direct => &DIRECT_RECOVERY_PROBE,
-		RedditLane::Tor => &TOR_RECOVERY_PROBE,
+	let onion = lane == RedditLane::Tor && QuotaBudget::for_endpoint(endpoint) == QuotaBudget::Rest;
+	// Acquire the onion cap before total capacity. Queued onion requests must
+	// never occupy a total slot while waiting for their own cap or probe.
+	let onion_permit = if onion {
+		Some(if mode == AdmissionRetryMode::Immediate {
+			TOR_ONION_CONCURRENCY.try_acquire().map_err(|_| denied())?
+		} else {
+			tokio::time::timeout_at(deadline, TOR_ONION_CONCURRENCY.acquire())
+				.await
+				.map_err(|_| denied())?
+				.map_err(|_| denied())?
+		})
+	} else {
+		None
 	};
-	if mode == AdmissionRetryMode::Immediate {
-		return acquire_immediate_recovery_capacity(api_concurrency(lane), gate, recovery).map_err(|_| denied());
-	}
-	acquire_recovery_capacity(api_concurrency(lane), gate, deadline, recovery).await.map_err(|_| denied())
+	let gate = match (lane, onion) {
+		(RedditLane::Direct, _) => &DIRECT_RECOVERY_PROBE,
+		(RedditLane::Tor, true) => &TOR_ONION_RECOVERY_PROBE,
+		(RedditLane::Tor, false) => &TOR_RECOVERY_PROBE,
+	};
+	let (permit, probe) = if mode == AdmissionRetryMode::Immediate {
+		acquire_immediate_recovery_capacity(api_concurrency(lane), gate, recovery).map_err(|_| denied())?
+	} else {
+		acquire_recovery_capacity(api_concurrency(lane), gate, deadline, recovery).await.map_err(|_| denied())?
+	};
+	Ok((
+		ApiCapacityPermit {
+			_total: permit,
+			_onion: onion_permit,
+		},
+		probe,
+	))
 }
 
 fn acquire_immediate_recovery_capacity<'a>(
@@ -2195,12 +2286,17 @@ fn record_upstream_failure(lane: RedditLane, kind: &str, status: Option<u16>, pa
 		trace!("Ignoring stale Reddit upstream failure: kind={kind} endpoint={}", endpoint_class(path));
 		return;
 	}
-	let opened = guard.record_failure(Instant::now());
+	let opened = guard.record_endpoint_failure(Instant::now(), endpoint_class_index(path));
 	warn!(
-		"Reddit upstream failure: lane={} kind={kind} status={} endpoint={} circuit_opened={opened}",
+		"Reddit upstream failure: lane={} kind={kind} status={} endpoint={} transport={} circuit_opened={opened}",
 		lane.label(),
 		status.map_or_else(|| "transport".to_string(), |status| status.to_string()),
 		endpoint_class(path),
+		if lane == RedditLane::Tor && QuotaBudget::for_endpoint(endpoint_class_index(path)) == QuotaBudget::Rest {
+			"onion_rest"
+		} else {
+			"public_https"
+		},
 	);
 }
 
@@ -3343,6 +3439,13 @@ where
 	}
 }
 
+fn onion_recovery_wait_message(delay: Duration) -> String {
+	format!(
+		"Reddit requests are temporarily paused while the Tor onion API recovers. Retry in {} seconds",
+		retry_after_seconds(delay)
+	)
+}
+
 fn session_refresh_wait_message(backoff: Option<Duration>) -> String {
 	match backoff {
 		Some(delay) => format!("OAuth token refresh is temporarily unavailable. Retry in {} seconds", retry_after_seconds(delay)),
@@ -3366,6 +3469,11 @@ async fn wait_for_tor_recovery(path: &str) -> Result<(), String> {
 		if rejected {
 			if let Some(backoff) = refresh_backoff_remaining(RedditLane::Tor) {
 				return Err(session_refresh_wait_message(Some(backoff)));
+			}
+		}
+		if QuotaBudget::for_endpoint(endpoint_class_index(path)) == QuotaBudget::Rest {
+			if let Some((delay, CooldownReason::UpstreamFailures)) = upstream_guard(RedditLane::Tor).active_endpoint_cooldown(Instant::now(), endpoint_class_index(path)) {
+				return Err(onion_recovery_wait_message(delay));
 			}
 		}
 		let Some(delay) = delay else { return Ok(()) };
@@ -3528,6 +3636,12 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 		{
 			return (result, TorRetryReason::TransportUnavailable);
 		}
+		if lane == RedditLane::Tor && QuotaBudget::for_endpoint(endpoint_class_index(&path)) == QuotaBudget::Rest {
+			if let Some((delay, CooldownReason::UpstreamFailures)) = upstream_guard(lane).active_endpoint_cooldown(Instant::now(), endpoint_class_index(&path)) {
+				return (Err(onion_recovery_wait_message(delay)), TorRetryReason::TransportUnavailable);
+			}
+		}
+
 		let delay = match recovery_reason {
 			LaneRecoveryReason::TorQuotaRefreshWait(ticket) => {
 				if !tor_refresh.claim_redirect_replay(lane, ticket, Instant::now()) {
@@ -4536,6 +4650,149 @@ mod tests {
 	}
 
 	#[test]
+	fn test_tor_transport_health_isolates_onion_from_comments() {
+		let now = Instant::now();
+		let mut tor = UpstreamGuard::new(RedditLane::Tor);
+		tor.install_oauth_generation(7, true);
+		let comments = tor.begin_endpoint_attempt(now, 4).unwrap();
+		assert!(tor.record_endpoint_failure(now, 0));
+		let first = tor.transport_health(0).blocked_until.unwrap();
+		assert!((Duration::from_secs(5)..=Duration::from_millis(6250)).contains(&first.duration_since(now)));
+		assert_eq!(tor.routing_availability(now, 7, 0), LaneAvailability::TransportCooldown);
+		assert_eq!(tor.routing_availability(now, 7, 1), LaneAvailability::TransportCooldown);
+		assert_eq!(tor.routing_availability(now, 7, 4), LaneAvailability::Ready);
+		assert!(tor.active_endpoint_cooldown(now, 4).is_none());
+		assert!(tor.redirect_cooldown(now, comments).is_none());
+		tor.record_api_success(now + Duration::from_secs(1), comments);
+		assert_eq!(tor.transport_health(0).blocked_until, Some(first));
+		assert_eq!(tor.transport_health(0).consecutive_onion_failures, 1);
+		assert!(tor.record_endpoint_failure(first, 1));
+		let second = tor.transport_health(0).blocked_until.unwrap();
+		assert!((Duration::from_secs(10)..=Duration::from_millis(12500)).contains(&second.duration_since(first)));
+		// In-flight public successes must not reset onion backoff, and a late
+		// onion success must not erase a newer pause on the same destination.
+		let stale_onion = EdgeAttempt {
+			endpoint: 0,
+			epoch: 0,
+			half_open: false,
+		};
+		tor.record_api_success(first + Duration::from_secs(1), stale_onion);
+		assert_eq!(tor.transport_health(0).blocked_until, Some(second));
+		for _ in 0..FAILURE_THRESHOLD {
+			tor.record_endpoint_failure(first, 4);
+		}
+		let gql = tor.transport_health(4).blocked_until.unwrap();
+		assert_eq!(tor.transport_health(0).blocked_until, Some(second));
+		tor.install_oauth_generation(8, false);
+		tor.install_oauth_generation(9, true);
+		assert_eq!(tor.transport_health(0).blocked_until, Some(second));
+		assert_eq!(tor.transport_health(4).blocked_until, Some(gql));
+		// An onion recovery cannot clear an independently extended public pause.
+		tor.transport_health_mut(4).blocked_until = Some(second + Duration::from_secs(30));
+		tor.record_api_success(second, stale_onion);
+		assert!(tor.transport_health(0).blocked_until.is_none());
+		assert_eq!(tor.transport_health(0).consecutive_onion_failures, 0);
+		assert_eq!(tor.transport_health(4).blocked_until, Some(second + Duration::from_secs(30)));
+		let mut direct = UpstreamGuard::new(RedditLane::Direct);
+		for _ in 0..FAILURE_THRESHOLD {
+			direct.record_endpoint_failure(now, 4);
+		}
+		assert_eq!(direct.routing_availability(now, 0, 0), LaneAvailability::TransportCooldown);
+	}
+
+	#[test]
+	fn test_tor_transport_onion_backoff_escalates_caps_and_recovers() {
+		let mut health = TransportHealth::default();
+		let mut now = Instant::now();
+		for expected in [5, 10, 20, 40, 60, 60, 60] {
+			assert!(health.record_failure(now, true));
+			let until = health.blocked_until.unwrap();
+			let delay = until.duration_since(now);
+			assert!((Duration::from_secs(expected)..=Duration::from_millis(expected * 1250)).contains(&delay));
+			now = until;
+		}
+		health.record_success(now);
+		assert!(health.blocked_until.is_none());
+		assert!(health.record_failure(now, true));
+		assert!(health.blocked_until.unwrap().duration_since(now) <= Duration::from_millis(6250));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_MAX_CONCURRENCY","4")])]
+	fn test_tor_transport_stalled_onion_capacity_and_probe_do_not_block_comments() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			assert_eq!(max_concurrent_api_requests(), 4);
+			let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+			let first = acquire_attempt_capacity(lane, 0, AdmissionRetryMode::Immediate, deadline).await.unwrap();
+			let second = acquire_attempt_capacity(lane, 1, AdmissionRetryMode::Immediate, deadline).await.unwrap();
+			let mut queued = Box::pin(acquire_attempt_capacity(lane, 2, AdmissionRetryMode::Bounded, deadline));
+			assert!(tokio::time::timeout(Duration::from_millis(10), &mut queued).await.is_err());
+			let comment = tokio::time::timeout(Duration::from_millis(100), acquire_attempt_capacity(lane, 4, AdmissionRetryMode::Immediate, deadline))
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(api_concurrency(lane).available_permits(), 1);
+			drop(comment);
+			drop(queued);
+			drop(first);
+			drop(second);
+			assert_eq!(api_concurrency(lane).available_permits(), 4);
+			assert_eq!(TOR_ONION_CONCURRENCY.available_permits(), 2);
+
+			// Even if both destinations need recovery, their probes differ.
+			let now = Instant::now();
+			upstream_guard(lane).record_endpoint_failure(now, 0);
+			for _ in 0..FAILURE_THRESHOLD {
+				upstream_guard(lane).record_endpoint_failure(now, 4);
+			}
+			let onion = acquire_attempt_capacity(lane, 0, AdmissionRetryMode::Immediate, deadline).await.unwrap();
+			assert!(onion.1.is_some());
+			let comments = acquire_attempt_capacity(lane, 4, AdmissionRetryMode::Immediate, deadline).await.unwrap();
+			assert!(comments.1.is_some());
+			assert!(acquire_attempt_capacity(lane, 1, AdmissionRetryMode::Immediate, deadline).await.is_err());
+			drop(onion);
+			drop(comments);
+			assert_eq!(TOR_ONION_RECOVERY_PROBE.available_permits(), 1);
+			assert_eq!(TOR_RECOVERY_PROBE.available_permits(), 1);
+			for total in 1..=MAX_CONFIGURED_API_REQUESTS {
+				assert!(onion_concurrency_limit(total) <= total);
+				if total >= 2 {
+					assert!(onion_concurrency_limit(total) < total);
+				}
+			}
+		});
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+	fn test_tor_transport_onion_pause_returns_without_retry_sleeps() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			install_oauth_client(Oauth::request_fixture(lane, Arc::new(WreqClient::builder().no_proxy().build().unwrap())), true, None);
+			record_upstream_failure(lane, "request_transport", None, "/r/popular/hot.json", 0);
+			// A GQL metadata/comments continuation remains admitted.
+			let (oauth, mut attempt, permit, probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Immediate, &mut TorQuotaRefreshRetryState::default())
+				.await
+				.unwrap();
+			reserve_redirect_hop(&mut attempt, oauth.generation, Some(599), Some(Duration::from_secs(60)), false).unwrap();
+			attempt.complete();
+			drop(attempt);
+			drop(permit);
+			drop(probe);
+			let result = tokio::time::timeout(Duration::from_millis(100), json_uncached_on_lane("/r/popular/hot.json".into(), false, lane))
+				.await
+				.expect("known onion failure should return its retry delay immediately");
+			assert!(result.0.unwrap_err().starts_with("Reddit requests are temporarily paused"));
+			assert_eq!(result.1, TorRetryReason::TransportUnavailable);
+			let result = tokio::time::timeout(Duration::from_millis(100), wait_for_tor_recovery("/r/popular/hot.json"))
+				.await
+				.unwrap();
+			assert!(result.is_err());
+		});
+	}
+
+	#[test]
 	fn test_tor_first_stalled_send_uses_ready_standby_before_thirty_seconds() {
 		assert_eq!(
 			initial_lane_request_timeout(RedditLane::Tor, RedditLane::Tor, LaneAvailability::Ready),
@@ -4748,7 +5005,7 @@ mod tests {
 		guard.install_oauth_generation(8, false);
 		assert_eq!(guard.routing_availability(now, 8, 4), LaneAvailability::Ready);
 		assert_eq!(guard.routing_availability(now, 7, 4), LaneAvailability::Unavailable);
-		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
+		guard.transport_health_mut(0).blocked_until = Some(now + Duration::from_secs(10));
 		assert_eq!(guard.routing_availability(now, 8, 4), LaneAvailability::TransportCooldown);
 	}
 
@@ -5190,9 +5447,9 @@ mod tests {
 		direct.block_for_rate_limit(now, Duration::from_secs(30));
 		assert!(!direct.quota_spillover_still_needed(now, ticket));
 		direct.rate_limit_blocked_until = None;
-		direct.upstream_failure_blocked_until = Some(now + Duration::from_secs(30));
+		direct.transport.blocked_until = Some(now + Duration::from_secs(30));
 		assert!(!direct.quota_spillover_still_needed(now, ticket));
-		direct.upstream_failure_blocked_until = None;
+		direct.transport.blocked_until = None;
 		let edge_attempt = direct.begin_attempt(now).unwrap();
 		direct.record_edge_throttle(now, edge_attempt, None);
 		assert!(!direct.quota_spillover_still_needed(now, ticket));
@@ -5367,11 +5624,11 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard::default();
 		let attempt = guard.begin_attempt(now).unwrap();
-		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(12));
+		guard.transport_health_mut(0).blocked_until = Some(now + Duration::from_secs(12));
 		guard.record_api_success(now + Duration::from_secs(11), attempt);
-		assert!(guard.upstream_failure_blocked_until.is_some());
+		assert!(guard.transport_health_mut(0).blocked_until.is_some());
 		guard.record_api_success(now + Duration::from_secs(13), attempt);
-		assert!(guard.upstream_failure_blocked_until.is_none());
+		assert!(guard.transport_health_mut(0).blocked_until.is_none());
 	}
 
 	#[test]
@@ -5383,7 +5640,7 @@ mod tests {
 			epoch: 1,
 			expires_at: now + Duration::from_secs(90),
 		};
-		guard.upstream_failure_blocked_until = Some(now - Duration::from_secs(1));
+		guard.transport_health_mut(0).blocked_until = Some(now - Duration::from_secs(1));
 		assert!(guard
 			.record_generation_success(
 				now,
@@ -5396,7 +5653,7 @@ mod tests {
 			)
 			.is_none());
 		assert!(matches!(guard.edges[0].state, EdgeCircuitState::Open { .. }));
-		assert!(guard.upstream_failure_blocked_until.is_some());
+		assert!(guard.transport_health_mut(0).blocked_until.is_some());
 	}
 
 	#[test]
@@ -5534,10 +5791,10 @@ mod tests {
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
 		guard.rate_limit_blocked_until = None;
-		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(60));
+		guard.transport_health_mut(0).blocked_until = Some(now + Duration::from_secs(60));
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		assert!(!guard.completed_quota_rotation_still_valid(completed_at, ticket));
-		guard.upstream_failure_blocked_until = None;
+		guard.transport_health_mut(0).blocked_until = None;
 		guard.edges[0].state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(60),
 		};
@@ -5611,7 +5868,7 @@ mod tests {
 		};
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 		guard.edges[0].state = EdgeCircuitState::Closed;
-		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
+		guard.transport_health_mut(0).blocked_until = Some(now + Duration::from_secs(10));
 		assert_eq!(guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive), None);
 	}
 
@@ -5773,10 +6030,10 @@ mod tests {
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
 		assert!(!guard.completed_quota_rotation_still_valid(now, next_ticket));
 		guard.rate_limit_blocked_until = None;
-		guard.upstream_failure_blocked_until = Some(now + Duration::from_secs(10));
+		guard.transport_health_mut(0).blocked_until = Some(now + Duration::from_secs(10));
 		assert!(!guard.quota_rotation_still_needed(now, next_ticket));
 		assert!(!guard.completed_quota_rotation_still_valid(now, next_ticket));
-		guard.upstream_failure_blocked_until = None;
+		guard.transport_health_mut(0).blocked_until = None;
 		guard.edges[0].state = EdgeCircuitState::Open {
 			until: now + Duration::from_secs(10),
 		};
@@ -6737,7 +6994,7 @@ mod tests {
 		);
 		assert!(guard.active_cooldown(now + FAILURE_COOLDOWN + Duration::from_secs(6)).is_none());
 		guard.reset_failure_window();
-		assert_eq!(guard.failures_in_window, 0);
+		assert_eq!(guard.transport_health(0).failures_in_window, 0);
 	}
 
 	#[test]
@@ -6964,14 +7221,14 @@ mod tests {
 		guard.record_edge_throttle(now, attempt, None);
 		guard.block_for_rate_limit(now, Duration::from_secs(20));
 		let failure_deadline = now + Duration::from_secs(30);
-		guard.upstream_failure_blocked_until = Some(failure_deadline);
+		guard.transport_health_mut(0).blocked_until = Some(failure_deadline);
 
 		guard.install_oauth_generation(2, true);
 
 		assert!(guard.rate_limit_blocked_until.is_none());
 		assert_eq!(guard.active_cooldown(now).map(|(_, reason)| reason), Some(CooldownReason::UpstreamFailures));
 		assert_eq!(guard.edges[0].failures, 1);
-		assert_eq!(guard.upstream_failure_blocked_until, Some(failure_deadline));
+		assert_eq!(guard.transport_health_mut(0).blocked_until, Some(failure_deadline));
 		assert_eq!(guard.quota.generation, 2);
 	}
 
