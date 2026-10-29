@@ -3,6 +3,7 @@ use crate::oauth::{
 	force_refresh_token, quota_rotation_in_progress, refresh_backoff_remaining, spawn_rate_limit_refresh, token_daemon, token_refresh_notify, Oauth, RefreshReason,
 };
 use crate::reddit_graphql::{CommentsRequest, ErrorKind as GraphqlErrorKind, GraphqlError};
+use crate::reddit_graphql_pages::PageRequest;
 use crate::reddit_lane::{RedditLane, RedditOrigin, PRIMARY_REDDIT_LANE, TOR_FALLBACK_CONFIG};
 use crate::server::RequestExt;
 use crate::timing::{positive_jitter, proportional_positive_jitter};
@@ -28,6 +29,10 @@ use wreq::dns::{Addrs, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, Method, Proxy, Response as WreqResponse};
 use wreq_util::{Emulation, Platform, Profile};
+
+#[cfg(test)]
+#[path = "client_graphql_pages_tests.rs"]
+mod graphql_pages_tests;
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 
@@ -182,7 +187,7 @@ enum QuotaBudget {
 }
 impl QuotaBudget {
 	fn for_endpoint(endpoint: usize) -> Self {
-		if endpoint == 4 {
+		if endpoint == 4 || endpoint == 7 {
 			Self::Graphql
 		} else {
 			Self::Rest
@@ -649,7 +654,7 @@ struct UpstreamGuard {
 	transport: TransportHealth,
 	onion_transport: TransportHealth,
 	rate_limit_blocked_until: Option<Instant>,
-	edges: [EdgeCircuit; 7],
+	edges: [EdgeCircuit; 8],
 	identity_installed_at: Instant,
 	rejected_oauth_generation: Option<u64>,
 	rejected_session_refresh_after: Instant,
@@ -1427,7 +1432,7 @@ pub(crate) fn quota_rotation_still_needed(ticket: QuotaRotationTicket) -> bool {
 }
 
 fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str) {
-	if QuotaBudget::for_endpoint(endpoint_class_index(path)) == QuotaBudget::Graphql {
+	if QuotaBudget::for_endpoint(api_endpoint_index(path)) == QuotaBudget::Graphql {
 		return;
 	}
 	let now = Instant::now();
@@ -1466,6 +1471,16 @@ fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<
 		effective_quota.map_or(0, |(_, duration)| duration.as_secs()),
 		endpoint_class(path),
 	);
+}
+
+// GraphQL pages share the GraphQL allowance and public HTTPS transport, but
+// retain a distinct edge probe so feed rejection cannot stall comments.
+fn api_endpoint_index(path: &str) -> usize {
+	if PageRequest::from_path(path, false).is_some() {
+		7
+	} else {
+		endpoint_class_index(path)
+	}
 }
 
 fn endpoint_class_index(path: &str) -> usize {
@@ -1748,7 +1763,7 @@ fn configured_primary_lane() -> RedditLane {
 fn lane_availability(lane: RedditLane, now: Instant, path: &str) -> LaneAvailability {
 	let Some(oauth) = oauth_client(lane) else { return LaneAvailability::Unavailable };
 	let guard = upstream_guard(lane);
-	guard.routing_availability(now, oauth.generation, endpoint_class_index(path))
+	guard.routing_availability(now, oauth.generation, api_endpoint_index(path))
 }
 
 fn tor_fallback_ready(path: &str) -> bool {
@@ -1769,7 +1784,7 @@ fn edge_fallback_active(guard: &UpstreamGuard, now: Instant, endpoint: usize) ->
 }
 
 fn direct_edge_fallback_active(now: Instant, path: &str) -> bool {
-	edge_fallback_active(&upstream_guard(RedditLane::Direct), now, endpoint_class_index(path))
+	edge_fallback_active(&upstream_guard(RedditLane::Direct), now, api_endpoint_index(path))
 }
 
 fn select_api_lane(primary: RedditLane, direct: LaneAvailability, tor: LaneAvailability) -> RedditLane {
@@ -2286,13 +2301,13 @@ fn record_upstream_failure(lane: RedditLane, kind: &str, status: Option<u16>, pa
 		trace!("Ignoring stale Reddit upstream failure: kind={kind} endpoint={}", endpoint_class(path));
 		return;
 	}
-	let opened = guard.record_endpoint_failure(Instant::now(), endpoint_class_index(path));
+	let opened = guard.record_endpoint_failure(Instant::now(), api_endpoint_index(path));
 	warn!(
 		"Reddit upstream failure: lane={} kind={kind} status={} endpoint={} transport={} circuit_opened={opened}",
 		lane.label(),
 		status.map_or_else(|| "transport".to_string(), |status| status.to_string()),
 		endpoint_class(path),
-		if lane == RedditLane::Tor && QuotaBudget::for_endpoint(endpoint_class_index(path)) == QuotaBudget::Rest {
+		if lane == RedditLane::Tor && QuotaBudget::for_endpoint(api_endpoint_index(path)) == QuotaBudget::Rest {
 			"onion_rest"
 		} else {
 			"public_https"
@@ -2811,6 +2826,7 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 /// A REST listing or the final response of an anonymous comments read.
 enum RedditReadResponse {
+	Pages(HyperResponse<Body>),
 	Rest(WreqResponse),
 	Comments {
 		response: WreqResponse,
@@ -2881,6 +2897,85 @@ async fn reddit_comments(
 	unreachable!("comments reads always have two operations")
 }
 
+async fn reddit_pages(
+	path: &str,
+	quarantine: bool,
+	oauth: Arc<Oauth>,
+	attempt: &mut UpstreamAttempt,
+	allow_quota_refresh: bool,
+	request: PageRequest,
+	origin: RedditOrigin,
+) -> Result<RedditReadResponse, ApiRequestError> {
+	let lane = attempt.lane;
+	let mut values = Vec::new();
+	let mut headers = wreq_header::HeaderMap::new();
+	let mut remaining = None;
+	let mut reset = None;
+	let mut sent = false;
+	loop {
+		let payload = request
+			.next_payload(&mut values)
+			.map_err(|error| graphql_api_error(error, lane, oauth.generation, &headers))?;
+		let Some(payload) = payload else { break };
+		if sent {
+			reserve_redirect_hop(attempt, oauth.generation, remaining, reset, allow_quota_refresh)?;
+		}
+		attempt.mark_sent();
+		record_api_send(path, false, lane);
+		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
+			.await
+			.map_err(ApiRequestError::Upstream)?;
+		if !response.status().is_success() {
+			return Ok(RedditReadResponse::Pages(response.into_hyper_response()));
+		}
+		headers = response.headers().clone();
+		remaining = headers
+			.get("x-ratelimit-remaining")
+			.and_then(|v| v.to_str().ok())
+			.and_then(|v| parse_rate_limit_count(Some(v)));
+		reset = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()).and_then(|v| parse_delay_seconds(Some(v)));
+		let value = response
+			.json::<Value>()
+			.await
+			.map_err(|_| ApiRequestError::Upstream("Reddit returned an invalid GraphQL page response".into()))?;
+		reconcile_rate_limit(attempt, remaining, reset, remaining == Some(0));
+		if let Some(mut error) = crate::reddit_graphql::response_error(&value) {
+			error.message = error.message.replace("comments", "page");
+			warn!(
+				"Reddit GraphQL page response rejected: lane={} endpoint={} reason={}",
+				lane.label(),
+				endpoint_class(path),
+				error.reason
+			);
+			return Err(graphql_api_error(error, lane, oauth.generation, &headers));
+		}
+		values.push(value);
+		sent = true;
+	}
+	let value = request.finish(&values).map_err(|error| {
+		warn!(
+			"Reddit GraphQL page response rejected: lane={} endpoint={} reason={}",
+			lane.label(),
+			endpoint_class(path),
+			error.reason
+		);
+		graphql_api_error(error, lane, oauth.generation, &headers)
+	})?;
+	// Reuse the common status, cooldown and success handling for the complete
+	// logical read. Never mark a partial multi-operation page successful.
+	headers.remove(wreq_header::CONTENT_LENGTH);
+	headers.remove(wreq_header::CONTENT_ENCODING);
+	headers.remove(wreq_header::TRANSFER_ENCODING);
+	headers.insert(wreq_header::CONTENT_TYPE, wreq_header::HeaderValue::from_static("application/json"));
+	let mut response = HyperResponse::new(Body::from(value.to_string()));
+	for (key, value) in &headers {
+		if let (Ok(key), Ok(value)) = (header::HeaderName::from_bytes(key.as_str().as_bytes()), header::HeaderValue::from_bytes(value.as_bytes())) {
+			response.headers_mut().append(key, value);
+		}
+	}
+	Ok(RedditReadResponse::Pages(response))
+}
+
 async fn reddit_get(
 	path: String,
 	quarantine: bool,
@@ -2891,6 +2986,9 @@ async fn reddit_get(
 	if let Some(request) = CommentsRequest::from_path(&path) {
 		let origin = attempt.lane.graphql_origin();
 		return reddit_comments(&path, quarantine, oauth_client, attempt, allow_quota_refresh, request, origin).await;
+	}
+	if let Some(request) = PageRequest::from_path(&path, quarantine) {
+		return reddit_pages(&path, quarantine, oauth_client, attempt, allow_quota_refresh, request, attempt.lane.graphql_origin()).await;
 	}
 	let lane = attempt.lane;
 	let origin = lane.api_origin();
@@ -3461,7 +3559,7 @@ async fn wait_for_tor_recovery(path: &str) -> Result<(), String> {
 		let (delay, rejected) = {
 			let guard = upstream_guard(RedditLane::Tor);
 			let delay = guard
-				.active_endpoint_cooldown(Instant::now(), endpoint_class_index(path))
+				.active_endpoint_cooldown(Instant::now(), api_endpoint_index(path))
 				.map(|(delay, _)| delay)
 				.or_else(|| guard.rejected_oauth_generation.map(|_| LOCAL_QUOTA_RETRY_INTERVAL));
 			(delay, guard.rejected_oauth_generation.is_some())
@@ -3471,8 +3569,8 @@ async fn wait_for_tor_recovery(path: &str) -> Result<(), String> {
 				return Err(session_refresh_wait_message(Some(backoff)));
 			}
 		}
-		if QuotaBudget::for_endpoint(endpoint_class_index(path)) == QuotaBudget::Rest {
-			if let Some((delay, CooldownReason::UpstreamFailures)) = upstream_guard(RedditLane::Tor).active_endpoint_cooldown(Instant::now(), endpoint_class_index(path)) {
+		if QuotaBudget::for_endpoint(api_endpoint_index(path)) == QuotaBudget::Rest {
+			if let Some((delay, CooldownReason::UpstreamFailures)) = upstream_guard(RedditLane::Tor).active_endpoint_cooldown(Instant::now(), api_endpoint_index(path)) {
 				return Err(onion_recovery_wait_message(delay));
 			}
 		}
@@ -3487,7 +3585,7 @@ fn tor_recovery_wait_message(path: &str) -> String {
 		return session_refresh_wait_message(refresh_backoff_remaining(RedditLane::Tor));
 	}
 	let delay = guard
-		.active_endpoint_cooldown(Instant::now(), endpoint_class_index(path))
+		.active_endpoint_cooldown(Instant::now(), api_endpoint_index(path))
 		.map_or(Duration::from_secs(5), |(delay, _)| delay);
 	format!(
 		"Reddit API request timed out while recovering the Tor lane. Retry in {} seconds",
@@ -3636,8 +3734,8 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 		{
 			return (result, TorRetryReason::TransportUnavailable);
 		}
-		if lane == RedditLane::Tor && QuotaBudget::for_endpoint(endpoint_class_index(&path)) == QuotaBudget::Rest {
-			if let Some((delay, CooldownReason::UpstreamFailures)) = upstream_guard(lane).active_endpoint_cooldown(Instant::now(), endpoint_class_index(&path)) {
+		if lane == RedditLane::Tor && QuotaBudget::for_endpoint(api_endpoint_index(&path)) == QuotaBudget::Rest {
+			if let Some((delay, CooldownReason::UpstreamFailures)) = upstream_guard(lane).active_endpoint_cooldown(Instant::now(), api_endpoint_index(&path)) {
 				return (Err(onion_recovery_wait_message(delay)), TorRetryReason::TransportUnavailable);
 			}
 		}
@@ -3774,7 +3872,7 @@ async fn json_uncached_on_lane_with_options(
 	// Keep this exact OAuth client throughout redirects and attach its generation
 	// to the response. A late response from an old identity must not overwrite a
 	// newly rotated identity's request budget.
-	let (oauth_client, mut upstream_attempt, _permit, _probe) = match begin_upstream_attempt(lane, endpoint_class_index(&path), admission_mode, tor_refresh).await {
+	let (oauth_client, mut upstream_attempt, _permit, _probe) = match begin_upstream_attempt(lane, api_endpoint_index(&path), admission_mode, tor_refresh).await {
 		Ok(attempt) => attempt,
 		Err(denied) => {
 			let retry_reason = if upstream_guard(lane).rejected_oauth_generation.is_some() {
@@ -3813,10 +3911,11 @@ async fn json_uncached_on_lane_with_options(
 	let result = tokio::time::timeout_at(request_deadline, async {
 		match reddit_get(path.clone(), quarantine, oauth_client, &mut upstream_attempt, allow_quota_refresh).await {
 			Ok(response) => {
-				let (response, graphql) = match response {
-					RedditReadResponse::Rest(response) => (response, None),
-					RedditReadResponse::Comments { response, post, request } => (response, Some((post, request))),
-				};
+				let (mut response, graphql, graphql_page) = match response {
+                    RedditReadResponse::Rest(response) => (response.into_hyper_response(), None, false),
+                    RedditReadResponse::Comments { response, post, request } => (response.into_hyper_response(), Some((post, request)), false),
+                    RedditReadResponse::Pages(response) => (response, None, true),
+                };
 				let status = response.status();
 				let status_code = status.as_u16();
 
@@ -3824,22 +3923,21 @@ async fn json_uncached_on_lane_with_options(
 				let remaining = response_headers.get("x-ratelimit-remaining").and_then(|value| value.to_str().ok());
 				let reset = response_headers.get("x-ratelimit-reset").and_then(|value| value.to_str().ok());
 				let used = response_headers.get("x-ratelimit-used").and_then(|value| value.to_str().ok());
-				let retry_after = response_headers.get(wreq_header::RETRY_AFTER).and_then(|value| value.to_str().ok());
+				let retry_after = response_headers.get(header::RETRY_AFTER).and_then(|value| value.to_str().ok());
 				let parsed_remaining = parse_rate_limit_count(remaining);
 				let parsed_used = parse_rate_limit_count(used);
 				let reset_duration = parse_delay_seconds(reset);
 				let retry_after_duration = parse_retry_after(retry_after, SystemTime::now());
 				let quota_headers_present = remaining.is_some() || reset.is_some() || used.is_some();
 
-				let challenge = response_headers.get(wreq_header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok());
+				let challenge = response_headers.get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok());
 				let auth_rejected = credential_rejected(status_code, challenge);
-				let content_kind = response_headers.get(wreq_header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map_or("missing", |value| {
+				let content_kind = response_headers.get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map_or("missing", |value| {
 					if value.starts_with("application/json") { "json" } else if value.starts_with("text/html") { "html" } else { "other" }
 				});
-				let mut response = response.into_hyper_response();
 				let rejection = if status_code == 403 { Some(read_rejection_details(response.body_mut()).await) } else { None };
 				let resource_reason = rejection.as_ref().and_then(|details| details.resource_reason);
-				let throttle_kind = if resource_reason.is_some() || auth_rejected { None } else if graphql.is_some() && status_code == 403 && content_kind == "html" && !quota_headers_present {
+				let throttle_kind = if resource_reason.is_some() || auth_rejected { None } else if (graphql.is_some() || graphql_page) && status_code == 403 && content_kind == "html" && !quota_headers_present {
 					// The GraphQL API reports resource errors as JSON. An HTML 403
 					// is an edge rejection even when that edge omits Retry-After.
 					Some(ThrottleKind::Edge)
@@ -3879,7 +3977,7 @@ async fn json_uncached_on_lane_with_options(
 
 				match throttle_kind {
 					Some(ThrottleKind::Quota) => {
-						let (delay, response_is_current) = block_for_rate_limit(lane, request_generation, retry_after, reset, endpoint_class_index(&path));
+						let (delay, response_is_current) = block_for_rate_limit(lane, request_generation, retry_after, reset, api_endpoint_index(&path));
 						if response_is_current {
 							recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
 						}
@@ -3976,7 +4074,7 @@ async fn json_uncached_on_lane_with_options(
 												retry_reason = TorRetryReason::SessionUnavailable;
 											}
 											if error.kind == GraphqlErrorKind::RateLimit {
-												let (delay, current) = block_for_rate_limit(lane, request_generation, retry_after.or(Some("30")), reset, endpoint_class_index(&path));
+												let (delay, current) = block_for_rate_limit(lane, request_generation, retry_after.or(Some("30")), reset, api_endpoint_index(&path));
 												if current {
 													recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
 												}
@@ -4770,7 +4868,7 @@ mod tests {
 		tokio::runtime::Runtime::new().unwrap().block_on(async {
 			let lane = RedditLane::Tor;
 			install_oauth_client(Oauth::request_fixture(lane, Arc::new(WreqClient::builder().no_proxy().build().unwrap())), true, None);
-			record_upstream_failure(lane, "request_transport", None, "/r/popular/hot.json", 0);
+			record_upstream_failure(lane, "request_transport", None, "/api/site_admin.json", 0);
 			// A GQL metadata/comments continuation remains admitted.
 			let (oauth, mut attempt, permit, probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Immediate, &mut TorQuotaRefreshRetryState::default())
 				.await
@@ -4780,12 +4878,12 @@ mod tests {
 			drop(attempt);
 			drop(permit);
 			drop(probe);
-			let result = tokio::time::timeout(Duration::from_millis(100), json_uncached_on_lane("/r/popular/hot.json".into(), false, lane))
+			let result = tokio::time::timeout(Duration::from_millis(100), json_uncached_on_lane("/api/site_admin.json".into(), false, lane))
 				.await
 				.expect("known onion failure should return its retry delay immediately");
 			assert!(result.0.unwrap_err().starts_with("Reddit requests are temporarily paused"));
 			assert_eq!(result.1, TorRetryReason::TransportUnavailable);
-			let result = tokio::time::timeout(Duration::from_millis(100), wait_for_tor_recovery("/r/popular/hot.json"))
+			let result = tokio::time::timeout(Duration::from_millis(100), wait_for_tor_recovery("/api/site_admin.json"))
 				.await
 				.unwrap();
 			assert!(result.is_err());

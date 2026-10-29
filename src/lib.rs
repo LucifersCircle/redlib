@@ -6,6 +6,7 @@ pub mod oauth;
 pub mod oauth_resources;
 pub mod post;
 mod reddit_graphql;
+mod reddit_graphql_pages;
 mod reddit_lane;
 pub mod search;
 pub mod server;
