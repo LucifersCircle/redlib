@@ -672,6 +672,12 @@ impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self, client: &wreq::Client) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
 		let origin = self.lane.auth_origin();
+		#[cfg(test)]
+		let origin = if self.lane == RedditLane::Tor && std::env::var("REDLIB_DIAGNOSTIC_PUBLIC_AUTH").as_deref() == Ok("on") {
+			RedditLane::Direct.auth_origin()
+		} else {
+			origin
+		};
 		let url = format!("{}/auth/v2/oauth/access-token/loid", origin.base);
 		record_oauth_send(self.lane);
 		let mut builder = client.post(&url);
@@ -1164,5 +1170,105 @@ mod tests {
 		let rotated_device_id = rotated.device.headers.get("X-Reddit-Device-Id").unwrap().clone();
 		assert!(rotated_is_fresh);
 		assert_ne!(rotated_device_id, original_device_id);
+	}
+}
+
+#[cfg(test)]
+mod tor_oauth_exit_diagnostic {
+	use super::*;
+	use crate::reddit_graphql::CommentsRequest;
+
+	#[tokio::test]
+	#[ignore = "isolated live Tor diagnostic; no personal credentials"]
+	async fn live_tor_oauth_exit_diagnostic() {
+		let _ = pretty_env_logger::try_init();
+		let lane = RedditLane::Tor;
+		let client = client_for_oauth_profile(lane, OauthTransportProfile::Chrome145Android).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let started = Instant::now();
+		let oauth = match Oauth::authenticate_with_backend(&mut backend, client, OauthTransportProfile::Chrome145Android).await {
+			Ok(oauth) => {
+				println!("TOR_EXIT_AUTH success elapsed_ms={}", started.elapsed().as_millis());
+				oauth
+			}
+			Err(error) => {
+				println!(
+					"TOR_EXIT_AUTH failed class={} elapsed_ms={} error={}",
+					error.failure_class(),
+					started.elapsed().as_millis(),
+					error
+				);
+				return;
+			}
+		};
+		let request = CommentsRequest::from_path("/r/SteamDeck/comments/1xci3c1.json?raw_json=1").unwrap();
+		for (name, payload) in [("post", request.post_payload()), ("comments", request.comments_payload())] {
+			let mut builder = oauth.http_client.post("https://gql-fed.reddit.com/").header("Host", "gql-fed.reddit.com");
+			for (k, v) in &oauth.headers_map {
+				builder = builder.header(k, v);
+			}
+			match timeout(Duration::from_secs(30), builder.json(&payload).send()).await {
+				Ok(Ok(response)) => {
+					let status = response.status().as_u16();
+					match response.json::<serde_json::Value>().await {
+						Ok(value) => {
+							let codes = value["errors"]
+								.as_array()
+								.map(|errors| {
+									errors
+										.iter()
+										.map(|error| {
+											error["extensions"]["code"]
+												.as_str()
+												.unwrap_or("unknown")
+												.chars()
+												.filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+												.take(80)
+												.collect::<String>()
+										})
+										.collect::<Vec<_>>()
+								})
+								.unwrap_or_default();
+							println!(
+								"TOR_EXIT_GRAPHQL stage={} status={} error_codes={:?} post_count={:?} trees={:?}",
+								name,
+								status,
+								codes,
+								value["data"]["postsInfoByIds"].as_array().map(Vec::len),
+								value["data"]["postInfoById"]["commentForest"]["trees"].as_array().map(Vec::len)
+							);
+						}
+						Err(_) => println!("TOR_EXIT_GRAPHQL stage={} status={} body=non_json", name, status),
+					}
+				}
+				Ok(Err(error)) => println!("TOR_EXIT_GRAPHQL stage={} transport={}", name, error),
+				Err(_) => println!("TOR_EXIT_GRAPHQL stage={} timeout", name),
+			}
+		}
+		let mut builder = oauth
+			.http_client
+			.get("https://oauth.reddit.com/r/rust/hot?raw_json=1&limit=1")
+			.header("Host", "oauth.reddit.com");
+		for (k, v) in &oauth.headers_map {
+			builder = builder.header(k, v);
+		}
+		match timeout(Duration::from_secs(30), builder.send()).await {
+			Ok(Ok(response)) => println!(
+				"TOR_EXIT_REST status={} content_kind={}",
+				response.status().as_u16(),
+				if response.headers().get("content-type").is_some_and(|v| v.to_str().unwrap_or("").contains("json")) {
+					"json"
+				} else {
+					"other"
+				}
+			),
+			Ok(Err(error)) => println!("TOR_EXIT_REST transport={}", error),
+			Err(_) => println!("TOR_EXIT_REST timeout"),
+		}
+		let started = Instant::now();
+		match oauth.refreshed(RefreshReason::Scheduled).await {
+			Ok(_) => println!("TOR_EXIT_REFRESH success elapsed_ms={}", started.elapsed().as_millis()),
+			Err(error) => println!("TOR_EXIT_REFRESH failed elapsed_ms={} error={}", started.elapsed().as_millis(), error),
+		}
 	}
 }
