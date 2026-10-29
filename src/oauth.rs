@@ -1390,3 +1390,152 @@ mod tests {
 		assert_ne!(rotated_device_id, original_device_id);
 	}
 }
+
+#[cfg(test)]
+mod live_tor_page_operations {
+	use super::*;
+	use serde_json::{json, Value};
+	async fn query(oauth: &Oauth, name: &str, hash: &str, variables: Value, pointer: &str) -> Value {
+		let started = Instant::now();
+		let mut builder = oauth
+			.http_client
+			.post("https://gql-fed.reddit.com/")
+			.header("X-APOLLO-OPERATION-NAME", name)
+			.header("X-APOLLO-OPERATION-ID", hash);
+		for (key, value) in &oauth.headers_map {
+			if !key.eq_ignore_ascii_case("content-type") {
+				builder = builder.header(key, value);
+			}
+		}
+		let response = tokio::time::timeout(
+			Duration::from_secs(40),
+			builder
+				.json(&json!({
+						"operationName":name, "variables":variables,
+						"extensions":{"persistedQuery":{"version":1,"sha256Hash":hash}}
+				}))
+				.send(),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let status = response.status();
+		let value: Value = response.json().await.unwrap();
+		let found = value.pointer(pointer).is_some_and(|v| !v.is_null());
+		let errors: Vec<_> = value["errors"].as_array().into_iter().flatten().map(|e| e["extensions"]["code"].clone()).collect();
+		println!(
+			"LIVE_PAGE_OPERATION name={name} status={status} found={found} elapsed_ms={} errors={errors:?}",
+			started.elapsed().as_millis()
+		);
+		assert!(status.is_success() && found, "{name} must return data");
+		value
+	}
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated live Tor GraphQL page operation validation"]
+	async fn live_tor_page_operations_probe() {
+		let _ = pretty_env_logger::try_init();
+		let lane = RedditLane::Tor;
+		let profile = OauthTransportProfile::Chrome145Android;
+		let http = client_for_oauth_profile(lane, profile).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let oauth = Oauth::authenticate_with_backend(&mut backend, http, profile).await.expect("anonymous Tor OAuth");
+		println!("LIVE_PAGE_OPERATION anonymous_auth=true public_auth={}", oauth.backend.public_auth);
+		let popular = query(
+			&oauth,
+			"PopularFeedElements",
+			"728c0f9a4d12c17b8cffe07669bb1a8770b0f2ec0c84e040485f8fad2d9c417f",
+			json!({"sort":"HOT","pageSize":5}),
+			"/data/popular/elements",
+		)
+		.await;
+		let cursor = popular.pointer("/data/popular/elements/pageInfo/endCursor").unwrap().clone();
+		query(
+			&oauth,
+			"PopularFeedElements",
+			"728c0f9a4d12c17b8cffe07669bb1a8770b0f2ec0c84e040485f8fad2d9c417f",
+			json!({"sort":"HOT","pageSize":5,"after":cursor}),
+			"/data/popular/elements",
+		)
+		.await;
+		query(
+			&oauth,
+			"SubredditFeedElements",
+			"97046e2a48050f10a507db354a8da60955ffccb586dcf63163bdfc6610d5cf7a",
+			json!({"subredditName":"rust","sort":"NEW","pageSize":5,"includeSubredditInPosts":true}),
+			"/data/postFeed/elements",
+		)
+		.await;
+		query(
+			&oauth,
+			"SubredditFeedElements",
+			"97046e2a48050f10a507db354a8da60955ffccb586dcf63163bdfc6610d5cf7a",
+			json!({"subredditName":"gaming","sort":"TOP","range":"WEEK","pageSize":5,"includeSubredditInPosts":true}),
+			"/data/postFeed/elements",
+		)
+		.await;
+		query(
+			&oauth,
+			"AllFeedSdui",
+			"0e9c0045dd244e934efd0ea4fefc00cb0b4d91523e2f09c8af075856cb59b937",
+			json!({"sort":"HOT"}),
+			"/data/allV3/elements",
+		)
+		.await;
+		query(
+			&oauth,
+			"SubredditInfoByName",
+			"6b9c1679e69097e1c6df364adc11183afe6e2b6545dd1c0c1cc8f7490448c3e5",
+			json!({"subredditName":"rust","filterGated":true,"includeDevvitData":false,"includeRecapFields":false,"includeWelcomePage":false}),
+			"/data/subredditInfoByName",
+		)
+		.await;
+		for pane in ["posts", "communities"] {
+			query(&oauth,"DynamicSearch","4acac653e5aac2ae2f08114d07ba7582e852464a57e324547c259ea3ef2ebd40",
+                json!({"query":"rust","queryId":uuid::Uuid::new_v4().to_string(),
+                    "filters":[{"key":"safe_search","value":"on"}],
+                    "options":[{"key":"page_type","value":"search_results"},{"key":"pane","value":pane},{"key":"pref_allow_nsfw","value":"0"},{"key":"is_eligible_for_kwf","value":"0"},{"key":"after","value":""},{"key":"treatment","value":"default"}],
+                    "includeSubredditUnit":true}),"/data/search/dynamic/components/main").await;
+		}
+		query(
+			&oauth,
+			"ProfileDetailsByName",
+			"096ccf5d943485822cb6d3e0dc13f9977da1984514e1d539e1ed38a51158e689",
+			json!({"profileName":"reddit"}),
+			"/data/profileByName",
+		)
+		.await;
+		query(
+			&oauth,
+			"UserSubmittedPosts",
+			"78a213c02a340db4a707d4bcd375ce34f733b75893379603acb4ec20388fafe6",
+			json!({"username":"reddit","sort":"NEW","pageSize":5,"after":null,"includeSubredditInPosts":true}),
+			"/data/postFeed/posts",
+		)
+		.await;
+		let comments = query(
+			&oauth,
+			"SubmittedComments",
+			"e1b37f521fb40af2120946b70e7fbf6a3d924db2abaf28ff2164d4cfacca28db",
+			json!({"name":"spez","sort":"NEW","pageSize":5,"after":null}),
+			"/data/redditorInfoByName/comments",
+		)
+		.await;
+		let ids: Vec<_> = comments
+			.pointer("/data/redditorInfoByName/comments/edges")
+			.unwrap()
+			.as_array()
+			.unwrap()
+			.iter()
+			.filter_map(|e| e["node"]["id"].as_str())
+			.collect();
+		query(
+			&oauth,
+			"LiveCommentsByIds",
+			"51ab9f2e0eb87b6dac9aac02012ba7046049e516ec55ec442abfed0f19c6f311",
+			json!({"ids":ids,"includePremiumAvatarTreatment":false}),
+			"/data/commentsByIds",
+		)
+		.await;
+		println!("LIVE_PAGE_OPERATION completed=true operations=12");
+	}
+}
