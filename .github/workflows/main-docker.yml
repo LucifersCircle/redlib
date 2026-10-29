@@ -148,6 +148,7 @@ jobs:
           cargo test --locked --lib test_community_only_search_skips_post_listing
           cargo test --locked --lib test_subscription_names_are_compared_case_insensitively
           cargo test --locked --lib test_preference_membership_is_case_insensitive
+          cargo test --locked --lib test_tor_oauth_fallback_
           cargo test --locked --lib test_refresh_retry_delay_is_exponential_and_capped
           cargo test --locked --lib test_active_quota_rotation_matches_generation_and_epoch
           cargo test --locked --lib test_refresh_retry_delay_honors_server_delay
