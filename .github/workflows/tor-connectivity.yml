@@ -1,0 +1,44 @@
+name: Tor onion connectivity diagnostic
+on:
+  push:
+    branches: [diagnostics/tor-onion-20261029]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  connectivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tor
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tor
+      - name: Bootstrap isolated Tor
+        run: |
+          mkdir -p "$RUNNER_TEMP/tor-diagnostic"
+          tor --SocksPort "127.0.0.1:19050 IsolateSOCKSAuth ExtendedErrors" --DataDirectory "$RUNNER_TEMP/tor-diagnostic" --Log "notice file $RUNNER_TEMP/tor-diagnostic.log" &
+          for attempt in $(seq 1 240); do
+            if grep -q 'Bootstrapped 100%' "$RUNNER_TEMP/tor-diagnostic.log"; then
+              echo 'Tor bootstrap complete'
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -15 "$RUNNER_TEMP/tor-diagnostic.log"
+          exit 1
+      - name: Compare onion and public destinations over Tor
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, json, subprocess
+          onion = "reddittorjg6rue252oqsxryoxengawnmo46qy4kyii5wtqnwfj4ooad.onion"
+          hosts = ["check.torproject.org", "www." + onion, "oauth." + onion, onion, "www.reddit.com", "oauth.reddit.com", "gql-fed.reddit.com"]
+          def probe(host):
+              result = subprocess.run(["curl", "--silent", "--show-error", "--socks5-hostname", "127.0.0.1:19050", "--proxy-user", "diagnostic:connectivity", "--connect-timeout", "25", "--max-time", "35", "--output", "/dev/null", "--write-out", "%{http_code} %{time_connect} %{time_appconnect} %{time_total}", "https://" + host + "/"], capture_output=True, text=True)
+              return {"host":host,"exit":result.returncode,"timing":result.stdout,"error":result.stderr.strip()}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+              for result in pool.map(probe, hosts):
+                  print(json.dumps(result), flush=True)
+          PY
+      - name: Tor notices
+        if: always()
+        run: tail -20 "$RUNNER_TEMP/tor-diagnostic.log"
