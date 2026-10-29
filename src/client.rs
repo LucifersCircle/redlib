@@ -7149,3 +7149,8 @@ mod tests {
 		assert_eq!(link, Err("gated".into()));
 	}
 }
+
+#[cfg(test)]
+pub(crate) fn diagnostic_reject_tor_generation(generation: u64) {
+	assert!(upstream_guard(RedditLane::Tor).reject_oauth_generation(generation));
+}

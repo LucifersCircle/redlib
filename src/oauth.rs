@@ -1390,3 +1390,69 @@ mod tests {
 		assert_ne!(rotated_device_id, original_device_id);
 	}
 }
+
+#[cfg(test)]
+mod live_tor_onion_fallback_diagnostic {
+	use super::*;
+	use crate::server::RequestExt;
+	#[tokio::test(flavor = "multi_thread")]
+	#[ignore = "isolated live Tor anonymous login, renewal and rendered comments"]
+	async fn live_tor_onion_oauth_fallback_recovery() {
+		let _ = pretty_env_logger::try_init();
+		let lane = RedditLane::Tor;
+		let profile = OauthTransportProfile::Chrome145Android;
+		let http = client_for_oauth_profile(lane, profile).unwrap();
+		let mut backend = MobileSpoofAuth::new(lane);
+		let started = Instant::now();
+		let oauth = Oauth::authenticate_with_backend(&mut backend, http.clone(), profile)
+			.await
+			.expect("anonymous OAuth with production onion fallback");
+		assert!(oauth.backend.public_auth, "the known onion outage must exercise actual fallback");
+		let device = oauth.backend.device.headers["X-Reddit-Device-Id"].clone();
+		println!(
+			"LIVE_TOR_FIX auth=fallback elapsed_ms={} same_transport={}",
+			started.elapsed().as_millis(),
+			Arc::ptr_eq(&oauth.http_client, &http)
+		);
+		assert!(crate::client::install_oauth_client(oauth, true, None));
+		crate::client::diagnostic_reject_tor_generation(0);
+		let started = Instant::now();
+		assert_eq!(force_refresh_token(lane, RefreshReason::Unauthorized).await, RefreshOutcome::Refreshed);
+		let renewed = oauth_client(lane).unwrap();
+		assert_eq!(renewed.generation, 1);
+		assert!(renewed.backend.public_auth);
+		assert!(Arc::ptr_eq(&renewed.http_client, &http));
+		assert_eq!(renewed.backend.device.headers["X-Reddit-Device-Id"], device);
+		assert!(refresh_backoff_remaining(lane).is_none());
+		println!(
+			"LIVE_TOR_FIX renewal=success generation=1 same_transport=true same_device=true elapsed_ms={}",
+			started.elapsed().as_millis()
+		);
+		for (sub, id, slug, title) in [
+			("SteamDeck", "1xci3c1", "ar_glasses_hub", "AR Glasses"),
+			("gaming", "1xcfm9l", "the_nintendo_switch_2_has_been_hacked_first", "Nintendo Switch 2"),
+		] {
+			let started = Instant::now();
+			let path = format!("/r/{sub}/comments/{id}/{slug}/?sort=new");
+			let mut req = hyper::Request::builder().uri(&path).body(hyper::Body::empty()).unwrap();
+			let mut params = route_recognizer::Params::new();
+			params.insert("sub".into(), sub.into());
+			params.insert("id".into(), id.into());
+			req.set_params(params);
+			let response = crate::post::item(req).await.unwrap();
+			assert_eq!(response.status(), 200);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let body = String::from_utf8(body.to_vec()).unwrap();
+			assert!(body.to_lowercase().contains(&title.to_lowercase()));
+			let comments = body.matches("class=\"comment\"").count();
+			assert!(comments > 0);
+			assert!(!body.contains("Still trying to load your page"));
+			println!(
+				"LIVE_TOR_FIX page={} status=200 rendered_comments={} elapsed_ms={}",
+				id,
+				comments,
+				started.elapsed().as_millis()
+			);
+		}
+	}
+}
