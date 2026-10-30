@@ -357,11 +357,14 @@ impl PageRequest {
 		}
 	}
 	pub(crate) fn finish(&self, values: &[Value]) -> Result<Value, GraphqlError> {
+		self.finish_at(values, time::OffsetDateTime::now_utc().unix_timestamp())
+	}
+	fn finish_at(&self, values: &[Value], now: i64) -> Result<Value, GraphqlError> {
 		let result = match &self.page {
-			Page::Feed(pointer) => feed(connection(&values[0], pointer)?, self.quarantine)?,
+			Page::Feed(pointer) => visible_feed(feed(connection(&values[0], pointer)?, self.quarantine)?, now),
 			Page::All => {
 				let posts = values[1]["data"]["postsInfoByIds"].as_array().ok_or_else(|| invalid("missing_posts"))?;
-				listing(post_items(posts, self.quarantine)?, cursor(connection(&values[0], "/data/allV3/elements")?)?)
+				visible_feed(listing(post_items(posts, self.quarantine)?, cursor(connection(&values[0], "/data/allV3/elements")?)?), now)
 			}
 			Page::About => subreddit(&values[0]["data"]["subredditInfoByName"], self.quarantine)?,
 			Page::Search { community_only } => {
@@ -420,7 +423,7 @@ impl PageRequest {
 						index
 							.map(|i| feed(connection(&values[i], "/data/postFeed/elements")?, self.quarantine))
 							.transpose()
-							.map(|v| v.unwrap_or_else(|| listing(vec![], None)))
+							.map(|v| visible_feed(v.unwrap_or_else(|| listing(vec![], None)), now))
 					})
 					.collect::<Result<Vec<_>, _>>()?;
 				let balanced = matches!(self.sort.as_str(), "hot" | "best" | "rising");
@@ -429,6 +432,15 @@ impl PageRequest {
 		};
 		Ok(result)
 	}
+}
+fn visible_feed(mut page: Value, now: i64) -> Value {
+	if let Some(children) = page["data"]["children"].as_array_mut() {
+		children.retain(|post| {
+			let data = &post["data"];
+			crate::utils::feed_post_visible(data["stickied"] == true || data["pinned"] == true, data["created_utc"].as_f64().unwrap_or_default(), now)
+		});
+	}
+	page
 }
 fn connection<'a>(value: &'a Value, pointer: &str) -> Result<&'a Value, GraphqlError> {
 	if let Some(mut error) = response_error(value) {
