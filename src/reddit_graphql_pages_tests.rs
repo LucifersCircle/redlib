@@ -1,5 +1,171 @@
 use super::*;
 
+// Exercise the real request planner and converter against fourteen independently
+// paginated communities. Skyrim deliberately dominates every score/age comparison.
+fn fourteen_community_page(path: &str) -> Value {
+	let request = PageRequest::from_path(path, false).unwrap();
+	let mut values = Vec::new();
+	while let Some(payload) = request.next_payload(&mut values).unwrap() {
+		assert_eq!(payload["operationName"], "SubredditFeedElements");
+		let vars = &payload["variables"];
+		let name = vars["subredditName"].as_str().unwrap();
+		let start = vars["after"]
+			.as_str()
+			.map(|s| {
+				let id = String::from_utf8(STANDARD.decode(s).unwrap()).unwrap();
+				id.strip_prefix(&format!("t3_{name}")).unwrap().parse::<usize>().unwrap() + 1
+			})
+			.unwrap_or(0);
+		let end = (start + vars["pageSize"].as_u64().unwrap() as usize).min(100);
+		let posts = (start..end)
+			.map(|index| {
+				let mut value = post(&format!("{name}{index}"), 1);
+				value["subreddit"]["name"] = json!(name);
+				value["score"] = json!(if name == "skyrim" { 100_000 } else { 1 });
+				value["createdAt"] = json!(if name == "skyrim" { "2026-10-30T00:00:00Z" } else { "2026-01-01T00:00:00Z" });
+				value
+			})
+			.collect();
+		let after = (end < 100).then(|| format!("t3_{name}{}", end - 1));
+		values.push(feed_value(posts, after.as_deref()));
+	}
+	request.finish(&values).unwrap()
+}
+fn fourteen_community_path(sort: &str, limit: usize, after: Option<&str>) -> String {
+	let names = (0..13).map(|i| format!("community{i:02}")).chain(std::iter::once("skyrim".into())).collect::<Vec<_>>();
+	let mut query = url::form_urlencoded::Serializer::new(String::new());
+	query.append_pair("limit", &limit.to_string());
+	if let Some(after) = after {
+		query.append_pair("after", after);
+	}
+	format!("/r/{}/{sort}.json?{}", names.join("%2B"), query.finish())
+}
+#[test]
+fn test_graphql_pages_subscription_hot_balances_fourteen_communities_across_three_pages() {
+	let mut cursor = None;
+	let mut total = BTreeMap::<String, usize>::new();
+	let mut ids = HashSet::new();
+	for _ in 0..3 {
+		let page = fourteen_community_page(&fourteen_community_path("hot", 25, cursor.as_deref()));
+		let mut counts = BTreeMap::<String, usize>::new();
+		let children = page["data"]["children"].as_array().unwrap();
+		assert_eq!(children.len(), 25);
+		for item in children {
+			let sub = item["data"]["subreddit"].as_str().unwrap().to_string();
+			*counts.entry(sub.clone()).or_default() += 1;
+			*total.entry(sub).or_default() += 1;
+			assert!(ids.insert(item["data"]["name"].as_str().unwrap().to_string()), "post repeated across pages");
+		}
+		assert_eq!(counts.len(), 14, "one community must not monopolize a home-feed page");
+		assert!(counts.values().all(|&count| count <= 2));
+		cursor = page["data"]["after"].as_str().map(str::to_string);
+	}
+	assert_eq!(ids.len(), 75);
+	assert!(total.values().max().unwrap() - total.values().min().unwrap() <= 1);
+}
+
+#[test]
+fn test_graphql_pages_subscription_small_pages_do_not_starve_other_communities() {
+	for sort in ["hot", "best", "rising"] {
+		for limit in [1, 5] {
+			let mut cursor = None;
+			let mut counts = BTreeMap::<String, usize>::new();
+			let mut ids = HashSet::new();
+			for _ in 0..14usize.div_ceil(limit) {
+				let page = fourteen_community_page(&fourteen_community_path(sort, limit, cursor.as_deref()));
+				for item in page["data"]["children"].as_array().unwrap() {
+					*counts.entry(item["data"]["subreddit"].as_str().unwrap().to_string()).or_default() += 1;
+					assert!(ids.insert(item["data"]["name"].as_str().unwrap().to_string()));
+				}
+				cursor = page["data"]["after"].as_str().map(str::to_string);
+			}
+			assert_eq!(counts.len(), 14, "{sort} limit={limit} must visit every community");
+			assert!(counts.values().max().unwrap() - counts.values().min().unwrap() <= 1);
+		}
+	}
+}
+
+#[test]
+fn test_graphql_pages_subscription_new_and_top_keep_global_order() {
+	for sort in ["new", "top"] {
+		let page = fourteen_community_page(&fourteen_community_path(sort, 25, None));
+		let children = page["data"]["children"].as_array().unwrap();
+		assert_eq!(children.len(), 25);
+		assert!(children.iter().all(|item| item["data"]["subreddit"] == "skyrim"));
+		assert!(decode_cursor(page["data"]["after"].as_str().unwrap(), 14).is_some());
+	}
+}
+
+#[test]
+fn test_graphql_pages_subscription_balancing_accepts_existing_page_links() {
+	let names = (0..13).map(|i| format!("community{i:02}")).chain(std::iter::once("skyrim".into()));
+	let legacy = encode_cursor(&names.map(|name| format!("t3_{name}2")).collect::<Vec<_>>()).unwrap();
+	let page = fourteen_community_page(&fourteen_community_path("hot", 25, Some(&legacy)));
+	let mut counts = BTreeMap::<String, usize>::new();
+	for item in page["data"]["children"].as_array().unwrap() {
+		let name = item["data"]["subreddit"].as_str().unwrap();
+		let index = item["data"]["name"]
+			.as_str()
+			.unwrap()
+			.strip_prefix(&format!("t3_{name}"))
+			.unwrap()
+			.parse::<usize>()
+			.unwrap();
+		assert!(index >= 3, "legacy cursor must not repeat earlier posts");
+		*counts.entry(name.into()).or_default() += 1;
+	}
+	assert_eq!(counts.len(), 14);
+	assert!(counts.values().all(|&count| count <= 2));
+}
+
+#[test]
+fn test_graphql_pages_subscription_empty_exhausted_and_duplicate_sources_fill_page() {
+	let request = PageRequest::from_path("/r/alpha%2Bbeta%2Bgamma/hot.json?limit=5", false).unwrap();
+	let page = request
+		.finish(&[
+			feed_value(vec![], None),
+			feed_value(vec![post("shared", 1)], None),
+			feed_value(
+				std::iter::once(post("shared", 1)).chain((0..8).map(|i| post(&format!("gamma{i}"), 1))).collect(),
+				Some("t3_gamma7"),
+			),
+		])
+		.unwrap();
+	let children = page["data"]["children"].as_array().unwrap();
+	assert_eq!(children.len(), 5);
+	let ids: HashSet<_> = children.iter().map(|v| v["data"]["name"].as_str().unwrap()).collect();
+	assert_eq!(ids.len(), 5);
+	let cursor = page["data"]["after"].as_str().unwrap();
+	let (cursors, _) = decode_subscription_cursor(cursor, 3).unwrap();
+	assert_eq!(&cursors[..2], ["-", "-"]);
+	assert_eq!(cursors[2], children.last().unwrap()["data"]["name"].as_str().unwrap());
+	let next = PageRequest::from_path(&format!("/r/alpha%2Bbeta%2Bgamma/hot.json?after={cursor}"), false).unwrap();
+	assert_eq!(next.next_payload(&mut vec![]).unwrap().unwrap()["variables"]["subredditName"], "gamma");
+	let last = next.finish(&[feed_value(vec![post("last", 1)], None)]).unwrap();
+	assert!(last["data"]["after"].is_null());
+}
+
+#[test]
+fn test_graphql_pages_subscription_cursor_validates_counts_and_avoids_overflow() {
+	for state in [
+		json!({"cursors":vec!["";14],"served":[0]}),
+		json!({"cursors":vec!["";14],"served":vec![-1;14]}),
+		json!({"cursors":vec!["\n";14],"served":vec![0;14]}),
+	] {
+		let cursor = format!("gql:{}", URL_SAFE_NO_PAD.encode(state.to_string()));
+		let request = PageRequest::from_path(&fourteen_community_path("hot", 25, Some(&cursor)), false).unwrap();
+		assert!(request.next_payload(&mut vec![]).is_err());
+	}
+	let cursor = encode_subscription_cursor(&vec![String::new(); 14], &[u64::MAX; 14]).unwrap();
+	let page = fourteen_community_page(&fourteen_community_path("hot", 25, Some(&cursor)));
+	let mut counts = BTreeMap::<String, usize>::new();
+	for item in page["data"]["children"].as_array().unwrap() {
+		*counts.entry(item["data"]["subreddit"].as_str().unwrap().into()).or_default() += 1;
+	}
+	assert_eq!(counts.len(), 14);
+	assert!(counts.values().all(|&count| count <= 2));
+}
+
 fn post(id: &str, time: u64) -> Value {
 	json!({"__typename":"SubredditPost","id":format!("t3_{id}"),"title":format!("Post {id}"),"authorInfo":{"name":"fixture"},
         "subreddit":{"name":"fixture","type":"PUBLIC"},"createdAt":format!("2026-10-29T00:00:{time:02}Z"),
