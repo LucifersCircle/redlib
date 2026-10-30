@@ -878,6 +878,16 @@ pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
 		.collect::<HashSet<String>>()
 }
 
+/// Community feed pins are visible only for the first 24 hours after creation.
+pub(crate) fn feed_post_visible(pinned: bool, created: f64, now: i64) -> bool {
+	!pinned || (created.is_finite() && created > 0.0 && created <= now as f64 && now as f64 - created <= 86_400.0)
+}
+
+/// Recheck cached feed posts at render time so pins also expire during outages.
+pub(crate) fn filter_feed_pins(posts: &mut Vec<Post>, now: i64) {
+	posts.retain(|post| feed_post_visible(post.flags.stickied, post.created_ts as f64, now));
+}
+
 /// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being
 /// a subreddit name or a user name). If a `Post`'s subreddit or author is
 /// found in the filters, it is removed.

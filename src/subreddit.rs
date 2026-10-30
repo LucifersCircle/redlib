@@ -164,6 +164,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
+				utils::filter_feed_pins(&mut posts, OffsetDateTime::now_utc().unix_timestamp());
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
@@ -581,7 +582,8 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subreddit = subreddit(&sub, false).await?;
 
 	// Get posts
-	let (posts, _) = Post::fetch(&path, false).await?;
+	let (mut posts, _) = Post::fetch(&path, false).await?;
+	utils::filter_feed_pins(&mut posts, OffsetDateTime::now_utc().unix_timestamp());
 
 	// Build the RSS feed
 	let channel = ChannelBuilder::default()
