@@ -48,6 +48,7 @@ enum Page {
 		names: Vec<String>,
 		indices: Vec<Option<usize>>,
 		cursors: Vec<String>,
+		served: Vec<u64>,
 	},
 }
 #[derive(Debug, Clone)]
@@ -77,7 +78,38 @@ fn decode_cursor(cursor: &str, count: usize) -> Option<Vec<String>> {
 	}
 	let bytes = URL_SAFE_NO_PAD.decode(cursor.strip_prefix("gql:")?).ok()?;
 	let cursors: Vec<String> = serde_json::from_slice(&bytes).ok()?;
-	(cursors.len() == count && cursors.iter().all(|s| s.len() <= 1024 && !s.chars().any(char::is_control))).then_some(cursors)
+	valid_cursors(&cursors, count).then_some(cursors)
+}
+fn valid_cursors(cursors: &[String], count: usize) -> bool {
+	cursors.len() == count && cursors.iter().all(|s| s.len() <= 1024 && !s.chars().any(char::is_control))
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SubscriptionCursor {
+	cursors: Vec<String>,
+	served: Vec<u64>,
+}
+fn decode_subscription_cursor(cursor: &str, count: usize) -> Option<(Vec<String>, Vec<u64>)> {
+	// Continue links produced before subscription balancing was introduced.
+	if let Some(cursors) = decode_cursor(cursor, count) {
+		return Some((cursors, vec![0; count]));
+	}
+	if cursor.len() > 8192 {
+		return None;
+	}
+	let bytes = URL_SAFE_NO_PAD.decode(cursor.strip_prefix("gql:")?).ok()?;
+	let state: SubscriptionCursor = serde_json::from_slice(&bytes).ok()?;
+	(valid_cursors(&state.cursors, count) && state.served.len() == count).then_some((state.cursors, state.served))
+}
+fn encode_subscription_cursor(cursors: &[String], served: &[u64]) -> Option<String> {
+	if cursors.iter().all(|s| s == "-") {
+		return None;
+	}
+	let state = SubscriptionCursor {
+		cursors: cursors.to_vec(),
+		served: served.to_vec(),
+	};
+	let cursor = format!("gql:{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(&state).ok()?));
+	(cursor.len() <= 8192).then_some(cursor)
 }
 fn encode_cursor(cursors: &[String]) -> Option<String> {
 	if cursors.iter().all(|s| s == "-") {
@@ -133,9 +165,9 @@ impl PageRequest {
 					if names.len() > 64 {
 						return None;
 					}
-					let cursors = decode_cursor(&after, names.len());
-					request.invalid_cursor = cursors.is_none();
-					let cursors = cursors.unwrap_or_else(|| vec![String::new(); names.len()]);
+					let state = decode_subscription_cursor(&after, names.len());
+					request.invalid_cursor = state.is_none();
+					let (cursors, served) = state.unwrap_or_else(|| (vec![String::new(); names.len()], vec![0; names.len()]));
 					let mut indices = Vec::new();
 					for (name, cursor) in names.iter().zip(&cursors) {
 						indices.push(if cursor == "-" {
@@ -146,7 +178,7 @@ impl PageRequest {
 							Some(index)
 						});
 					}
-					request.page = Page::Multi { names, indices, cursors };
+					request.page = Page::Multi { names, indices, cursors, served };
 				} else if name.eq_ignore_ascii_case("popular") {
 					request.page = Page::Feed("/data/popular/elements");
 					request.push("PopularFeedElements", POPULAR, request.feed_variables(&after));
@@ -378,9 +410,9 @@ impl PageRequest {
 						.transpose()?
 						.unwrap_or_else(|| listing(vec![], None)),
 				);
-				merge(&sides, cursors, &self.sort, self.limit)?
+				merge(&sides, cursors, &self.sort, self.limit, None)?
 			}
-			Page::Multi { names, indices, cursors } => {
+			Page::Multi { names, indices, cursors, served } => {
 				debug_assert_eq!(names.len(), indices.len());
 				let sides = indices
 					.iter()
@@ -391,7 +423,8 @@ impl PageRequest {
 							.map(|v| v.unwrap_or_else(|| listing(vec![], None)))
 					})
 					.collect::<Result<Vec<_>, _>>()?;
-				merge(&sides, cursors, &self.sort, self.limit)?
+				let balanced = matches!(self.sort.as_str(), "hot" | "best" | "rising");
+				merge(&sides, cursors, &self.sort, self.limit, balanced.then_some(served.as_slice()))?
 			}
 		};
 		Ok(result)
@@ -498,10 +531,19 @@ fn user_comments(previews: &Value, full: &Value) -> Result<Value, GraphqlError> 
 }
 /// Consume only the next item of each ordered source. Unconsumed entries stay
 /// behind that source's cursor, so interleaved pages neither skip nor repeat them.
-fn merge(sides: &[Value], prior: &[String], sort: &str, limit: usize) -> Result<Value, GraphqlError> {
+fn merge(sides: &[Value], prior: &[String], sort: &str, limit: usize, balance: Option<&[u64]>) -> Result<Value, GraphqlError> {
 	let lists: Vec<_> = sides.iter().map(|s| s["data"]["children"].as_array().cloned().unwrap_or_default()).collect();
 	let mut positions = vec![0; lists.len()];
 	let mut cursors = prior.to_vec();
+	let mut served = balance.map_or_else(|| vec![0; lists.len()], <[u64]>::to_vec);
+	if balance.is_some() {
+		// Only relative counts matter. Keep long-lived and externally supplied
+		// cursors away from overflow, ignoring communities with no current posts.
+		let minimum = (0..lists.len()).filter(|&i| !lists[i].is_empty()).map(|i| served[i]).min().unwrap_or(0);
+		for count in &mut served {
+			*count = count.saturating_sub(minimum);
+		}
+	}
 	let mut result = Vec::new();
 	let mut seen = HashSet::new();
 	let rank = |post: &Value| {
@@ -514,15 +556,20 @@ fn merge(sides: &[Value], prior: &[String], sort: &str, limit: usize) -> Result<
 		}
 	};
 	while result.len() < limit {
-		let next = (0..lists.len())
-			.filter(|&i| positions[i] < lists[i].len())
-			.max_by(|&a, &b| rank(&lists[a][positions[a]]).total_cmp(&rank(&lists[b][positions[b]])));
+		let next = (0..lists.len()).filter(|&i| positions[i] < lists[i].len()).max_by(|&a, &b| {
+			// Give each available community a turn before another takes its
+			// next turn; rank breaks ties within a round. Persist the counts
+			// so small pages and page boundaries cannot starve other sources.
+			let variety = if balance.is_some() { served[b].cmp(&served[a]) } else { std::cmp::Ordering::Equal };
+			variety.then_with(|| rank(&lists[a][positions[a]]).total_cmp(&rank(&lists[b][positions[b]])))
+		});
 		let Some(i) = next else { break };
 		let post = lists[i][positions[i]].clone();
 		positions[i] += 1;
 		let id = post["data"]["name"].as_str().ok_or_else(|| invalid("missing_merge_cursor"))?;
 		cursors[i] = id.into();
 		if seen.insert(id.to_string()) {
+			served[i] = served[i].saturating_add(1);
 			result.push(post);
 		}
 	}
@@ -531,7 +578,12 @@ fn merge(sides: &[Value], prior: &[String], sort: &str, limit: usize) -> Result<
 			cursors[i] = sides[i]["data"]["after"].as_str().unwrap_or("-").into();
 		}
 	}
-	Ok(listing(result, encode_cursor(&cursors)))
+	let after = if balance.is_some() {
+		encode_subscription_cursor(&cursors, &served)
+	} else {
+		encode_cursor(&cursors)
+	};
+	Ok(listing(result, after))
 }
 
 #[cfg(test)]
