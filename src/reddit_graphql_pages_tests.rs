@@ -238,7 +238,7 @@ fn test_graphql_pages_feed_pin_age_uses_creation_time_and_24_hour_boundary() {
 	];
 	for sort in ["hot", "best", "rising", "new", "top", "controversial"] {
 		for name in ["fixture", "popular"] {
-			let request = PageRequest::from_path(&format!("/r/{name}/{sort}.json"), false).unwrap();
+			let request = PageRequest::from_path(&format!("/r/{name}/{sort}.json{}", if name == "fixture" { "?after=t3_previous" } else { "" }), false).unwrap();
 			let value = if name == "popular" {
 				json!({"data":{"popular":{"elements":conn(posts.iter().map(|p|json!({"postInfo":p})).collect(),Some("t3_ordinary"))}}})
 			} else {
@@ -269,7 +269,7 @@ fn test_graphql_pages_all_and_filtered_only_feeds_keep_pagination() {
 	assert_eq!(page["data"]["children"].as_array().unwrap().len(), 1);
 	assert_eq!(page["data"]["children"][0]["data"]["name"], "t3_recent");
 	assert_eq!(page["data"]["after"], "all-next");
-	let request = PageRequest::from_path("/r/fixture/hot.json", false).unwrap();
+	let request = PageRequest::from_path("/r/fixture/hot.json?after=t3_previous", false).unwrap();
 	for after in [Some("t3_old"), None] {
 		let page = request.finish_at(&[feed_value(vec![old.clone()], after)], pin_test_now()).unwrap();
 		assert_eq!(page["data"]["children"], json!([]), "filtered pins are a valid empty page");
@@ -525,4 +525,51 @@ fn test_graphql_pages_community_summary_respects_limit() {
 		}}}}}})])
 		.unwrap();
 	assert_eq!(page["data"]["children"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_graphql_pages_own_subreddit_first_page_keeps_all_pins_at_top() {
+	let mut newest = post("newest", 1);
+	newest["createdAt"] = json!("2026-10-30T12:00:00Z");
+	let posts = vec![newest, pinned_post("oldpin", 86_400 * 300), post("ordinary", 1), pinned_post("freshpin", 3600)];
+	for sort in ["hot", "best", "rising", "new", "top", "controversial"] {
+		let request = PageRequest::from_path(&format!("/r/fixture/{sort}.json"), false).unwrap();
+		let page = request.finish_at(&[feed_value(posts.clone(), Some("t3_next"))], pin_test_now()).unwrap();
+		assert_eq!(page["data"]["children"].as_array().unwrap().len(), 4, "old subreddit pins must survive the API conversion");
+		assert_eq!(page["data"]["after"], "t3_next");
+		let mut displayed = Vec::new();
+		for item in page["data"]["children"].as_array().unwrap() {
+			displayed.push(crate::utils::parse_post(item).await);
+		}
+		let scoped = crate::utils::subreddit_pins_first("fixture", true, "");
+		assert!(scoped);
+		crate::utils::prepare_community_posts(&mut displayed, sort, scoped, pin_test_now());
+		let mut pinned = displayed.iter().take(2).map(|p| p.id.as_str()).collect::<Vec<_>>();
+		pinned.sort_unstable();
+		assert_eq!(pinned, ["freshpin", "oldpin"]);
+		assert_eq!(displayed.iter().skip(2).map(|p| p.id.as_str()).collect::<Vec<_>>(), ["newest", "ordinary"]);
+		// A one-subscription home page can share the same cached API listing.
+		let home = crate::utils::subreddit_pins_first("fixture", false, "");
+		assert!(!home);
+		crate::utils::prepare_community_posts(&mut displayed, sort, home, pin_test_now());
+		assert!(displayed.iter().all(|p| p.id != "oldpin"));
+		assert!(displayed.iter().any(|p| p.id == "freshpin"));
+		if sort == "new" {
+			assert_eq!(displayed[0].id, "newest", "home New must not promote a pin ahead of a newer post");
+		}
+	}
+}
+
+#[test]
+fn test_graphql_pages_pin_promotion_is_only_for_a_scoped_first_page() {
+	for query in ["", "sort=hot", "after=", "before=", "sort=top&t=all"] {
+		assert!(crate::utils::subreddit_pins_first("Skyrim", true, query));
+	}
+	for query in ["after=t3_page1", "before=t3_page2", "after=&before=t3_page2", "%61fter=t3_page1"] {
+		assert!(!crate::utils::subreddit_pins_first("Skyrim", true, query));
+	}
+	for sub in ["popular", "POPULAR", "all", "All", "alpha+beta"] {
+		assert!(!crate::utils::subreddit_pins_first(sub, true, ""));
+	}
+	assert!(!crate::utils::subreddit_pins_first("Skyrim", false, ""));
 }

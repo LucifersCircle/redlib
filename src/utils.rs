@@ -652,7 +652,7 @@ pub struct ErrorTemplate {
 struct LoadingTemplate {
 	prefs: Preferences,
 	url: String,
-	retry_after: u64,
+	refresh_after: u64,
 }
 
 #[derive(Template)]
@@ -878,7 +878,28 @@ pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
 		.collect::<HashSet<String>>()
 }
 
-/// Community feed pins are visible only for the first 24 hours after creation.
+/// Only an individual community's first page promotes pins of every age.
+pub(crate) fn subreddit_pins_first(sub: &str, scoped: bool, query: &str) -> bool {
+	scoped
+		&& !sub.contains('+')
+		&& !sub.eq_ignore_ascii_case("popular")
+		&& !sub.eq_ignore_ascii_case("all")
+		&& url::form_urlencoded::parse(query.as_bytes()).all(|(key, value)| !matches!(key.as_ref(), "after" | "before") || value.is_empty())
+}
+
+pub(crate) fn prepare_community_posts(posts: &mut Vec<Post>, sort: &str, show_pins: bool, now: i64) {
+	if !show_pins {
+		filter_feed_pins(posts, now);
+	}
+	if sort == "new" {
+		posts.sort_by_key(|post| std::cmp::Reverse(post.created_ts));
+	}
+	if show_pins {
+		posts.sort_by_key(|post| std::cmp::Reverse(post.flags.stickied));
+	}
+}
+
+/// Home and combined feed pins are visible only for the first 24 hours after creation.
 pub(crate) fn feed_post_visible(pinned: bool, created: f64, now: i64) -> bool {
 	!pinned || (created.is_finite() && created > 0.0 && created <= now as f64 && now as f64 - created <= 86_400.0)
 }
@@ -1530,7 +1551,7 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 		let body = LoadingTemplate {
 			prefs: Preferences::new(&req),
 			url: req.uri().to_string(),
-			retry_after: seconds,
+			refresh_after: seconds.min(10),
 		}
 		.render()
 		.unwrap_or_default();
@@ -1749,10 +1770,28 @@ mod tests {
 		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 		let html = std::str::from_utf8(&body).unwrap();
 		assert!(html.contains("Still trying to load your page…"));
-		assert!(html.contains(&format!("http-equiv=\"refresh\" content=\"{seconds}\"")));
+		assert!(html.contains("http-equiv=\"refresh\" content=\"10\""));
 		assert!(!html.contains(msg));
 		assert!(!html.contains("check_update.js"));
 		assert!(!html.contains("Report"));
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_recheck_long_cooldowns_within_ten_seconds() {
+		for delay in [90, 326, 361, 900] {
+			let request = hyper::Request::builder().uri("/r/example/hot?sort=hot&after=page2").body(hyper::Body::empty()).unwrap();
+			let response = super::error(request, &format!("Reddit is temporarily rejecting this instance. Retry in {delay} seconds"))
+				.await
+				.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+			assert_eq!(response.headers()["cache-control"], "no-store");
+			let retry_after = response.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap();
+			assert!((delay..=delay + 2).contains(&retry_after), "upstream retry metadata must stay intact");
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let html = std::str::from_utf8(&body).unwrap();
+			assert!(html.contains("http-equiv=\"refresh\" content=\"10\""));
+			assert!(html.contains("Still trying to load your page"));
+		}
 	}
 
 	#[tokio::test]
