@@ -12,7 +12,7 @@ use arc_swap::ArcSwapOption;
 use cached::proc_macro::cached;
 use futures_lite::{future::Boxed, FutureExt};
 use hyper::{body::Buf, header, Body, Request as HyperRequest, Response as HyperResponse};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 use std::borrow::Cow;
