@@ -1780,7 +1780,9 @@ mod tests {
 	async fn temporary_errors_recheck_long_cooldowns_within_ten_seconds() {
 		for delay in [90, 326, 361, 900] {
 			let request = hyper::Request::builder().uri("/r/example/hot?sort=hot&after=page2").body(hyper::Body::empty()).unwrap();
-			let response = super::error(request, &format!("Reddit is temporarily rejecting this instance. Retry in {delay} seconds")).await.unwrap();
+			let response = super::error(request, &format!("Reddit is temporarily rejecting this instance. Retry in {delay} seconds"))
+				.await
+				.unwrap();
 			assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
 			assert_eq!(response.headers()["cache-control"], "no-store");
 			let retry_after = response.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap();

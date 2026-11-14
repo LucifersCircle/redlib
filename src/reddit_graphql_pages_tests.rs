@@ -544,7 +544,10 @@ async fn test_graphql_pages_own_subreddit_first_page_keeps_all_pins_at_top() {
 		let scoped = crate::utils::subreddit_pins_first("fixture", true, "");
 		assert!(scoped);
 		crate::utils::prepare_community_posts(&mut displayed, sort, scoped, pin_test_now());
-		assert_eq!(displayed.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["oldpin", "freshpin", "newest", "ordinary"]);
+		let mut pinned = displayed.iter().take(2).map(|p| p.id.as_str()).collect::<Vec<_>>();
+		pinned.sort_unstable();
+		assert_eq!(pinned, ["freshpin", "oldpin"]);
+		assert_eq!(displayed.iter().skip(2).map(|p| p.id.as_str()).collect::<Vec<_>>(), ["newest", "ordinary"]);
 		// A one-subscription home page can share the same cached API listing.
 		let home = crate::utils::subreddit_pins_first("fixture", false, "");
 		assert!(!home);

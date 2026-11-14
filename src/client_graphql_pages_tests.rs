@@ -134,7 +134,8 @@ fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
 								"edges":[{"node":{"__typename":"SubredditPost","id":"t3_recovered","postTitle":"Recovered page",
 									"subreddit":{"name":"fixture","type":"PUBLIC"}}}],
 								"pageInfo":{"hasNextPage":false,"endCursor":null}
-							}}}}).to_string()
+							}}}})
+							.to_string()
 						};
 						Ok::<_, Infallible>(
 							HyperResponse::builder()
@@ -163,12 +164,13 @@ fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
 		for rejected in [true, false] {
 			let request = async {
 				let mut refresh = TorQuotaRefreshRetryState::default();
-				let (oauth, mut attempt, _permit, _probe) =
-					begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut refresh).await.unwrap();
-				let result = reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin).await.unwrap();
-				let RedditReadResponse::Pages(response) = result else {
-					panic!("page response")
-				};
+				let (oauth, mut attempt, _permit, _probe) = begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut refresh)
+					.await
+					.unwrap();
+				let result = reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin)
+					.await
+					.unwrap();
+				let RedditReadResponse::Pages(response) = result else { panic!("page response") };
 				if rejected {
 					assert_eq!(response.status(), 403);
 					let decision = block_for_edge_throttle(&mut attempt, Some(Duration::ZERO));
@@ -181,7 +183,9 @@ fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
 					record_upstream_success(&mut attempt, path);
 				}
 			};
-			tokio::time::timeout(Duration::from_secs(2), request).await.expect("the next Tor request must not wait for an edge cooldown");
+			tokio::time::timeout(Duration::from_secs(2), request)
+				.await
+				.expect("the next Tor request must not wait for an edge cooldown");
 		}
 		assert_eq!(calls.load(Ordering::SeqCst), 2);
 		assert_eq!(upstream_guard(lane).edges[api_endpoint_index(path)].failures, 0);
