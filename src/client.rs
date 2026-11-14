@@ -5104,6 +5104,7 @@ mod tests {
 		assert_eq!(guard.rate_limit_blocked_until, Some(now + Duration::from_secs(30)));
 		assert_eq!(guard.graphql_rate_limit_blocked_until, Some(now + Duration::from_secs(60)));
 	}
+
 	#[test]
 	fn test_endpoint_edge_recovery_requires_the_failed_class() {
 		let now = Instant::now();

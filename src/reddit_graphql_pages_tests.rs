@@ -551,6 +551,9 @@ async fn test_graphql_pages_own_subreddit_first_page_keeps_all_pins_at_top() {
 		crate::utils::prepare_community_posts(&mut displayed, sort, home, pin_test_now());
 		assert!(displayed.iter().all(|p| p.id != "oldpin"));
 		assert!(displayed.iter().any(|p| p.id == "freshpin"));
+		if sort == "new" {
+			assert_eq!(displayed[0].id, "newest", "home New must not promote a pin ahead of a newer post");
+		}
 	}
 }
 
