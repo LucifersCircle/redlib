@@ -5040,6 +5040,50 @@ mod tests {
 		assert!(!should_use_direct_standby(RedditLane::Tor, RedditLane::Tor, TorRetryReason::None, LaneAvailability::Ready));
 	}
 
+
+	#[test]
+	fn test_endpoint_edge_tor_rejections_do_not_start_cooldowns() {
+		let now = Instant::now();
+		for endpoint in 0..8 {
+			let mut guard = UpstreamGuard::new(RedditLane::Tor);
+			guard.install_oauth_generation(7, true);
+			let continuation = guard.begin_endpoint_attempt(now, endpoint).unwrap();
+			for failures in 1..=255 {
+				let attempt = guard.begin_endpoint_attempt(now, endpoint).expect("Tor must remain available after an edge rejection");
+				let decision = guard.record_edge_throttle(now, attempt, Some(Duration::ZERO));
+				assert_eq!(decision.delay, Duration::ZERO);
+				assert!(!decision.started_cooldown);
+				assert_eq!(decision.consecutive_failures, failures);
+				assert_eq!(guard.routing_availability(now, 7, endpoint), LaneAvailability::Ready);
+				assert!(guard.active_endpoint_cooldown(now, endpoint).is_none());
+				assert!(guard.redirect_cooldown(now, continuation).is_none());
+			}
+			let success = guard.begin_endpoint_attempt(now, endpoint).unwrap();
+			assert!(!success.half_open);
+			guard.record_api_success(now, success);
+			assert_eq!(guard.edges[endpoint].failures, 0);
+		}
+	}
+
+	#[test]
+	fn test_endpoint_edge_tor_rejections_preserve_explicit_quota_pauses() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		for endpoint in [0, 4, 7] {
+			let attempt = guard.begin_endpoint_attempt(now, endpoint).unwrap();
+			guard.record_edge_throttle(now, attempt, None);
+		}
+		guard.block_for_rate_limit(now, Duration::from_secs(30));
+		guard.graphql_rate_limit_blocked_until = Some(now + Duration::from_secs(60));
+		for endpoint in [0, 4, 7] {
+			assert_eq!(guard.routing_availability(now, 7, endpoint), LaneAvailability::UpstreamQuotaCooldown);
+			assert_eq!(guard.begin_endpoint_attempt(now, endpoint).unwrap_err().1, CooldownReason::RateLimit);
+		}
+		assert_eq!(guard.rate_limit_blocked_until, Some(now + Duration::from_secs(30)));
+		assert_eq!(guard.graphql_rate_limit_blocked_until, Some(now + Duration::from_secs(60)));
+	}
+
 	#[test]
 	fn test_endpoint_edge_recovery_requires_the_failed_class() {
 		let now = Instant::now();
