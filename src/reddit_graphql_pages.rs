@@ -361,7 +361,17 @@ impl PageRequest {
 	}
 	fn finish_at(&self, values: &[Value], now: i64) -> Result<Value, GraphqlError> {
 		let result = match &self.page {
-			Page::Feed(pointer) => visible_feed(feed(connection(&values[0], pointer)?, self.quarantine)?, now),
+			Page::Feed(pointer) => {
+				let page = feed(connection(&values[0], pointer)?, self.quarantine)?;
+				let first_page = ["after", "before"].iter().all(|key| self.query.get(*key).map_or(true, String::is_empty));
+				if *pointer == "/data/postFeed/elements" && first_page {
+					// Keep all pins for a community's own first page. Home rendering
+					// applies its age filter even when it shares this cached listing.
+					page
+				} else {
+					visible_feed(page, now)
+				}
+			}
 			Page::All => {
 				let posts = values[1]["data"]["postsInfoByIds"].as_array().ok_or_else(|| invalid("missing_posts"))?;
 				visible_feed(listing(post_items(posts, self.quarantine)?, cursor(connection(&values[0], "/data/allV3/elements")?)?), now)

@@ -108,3 +108,83 @@ fn test_graphql_pages_transport_retains_session_probe_and_counts_every_send() {
 		server.abort();
 	});
 }
+
+#[test]
+#[sealed_test(env = [("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		use hyper::service::{make_service_fn, service_fn};
+		use std::convert::Infallible;
+		let calls = Arc::new(AtomicUsize::new(0));
+		let server_calls = calls.clone();
+		let service = make_service_fn(move |_| {
+			let calls = server_calls.clone();
+			async move {
+				Ok::<_, Infallible>(service_fn(move |request: HyperRequest<Body>| {
+					let calls = calls.clone();
+					async move {
+						assert_eq!(request.headers()["authorization"], "Bearer local-test-fixture");
+						let payload: Value = serde_json::from_slice(&hyper::body::to_bytes(request.into_body()).await.unwrap()).unwrap();
+						assert_eq!(payload["operationName"], "SubredditFeedElements");
+						let rejected = calls.fetch_add(1, Ordering::SeqCst) == 0;
+						let body = if rejected {
+							"<html>Edge rejected this request</html>".to_string()
+						} else {
+							serde_json::json!({"data":{"postFeed":{"elements":{
+								"edges":[{"node":{"__typename":"SubredditPost","id":"t3_recovered","postTitle":"Recovered page",
+									"subreddit":{"name":"fixture","type":"PUBLIC"}}}],
+								"pageInfo":{"hasNextPage":false,"endCursor":null}
+							}}}}).to_string()
+						};
+						Ok::<_, Infallible>(
+							HyperResponse::builder()
+								.status(if rejected { 403 } else { 200 })
+								.header("content-type", if rejected { "text/html" } else { "application/json" })
+								.header("retry-after", "0")
+								.body(Body::from(body))
+								.unwrap(),
+						)
+					}
+				}))
+			}
+		});
+		let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+		let address = server.local_addr();
+		let origin = RedditOrigin {
+			base: Box::leak(format!("http://{address}").into_boxed_str()),
+			host: Box::leak(address.to_string().into_boxed_str()),
+		};
+		let server = tokio::spawn(server);
+		let lane = RedditLane::Tor;
+		*upstream_guard(lane) = UpstreamGuard::new(lane);
+		let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+		assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+		let path = "/r/fixture/hot.json";
+		for rejected in [true, false] {
+			let request = async {
+				let mut refresh = TorQuotaRefreshRetryState::default();
+				let (oauth, mut attempt, _permit, _probe) =
+					begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut refresh).await.unwrap();
+				let result = reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin).await.unwrap();
+				let RedditReadResponse::Pages(response) = result else {
+					panic!("page response")
+				};
+				if rejected {
+					assert_eq!(response.status(), 403);
+					let decision = block_for_edge_throttle(&mut attempt, Some(Duration::ZERO));
+					assert_eq!(decision.delay, Duration::ZERO);
+					assert!(!decision.started_cooldown);
+				} else {
+					assert_eq!(response.status(), 200);
+					let value: Value = serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap()).unwrap();
+					assert_eq!(value["data"]["children"][0]["data"]["title"], "Recovered page");
+					record_upstream_success(&mut attempt, path);
+				}
+			};
+			tokio::time::timeout(Duration::from_secs(2), request).await.expect("the next Tor request must not wait for an edge cooldown");
+		}
+		assert_eq!(calls.load(Ordering::SeqCst), 2);
+		assert_eq!(upstream_guard(lane).edges[api_endpoint_index(path)].failures, 0);
+		server.abort();
+	});
+}

@@ -1151,6 +1151,24 @@ impl UpstreamGuard {
 	}
 
 	fn record_edge_throttle(&mut self, now: Instant, attempt: EdgeAttempt, retry_after: Option<Duration>) -> EdgeThrottleDecision {
+		if self.lane == RedditLane::Tor {
+			// Tor edge rejections must not impose a lane-wide pause on later
+			// requests. Explicit quota responses are handled separately.
+			let edge = &mut self.edges[attempt.endpoint];
+			if attempt.epoch == edge.epoch {
+				edge.failures = edge.failures.saturating_add(1);
+				edge.episode_started_at.get_or_insert(now);
+				edge.state = EdgeCircuitState::Closed;
+			}
+			return EdgeThrottleDecision {
+				delay: Duration::ZERO,
+				consecutive_failures: edge.failures,
+				started_cooldown: false,
+				episode_seconds: edge.episode_started_at.map_or(0, |started| now.saturating_duration_since(started).as_secs()),
+				current_generation: self.quota.generation,
+				identity_age_seconds: now.saturating_duration_since(self.identity_installed_at).as_secs(),
+			};
+		}
 		let episode_seconds = self.edges[attempt.endpoint]
 			.episode_started_at
 			.map_or(0, |started| now.saturating_duration_since(started).as_secs());
@@ -3996,6 +4014,10 @@ async fn json_uncached_on_lane_with_options(
 						retry_reason = TorRetryReason::EdgeRejected;
 						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
 						match decision {
+							_ if lane == RedditLane::Tor => debug!(
+								"Reddit edge rejection: lane=tor endpoint={} cooldown_disabled=true",
+								endpoint_class(&path),
+							),
 							decision if decision.started_cooldown => warn!(
 								"Reddit edge throttle: lane={} status={} endpoint={} retry_after_present={} retry_after_valid={} retry_after_seconds={} quota_headers_present={} consecutive_failures={} episode_seconds={} cooldown_seconds={} half_open_probe={} request_generation={} current_generation={} current_identity_age_seconds={}",
 								lane.label(), status,
@@ -5040,7 +5062,6 @@ mod tests {
 		assert!(!should_use_direct_standby(RedditLane::Tor, RedditLane::Tor, TorRetryReason::None, LaneAvailability::Ready));
 	}
 
-
 	#[test]
 	fn test_endpoint_edge_tor_rejections_do_not_start_cooldowns() {
 		let now = Instant::now();
@@ -5083,13 +5104,12 @@ mod tests {
 		assert_eq!(guard.rate_limit_blocked_until, Some(now + Duration::from_secs(30)));
 		assert_eq!(guard.graphql_rate_limit_blocked_until, Some(now + Duration::from_secs(60)));
 	}
-
 	#[test]
 	fn test_endpoint_edge_recovery_requires_the_failed_class() {
 		let now = Instant::now();
 		let comments = endpoint_class_index("/r/example/comments/abc.json");
 		let listing = endpoint_class_index("/r/example/hot.json");
-		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		let mut guard = UpstreamGuard::new(RedditLane::Direct);
 		let rejected = guard.begin_endpoint_attempt(now, comments).unwrap();
 		let denial = guard.record_edge_throttle(now, rejected, Some(Duration::ZERO));
 		assert_eq!(guard.routing_availability(now, 0, comments), LaneAvailability::Unavailable);

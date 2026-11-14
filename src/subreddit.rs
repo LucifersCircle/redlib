@@ -164,14 +164,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
-				utils::filter_feed_pins(&mut posts, OffsetDateTime::now_utc().unix_timestamp());
+				let show_pins = utils::subreddit_pins_first(&sub_name, req.param("sub").is_some(), req.uri().query().unwrap_or_default());
+				utils::prepare_community_posts(&mut posts, &sort, show_pins, OffsetDateTime::now_utc().unix_timestamp());
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
-				if sort == "new" {
-					posts.sort_by_key(|post| std::cmp::Reverse(post.created_ts));
-					posts.sort_by_key(|post| std::cmp::Reverse(post.flags.stickied));
-				}
 				Ok(template(&SubredditTemplate {
 					sub,
 					posts,
