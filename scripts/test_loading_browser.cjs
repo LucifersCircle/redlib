@@ -24,13 +24,24 @@ class CDP {
             if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
             else pending.resolve(message.result);
         });
-        await once(client.socket, 'open');
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => { client.close(); reject(new Error('Browser connection timed out')); }, 5000);
+            client.socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+            client.socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Browser connection failed')); }, { once: true });
+        });
         return client;
     }
     send(method, params = {}) {
         const id = ++this.id;
         return new Promise((resolve, reject) => {
-            this.pending.set(id, { resolve, reject });
+            const timer = setTimeout(() => {
+                this.pending.delete(id);
+                reject(new Error(`Browser command timed out: ${method}`));
+            }, 5000);
+            this.pending.set(id, {
+                resolve(value) { clearTimeout(timer); resolve(value); },
+                reject(error) { clearTimeout(timer); reject(error); },
+            });
             this.socket.send(JSON.stringify({ id, method, params }));
         });
     }
@@ -74,8 +85,13 @@ test('loading pages reload fragment URLs in a real browser', { timeout: 45000 },
         if (chrome.exitCode === null && chrome.signalCode === null) {
             const exited = once(chrome, 'exit');
             chrome.kill();
-            await exited;
+            await Promise.race([exited, delay(2000)]);
+            if (chrome.exitCode === null && chrome.signalCode === null) {
+                chrome.kill('SIGKILL');
+                await exited;
+            }
         }
+        chrome.stderr.destroy();
         fs.rmSync(directory, { recursive: true, force: true });
     });
     await waitUntil(() => /DevTools listening on (ws:\/\/\S+)/.test(stderr), `Browser did not start: ${stderr}`);
