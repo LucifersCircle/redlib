@@ -208,6 +208,8 @@ Home, combined, Popular, All and RSS feeds hide pinned posts more than 24 hours 
 
 Other Tor OAuth API GETs omit the `.json` suffix because Reddit's onion edge rejects that suffix even with a valid anonymous token. This rewrite applies only to outgoing Tor REST API requests; logical cache keys, query parameters, direct requests, and share-link HEAD requests retain their existing behavior.
 
+A received HTTP response below 500 releases an expired transport or matching API quota recovery gate, even when Reddit rejects the requested page. This restores normal concurrency without marking a rejected page successful, replenishing quota, or clearing a newer active pause. Server errors and stale session generations retain their recovery state. A local capacity timeout ends its bounded queue wait instead of starting another upstream cooldown retry loop; a ready standby can still take over. Recovery diagnostics identify the lane, endpoint class and HTTP status without logging page URLs or tokens.
+
 The fallback is disabled by default. For the supplied Portainer stack:
 
 1. Deploy [`compose.portainer-tor.yaml`](compose.portainer-tor.yaml). It preserves the external `cloudflare_tunnel` network, adds a private Redlib-to-Tor network, and does not publish the SOCKS or Tor control ports. The supplied sidecar image is version- and digest-pinned for reproducible deployment.

@@ -1111,6 +1111,32 @@ impl UpstreamGuard {
 		}
 	}
 
+	fn record_http_response(&mut self, now: Instant, generation: u64, endpoint: usize, status: u16) -> bool {
+		if generation != self.quota.generation || !(200..500).contains(&status) {
+			return false;
+		}
+		// A reachable HTTP response ends an expired transport probe even when
+		// Reddit rejects the page. Do not mark the logical API request successful
+		// or reset a failure burst merely because one operation returned headers.
+		let mut released = false;
+		let health = self.transport_health_mut(endpoint);
+		if health.blocked_until.is_some_and(|until| until <= now) {
+			health.blocked_until = None;
+			health.consecutive_onion_failures = 0;
+			health.reset_failure_window();
+			released = true;
+		}
+		let quota_deadline = match QuotaBudget::for_endpoint(endpoint) {
+			QuotaBudget::Rest => &mut self.rate_limit_blocked_until,
+			QuotaBudget::Graphql => &mut self.graphql_rate_limit_blocked_until,
+		};
+		if quota_deadline.is_some_and(|until| until <= now) {
+			*quota_deadline = None;
+			released = true;
+		}
+		released
+	}
+
 	fn record_api_success(&mut self, now: Instant, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
 		self.transport_health_mut(attempt.endpoint).record_success(now);
 		let closes_probe = matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
@@ -1849,6 +1875,24 @@ struct BeginAttemptDenied {
 	tor_quota_refresh: Option<QuotaRefreshWaitTicket>,
 }
 
+impl BeginAttemptDenied {
+	fn recovery_reason(&self, lane: RedditLane) -> LaneRecoveryReason {
+		self.admission.as_ref().map_or(LaneRecoveryReason::None, |admission| {
+			if admission.source == "transport_capacity" {
+				// The bounded local queue wait is already spent. Starting another
+				// upstream recovery loop here would repeat that wait for 45 seconds.
+				LaneRecoveryReason::None
+			} else if admission.reason == CooldownReason::UpstreamFailures {
+				LaneRecoveryReason::UpstreamCooldown(admission.delay)
+			} else if admission.reason == CooldownReason::RateLimit && (lane == RedditLane::Tor || admission.source == "active_cooldown") && self.tor_quota_refresh.is_none() {
+				LaneRecoveryReason::QuotaCooldown(admission.delay)
+			} else {
+				LaneRecoveryReason::None
+			}
+		})
+	}
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct QuotaRefreshWaitTicket {
 	generation: u64,
@@ -2331,6 +2375,14 @@ fn record_upstream_failure(lane: RedditLane, kind: &str, status: Option<u16>, pa
 			"public_https"
 		},
 	);
+}
+
+fn record_upstream_response(attempt: &UpstreamAttempt, path: &str, status: u16) {
+	let released = upstream_guard(attempt.lane).record_http_response(Instant::now(), attempt.generation, attempt.edge.endpoint, status);
+	if released {
+		quota_notify(attempt.lane).notify_waiters();
+		info!("Reddit recovery gate released after HTTP response: lane={} endpoint={} status={status}", attempt.lane.label(), endpoint_class(path));
+	}
 }
 
 fn record_upstream_success(attempt: &mut UpstreamAttempt, path: &str) {
@@ -2889,6 +2941,7 @@ async fn reddit_comments(
 		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
 			.await
 			.map_err(ApiRequestError::Upstream)?;
+		record_upstream_response(attempt, path, response.status().as_u16());
 		if index == 1 || !response.status().is_success() {
 			return Ok(RedditReadResponse::Comments { response, post, request });
 		}
@@ -2943,6 +2996,7 @@ async fn reddit_pages(
 		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
 			.await
 			.map_err(ApiRequestError::Upstream)?;
+		record_upstream_response(attempt, path, response.status().as_u16());
 		if !response.status().is_success() {
 			return Ok(RedditReadResponse::Pages(response.into_hyper_response()));
 		}
@@ -3025,6 +3079,7 @@ async fn reddit_get(
 		let response = request_once(&Method::GET, transport_path.into_owned(), quarantine, origin, oauth_client.clone(), lane, None)
 			.await
 			.map_err(ApiRequestError::Upstream)?;
+		record_upstream_response(attempt, &path, response.status().as_u16());
 		if !response.status().is_redirection() {
 			return Ok(RedditReadResponse::Rest(response));
 		}
@@ -3902,15 +3957,7 @@ async fn json_uncached_on_lane_with_options(
 			} else {
 				denied.quota_spillover.map_or(TorRetryReason::None, TorRetryReason::QuotaReserve)
 			};
-			let recovery_reason = denied.admission.as_ref().map_or(LaneRecoveryReason::None, |admission| {
-				if admission.reason == CooldownReason::UpstreamFailures {
-					LaneRecoveryReason::UpstreamCooldown(admission.delay)
-				} else if admission.reason == CooldownReason::RateLimit && (lane == RedditLane::Tor || admission.source == "active_cooldown") && denied.tor_quota_refresh.is_none() {
-					LaneRecoveryReason::QuotaCooldown(admission.delay)
-				} else {
-					LaneRecoveryReason::None
-				}
-			});
+			let recovery_reason = denied.recovery_reason(lane);
 			return (Err(denied.message), retry_reason, recovery_reason);
 		}
 	};
@@ -5780,6 +5827,80 @@ mod tests {
 		let mut attempt = guard.try_admit(now, 7).unwrap();
 		guard.reconcile_quota(now + Duration::from_secs(1), &mut attempt, None, None, true);
 		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 0, reset_at } if reset_at == now + Duration::from_secs(120)));
+	}
+
+	#[test]
+	fn test_recovery_capacity_http_response_releases_only_expired_matching_guards() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		guard.transport.blocked_until = Some(now - Duration::from_secs(1));
+		guard.graphql_rate_limit_blocked_until = Some(now - Duration::from_secs(1));
+		guard.onion_transport.blocked_until = Some(now + Duration::from_secs(60));
+		guard.rate_limit_blocked_until = Some(now + Duration::from_secs(30));
+		guard.graphql_quota.window = QuotaWindow::Known {
+			available: 7,
+			reset_at: now + Duration::from_secs(120),
+		};
+		guard.edges[4].failures = 4;
+		for status in [500, 502, 503] {
+			assert!(!guard.record_http_response(now, 7, 4, status));
+			assert!(guard.transport.blocked_until.is_some());
+		}
+		assert!(!guard.record_http_response(now, 6, 4, 403), "stale generations cannot release current recovery");
+		assert!(guard.record_http_response(now, 7, 4, 403));
+		assert!(guard.transport.blocked_until.is_none());
+		assert!(guard.graphql_rate_limit_blocked_until.is_none());
+		assert_eq!(guard.onion_transport.blocked_until, Some(now + Duration::from_secs(60)));
+		assert_eq!(guard.rate_limit_blocked_until, Some(now + Duration::from_secs(30)));
+		assert!(matches!(guard.graphql_quota.window, QuotaWindow::Known { available: 7, .. }));
+		assert_eq!(guard.edges[4].failures, 4, "transport reachability is not a successful API page");
+	}
+
+	#[test]
+	fn test_recovery_capacity_http_responses_keep_active_pauses_and_failure_bursts() {
+		let now = Instant::now();
+		for lane in [RedditLane::Direct, RedditLane::Tor] {
+			let mut guard = UpstreamGuard::new(lane);
+			guard.install_oauth_generation(7, true);
+			for failure in 1..=FAILURE_THRESHOLD {
+				assert!(!guard.record_http_response(now, 7, 4, 200));
+				assert_eq!(guard.record_endpoint_failure(now, 4), failure == FAILURE_THRESHOLD);
+			}
+			let pause = guard.transport.blocked_until;
+			guard.graphql_rate_limit_blocked_until = Some(now + Duration::from_secs(30));
+			for status in [200, 403, 429] {
+				assert!(!guard.record_http_response(now, 7, 4, status));
+				assert_eq!(guard.transport.blocked_until, pause);
+				assert_eq!(guard.graphql_rate_limit_blocked_until, Some(now + Duration::from_secs(30)));
+			}
+		}
+	}
+
+	#[test]
+	fn test_recovery_capacity_queue_timeout_is_not_an_upstream_cooldown() {
+		let mut denied = BeginAttemptDenied {
+			admission: Some(AdmissionDenied {
+				delay: TRANSPORT_RETRY_BASE_DELAY,
+				reason: CooldownReason::UpstreamFailures,
+				reserve_exhausted: false,
+				local_quota_retry: false,
+				source: "transport_capacity",
+			}),
+			message: "local queue timed out".into(),
+			edge_deferred: false,
+			quota_spillover: None,
+			tor_quota_refresh: None,
+		};
+		for lane in [RedditLane::Direct, RedditLane::Tor] {
+			assert_eq!(denied.recovery_reason(lane), LaneRecoveryReason::None);
+		}
+		denied.admission.as_mut().unwrap().source = "active_cooldown";
+		assert_eq!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::UpstreamCooldown(TRANSPORT_RETRY_BASE_DELAY));
+		denied.admission.as_mut().unwrap().reason = CooldownReason::RateLimit;
+		assert_eq!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::QuotaCooldown(TRANSPORT_RETRY_BASE_DELAY));
+		denied.tor_quota_refresh = Some(QuotaRefreshWaitTicket { generation: 7, quota_epoch: 1 });
+		assert_eq!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::None);
 	}
 
 	#[test]
