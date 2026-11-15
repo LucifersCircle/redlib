@@ -160,6 +160,13 @@ fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
 		*upstream_guard(lane) = UpstreamGuard::new(lane);
 		let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
 		assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+		let now = Instant::now();
+		{
+			let mut guard = upstream_guard(lane);
+			guard.transport.blocked_until = Some(now - Duration::from_secs(1));
+			guard.graphql_rate_limit_blocked_until = Some(now - Duration::from_secs(1));
+			guard.onion_transport.blocked_until = Some(now + Duration::from_secs(60));
+		}
 		let path = "/r/fixture/hot.json";
 		for rejected in [true, false] {
 			let request = async {
@@ -173,6 +180,23 @@ fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
 				let RedditReadResponse::Pages(response) = result else { panic!("page response") };
 				if rejected {
 					assert_eq!(response.status(), 403);
+					{
+						let guard = upstream_guard(lane);
+						assert!(guard.transport.blocked_until.is_none(), "a received HTTP response must end an expired transport recovery");
+						assert!(
+							guard.graphql_rate_limit_blocked_until.is_none(),
+							"an expired quota deadline must not keep the recovery gate active"
+						);
+						assert!(guard.onion_transport.blocked_until.is_some(), "a public HTTPS response must not clear onion recovery");
+					}
+					let mut followers = Vec::new();
+					for _ in 0..3 {
+						let capacity = acquire_attempt_capacity(lane, api_endpoint_index(path), AdmissionRetryMode::Immediate, tokio::time::Instant::now())
+							.await
+							.expect("followers must use normal concurrency even while the original recovery probe is still held");
+						assert!(capacity.1.is_none());
+						followers.push(capacity);
+					}
 					let decision = block_for_edge_throttle(&mut attempt, Some(Duration::ZERO));
 					assert_eq!(decision.delay, Duration::ZERO);
 					assert!(!decision.started_cooldown);
