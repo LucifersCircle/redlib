@@ -1550,7 +1550,7 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 		let seconds = retry_after.unwrap_or(5).max(3).saturating_add(fastrand::u64(0..=2));
 		let body = LoadingTemplate {
 			prefs: Preferences::new(&req),
-			url: req.uri().to_string(),
+			url: req.uri().path_and_query().map_or("/", |path| path.as_str()).to_string(),
 			refresh_after: seconds.min(10),
 		}
 		.render()
@@ -1770,7 +1770,7 @@ mod tests {
 		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 		let html = std::str::from_utf8(&body).unwrap();
 		assert!(html.contains("Still trying to load your page…"));
-		assert!(html.contains("http-equiv=\"refresh\" content=\"10\""));
+		assert!(html.contains("http-equiv=\"refresh\" content=\"10;url=/./r/example/comments/abc.json?sort=new\""));
 		assert!(!html.contains(msg));
 		assert!(!html.contains("check_update.js"));
 		assert!(!html.contains("Report"));
@@ -1789,8 +1789,23 @@ mod tests {
 			assert!((delay..=delay + 2).contains(&retry_after), "upstream retry metadata must stay intact");
 			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 			let html = std::str::from_utf8(&body).unwrap();
-			assert!(html.contains("http-equiv=\"refresh\" content=\"10\""));
+			assert!(html.contains("http-equiv=\"refresh\" content=\"10;url=/./r/example/hot?sort=hot&amp;after=page2\""));
 			assert!(html.contains("Still trying to load your page"));
+		}
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_refresh_targets_use_only_the_request_path_and_query() {
+		for (uri, target) in [
+			("https://other.example/r/example?sort=new&limit=25", "/./r/example?sort=new&amp;limit=25"),
+			("//other.example/r/example?sort=new", "/.//other.example/r/example?sort=new"),
+		] {
+			let request = hyper::Request::builder().uri(uri).body(hyper::Body::empty()).unwrap();
+			let response = super::error(request, "Reddit API request timed out").await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let html = std::str::from_utf8(&body).unwrap();
+			assert!(html.contains(&format!(";url={target}\"")));
 		}
 	}
 

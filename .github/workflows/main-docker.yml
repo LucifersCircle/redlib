@@ -33,6 +33,7 @@ jobs:
           node --check static/downloadGallery.js
           node --check static/comments.js
           node --test scripts/test_ui_interactions.cjs
+          node --test scripts/test_loading_browser.cjs
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
