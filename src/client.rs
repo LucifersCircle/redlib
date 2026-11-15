@@ -2381,7 +2381,11 @@ fn record_upstream_response(attempt: &UpstreamAttempt, path: &str, status: u16) 
 	let released = upstream_guard(attempt.lane).record_http_response(Instant::now(), attempt.generation, attempt.edge.endpoint, status);
 	if released {
 		quota_notify(attempt.lane).notify_waiters();
-		info!("Reddit recovery gate released after HTTP response: lane={} endpoint={} status={status}", attempt.lane.label(), endpoint_class(path));
+		info!(
+			"Reddit recovery gate released after HTTP response: lane={} endpoint={} status={status}",
+			attempt.lane.label(),
+			endpoint_class(path)
+		);
 	}
 }
 
