@@ -183,7 +183,10 @@ fn test_endpoint_edge_tor_fixture_recovers_on_the_next_request() {
 					{
 						let guard = upstream_guard(lane);
 						assert!(guard.transport.blocked_until.is_none(), "a received HTTP response must end an expired transport recovery");
-						assert!(guard.graphql_rate_limit_blocked_until.is_none(), "an expired quota deadline must not keep the recovery gate active");
+						assert!(
+							guard.graphql_rate_limit_blocked_until.is_none(),
+							"an expired quota deadline must not keep the recovery gate active"
+						);
 						assert!(guard.onion_transport.blocked_until.is_some(), "a public HTTPS response must not clear onion recovery");
 					}
 					let mut followers = Vec::new();
