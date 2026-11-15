@@ -73,15 +73,22 @@ async function waitUntil(check, message, milliseconds = 5000) {
     assert.fail(message);
 }
 
-test('loading pages reload fragment URLs in a real browser', { timeout: 45000 }, async t => {
-    const executable = process.env.CHROME_BIN || ['/usr/bin/chromium', '/usr/bin/google-chrome', '/usr/bin/chromium-browser'].find(fs.existsSync);
+test('loading pages reload fragment URLs in a real browser', { timeout: 90000 }, async t => {
+    const executable = process.env.CHROME_BIN || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find(fs.existsSync);
     assert.ok(executable, 'Install Chromium or set CHROME_BIN');
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'redlib-loading-'));
-    const chrome = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--remote-debugging-port=0', `--user-data-dir=${directory}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const chrome = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-background-networking', '--no-first-run', '--remote-debugging-port=0', `--user-data-dir=${directory}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let browser;
     let stderr = '';
     chrome.stderr.on('data', chunk => { stderr += chunk.toString(); });
     chrome.on('error', error => { stderr += error.message; });
     t.after(async () => {
+        if (browser) {
+            // Let browser subprocesses flush and exit before deleting their
+            // profile. Killing only the parent races their final writes.
+            try { await browser.send('Browser.close'); } catch (_) { /* Fall back to process termination. */ }
+            browser.close();
+        }
         if (chrome.exitCode === null && chrome.signalCode === null) {
             const exited = once(chrome, 'exit');
             chrome.kill();
@@ -92,12 +99,15 @@ test('loading pages reload fragment URLs in a real browser', { timeout: 45000 },
             }
         }
         chrome.stderr.destroy();
-        fs.rmSync(directory, { recursive: true, force: true });
+        await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     });
-    await waitUntil(() => /DevTools listening on (ws:\/\/\S+)/.test(stderr), `Browser did not start: ${stderr}`);
+    try {
+        await waitUntil(() => /DevTools listening on (ws:\/\/\S+)/.test(stderr), 'Browser did not start', 20000);
+    } catch (error) {
+        throw new Error(`${error.message}: ${executable}\n${stderr}`);
+    }
     const browserUrl = stderr.match(/DevTools listening on (ws:\/\/\S+)/)[1];
-    const browser = await CDP.connect(browserUrl);
-    t.after(() => browser.close());
+    browser = await CDP.connect(browserUrl);
     const debugOrigin = browserUrl.replace(/^ws:/, 'http:').split('/devtools/')[0];
     const cases = new Map();
     const server = http.createServer((req, res) => {
