@@ -1789,7 +1789,7 @@ mod tests {
 			assert!((delay..=delay + 2).contains(&retry_after), "upstream retry metadata must stay intact");
 			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 			let html = std::str::from_utf8(&body).unwrap();
-			assert!(html.contains("http-equiv=\"refresh\" content=\"10;url=/./r/example/hot?sort=hot&amp;after=page2\""));
+			assert!(html.contains("http-equiv=\"refresh\" content=\"10;url=/./r/example/hot?sort=hot&#38;after=page2\""));
 			assert!(html.contains("Still trying to load your page"));
 		}
 	}
@@ -1797,7 +1797,7 @@ mod tests {
 	#[tokio::test]
 	async fn temporary_errors_refresh_targets_use_only_the_request_path_and_query() {
 		for (uri, target) in [
-			("https://other.example/r/example?sort=new&limit=25", "/./r/example?sort=new&amp;limit=25"),
+			("https://other.example/r/example?sort=new&limit=25", "/./r/example?sort=new&#38;limit=25"),
 			("//other.example/r/example?sort=new", "/.//other.example/r/example?sort=new"),
 		] {
 			let request = hyper::Request::builder().uri(uri).body(hyper::Body::empty()).unwrap();

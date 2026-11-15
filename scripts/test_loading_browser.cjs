@@ -60,7 +60,7 @@ function waiting(url) {
     // Use the actual template, shortening only the timer for this fixture.
     const meta = template.match(/<meta[^>]+http-equiv="refresh"[^>]+>/)[0]
         .replace('{{ refresh_after }}', '1')
-        .replace('{{ url }}', url.replaceAll('&', '&amp;').replaceAll('"', '&quot;'));
+        .replace('{{ url }}', url.replaceAll('&', '&#38;').replaceAll('"', '&#34;'));
     return `<!doctype html><html><head>${meta}</head><body>Still trying to load your page…</body></html>`;
 }
 
