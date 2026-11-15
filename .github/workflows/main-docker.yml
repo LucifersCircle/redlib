@@ -27,12 +27,14 @@ jobs:
         with:
           node-version: '22'
       - name: Check UI scripts and interactions
+        timeout-minutes: 3
         run: |
           node --check static/gallery.js
           node --check static/spoilers.js
           node --check static/downloadGallery.js
           node --check static/comments.js
           node --test scripts/test_ui_interactions.cjs
+          node --test --test-reporter=tap scripts/test_loading_browser.cjs
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
