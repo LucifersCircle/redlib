@@ -73,7 +73,7 @@ async function waitUntil(check, message, milliseconds = 5000) {
     assert.fail(message);
 }
 
-test('loading pages reload fragment URLs in a real browser', { timeout: 90000 }, async t => {
+test('loading pages reload fragment URLs in a real browser', { timeout: 120000 }, async t => {
     const executable = process.env.CHROME_BIN || ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'].find(fs.existsSync);
     assert.ok(executable, 'Install Chromium or set CHROME_BIN');
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'redlib-loading-'));
@@ -101,12 +101,32 @@ test('loading pages reload fragment URLs in a real browser', { timeout: 90000 },
         chrome.stderr.destroy();
         await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     });
+    let browserUrl;
+    const started = Date.now();
     try {
-        await waitUntil(() => /DevTools listening on (ws:\/\/\S+)/.test(stderr), 'Browser did not start', 20000);
+        // Chromium writes this endpoint when its debugging server is ready.
+        // Use the machine-readable file rather than depending on stderr output,
+        // and allow a cold hosted runner longer than the page-test deadline.
+        await waitUntil(() => {
+            if (chrome.exitCode !== null || chrome.signalCode !== null) {
+                throw new Error(`Browser exited during startup (${chrome.exitCode ?? chrome.signalCode})`);
+            }
+            let endpoint;
+            try {
+                endpoint = fs.readFileSync(path.join(directory, 'DevToolsActivePort'), 'utf8').trim().split(/\r?\n/);
+            } catch (error) {
+                if (error.code === 'ENOENT') return false;
+                throw error;
+            }
+            const port = Number(endpoint[0]);
+            if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^\/devtools\/browser\/[\w-]+$/.test(endpoint[1] || '')) return false;
+            browserUrl = `ws://127.0.0.1:${port}${endpoint[1]}`;
+            return true;
+        }, 'Browser did not start', 60000);
     } catch (error) {
         throw new Error(`${error.message}: ${executable}\n${stderr}`);
     }
-    const browserUrl = stderr.match(/DevTools listening on (ws:\/\/\S+)/)[1];
+    t.diagnostic(`Browser ready after ${Date.now() - started} ms using DevToolsActivePort`);
     browser = await CDP.connect(browserUrl);
     const debugOrigin = browserUrl.replace(/^ws:/, 'http:').split('/devtools/')[0];
     const cases = new Map();
