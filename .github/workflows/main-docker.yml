@@ -128,6 +128,7 @@ jobs:
           cargo test --locked --lib test_reddit_dns_name_
           cargo test --locked --lib test_rewriting_
           cargo test --locked --lib test_json_cache_policy_is_narrow
+          cargo test --locked --lib test_json_pause_cache_
           cargo test --locked --lib test_endpoint_class_does_not_log_resource_names
           cargo test --locked --lib temporary_errors_
           cargo test --locked --lib rewrite_urls_rewrites_reddit_onion_content

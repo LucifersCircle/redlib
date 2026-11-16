@@ -1112,7 +1112,7 @@ impl UpstreamGuard {
 	}
 
 	fn record_http_response(&mut self, now: Instant, generation: u64, endpoint: usize, status: u16) -> bool {
-		if generation != self.quota.generation || !(200..500).contains(&status) {
+		if generation != self.quota.generation || !(200..500).contains(&status) || status == 429 {
 			return false;
 		}
 		// A reachable HTTP response ends an expired transport probe even when
@@ -1140,11 +1140,12 @@ impl UpstreamGuard {
 	fn record_api_success(&mut self, now: Instant, attempt: EdgeAttempt) -> Option<EdgeRecovery> {
 		self.transport_health_mut(attempt.endpoint).record_success(now);
 		let closes_probe = matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::HalfOpen { epoch, .. } if epoch == attempt.epoch);
-		if self.rate_limit_blocked_until.is_some_and(|until| now >= until) {
-			self.rate_limit_blocked_until = None;
-		}
-		if self.graphql_rate_limit_blocked_until.is_some_and(|until| now >= until) {
-			self.graphql_rate_limit_blocked_until = None;
+		let quota_deadline = match QuotaBudget::for_endpoint(attempt.endpoint) {
+			QuotaBudget::Rest => &mut self.rate_limit_blocked_until,
+			QuotaBudget::Graphql => &mut self.graphql_rate_limit_blocked_until,
+		};
+		if quota_deadline.is_some_and(|until| now >= until) {
+			*quota_deadline = None;
 		}
 		let current_closed_attempt = matches!(self.edges[attempt.endpoint].state, EdgeCircuitState::Closed) && attempt.epoch == self.edges[attempt.endpoint].epoch;
 		let recovery = closes_probe.then(|| EdgeRecovery {
@@ -2180,7 +2181,9 @@ async fn acquire_attempt_capacity(
 	let (permit, probe) = if mode == AdmissionRetryMode::Immediate {
 		acquire_immediate_recovery_capacity(api_concurrency(lane), gate, recovery).map_err(|_| denied())?
 	} else {
-		acquire_recovery_capacity(api_concurrency(lane), gate, deadline, recovery).await.map_err(|_| denied())?
+		acquire_recovery_capacity(api_concurrency(lane), gate, deadline, quota_notify(lane), recovery)
+			.await
+			.map_err(|_| denied())?
 	};
 	Ok((
 		ApiCapacityPermit {
@@ -2208,13 +2211,33 @@ async fn acquire_recovery_capacity<'a>(
 	capacity: &'a Semaphore,
 	gate: &'a Semaphore,
 	deadline: tokio::time::Instant,
+	changed: &Notify,
 	recovery: impl Fn() -> bool,
 ) -> Result<(SemaphorePermit<'a>, Option<SemaphorePermit<'a>>), ()> {
 	let mut probe = None;
-	if recovery() {
-		let permit = tokio::time::timeout_at(deadline, gate.acquire()).await.map_err(|_| ())?.map_err(|_| ())?;
-		if recovery() {
-			probe = Some(permit);
+	// Keep one queued acquisition across unrelated notifications so followers
+	// retain FIFO order. A validated response can retire recovery while its
+	// logical request still holds the original probe for another operation.
+	{
+		let queued = tokio::time::timeout_at(deadline, gate.acquire());
+		tokio::pin!(queued);
+		loop {
+			let notified = changed.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if !recovery() {
+				break;
+			}
+			tokio::select! {
+				result = &mut queued => {
+					let permit = result.map_err(|_| ())?.map_err(|_| ())?;
+					if recovery() {
+						probe = Some(permit);
+					}
+					break;
+				}
+				_ = &mut notified => {}
+			}
 		}
 	}
 	let permit = tokio::time::timeout_at(deadline, capacity.acquire()).await.map_err(|_| ())?.map_err(|_| ())?;
@@ -2386,6 +2409,35 @@ fn record_upstream_response(attempt: &UpstreamAttempt, path: &str, status: u16) 
 			attempt.lane.label(),
 			endpoint_class(path)
 		);
+	}
+}
+
+fn record_plain_html_rejection(attempt: &UpstreamAttempt, path: &str, response: &WreqResponse) {
+	let headers = response.headers();
+	let quota_headers = ["x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-used"];
+	if response.status().as_u16() == 403
+		&& headers
+			.get("content-type")
+			.and_then(|value| value.to_str().ok())
+			.is_some_and(|value| value.starts_with("text/html"))
+		&& !quota_headers.iter().any(|name| headers.contains_key(*name))
+		&& !credential_rejected(403, headers.get("www-authenticate").and_then(|value| value.to_str().ok()))
+	{
+		// This matches the existing GraphQL edge classification. Unlike a 200
+		// JSON response, its body cannot contain a GraphQL quota/session error.
+		record_upstream_response(attempt, path, 403);
+	}
+}
+
+fn record_graphql_resource_response(attempt: &UpstreamAttempt, path: &str, status: u16, remaining: Option<u16>, error: &GraphqlError) {
+	if error.kind == GraphqlErrorKind::Resource {
+		record_resource_response(attempt, path, status, remaining);
+	}
+}
+
+fn record_resource_response(attempt: &UpstreamAttempt, path: &str, status: u16, remaining: Option<u16>) {
+	if remaining != Some(0) {
+		record_upstream_response(attempt, path, status);
 	}
 }
 
@@ -2945,8 +2997,8 @@ async fn reddit_comments(
 		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
 			.await
 			.map_err(ApiRequestError::Upstream)?;
-		record_upstream_response(attempt, path, response.status().as_u16());
 		if index == 1 || !response.status().is_success() {
+			record_plain_html_rejection(attempt, path, &response);
 			return Ok(RedditReadResponse::Comments { response, post, request });
 		}
 		let headers = response.headers().clone();
@@ -2961,6 +3013,7 @@ async fn reddit_comments(
 			Err(error) => {
 				warn!("Reddit comments response rejected: lane={} stage=post reason={}", lane.label(), error.reason);
 				reconcile_rate_limit(attempt, remaining, reset, remaining == Some(0));
+				record_graphql_resource_response(attempt, path, 200, remaining, &error);
 				return Err(graphql_api_error(error, lane, oauth.generation, &headers));
 			}
 		});
@@ -2968,6 +3021,7 @@ async fn reddit_comments(
 		// token, transport, permit and half-open probe, and reserve every wire send.
 		// No success is recorded until both responses have been validated.
 		reserve_redirect_hop(attempt, oauth.generation, remaining, reset, allow_quota_refresh)?;
+		record_upstream_response(attempt, path, 200);
 	}
 	unreachable!("comments reads always have two operations")
 }
@@ -2994,14 +3048,17 @@ async fn reddit_pages(
 		let Some(payload) = payload else { break };
 		if sent {
 			reserve_redirect_hop(attempt, oauth.generation, remaining, reset, allow_quota_refresh)?;
+			// Only a validated operation with its continuation quota reserved can
+			// retire recovery; raw 200 headers may still hide a quota/session error.
+			record_upstream_response(attempt, path, 200);
 		}
 		attempt.mark_sent();
 		record_api_send(path, false, lane);
 		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
 			.await
 			.map_err(ApiRequestError::Upstream)?;
-		record_upstream_response(attempt, path, response.status().as_u16());
 		if !response.status().is_success() {
+			record_plain_html_rejection(attempt, path, &response);
 			return Ok(RedditReadResponse::Pages(response.into_hyper_response()));
 		}
 		headers = response.headers().clone();
@@ -3023,6 +3080,7 @@ async fn reddit_pages(
 				endpoint_class(path),
 				error.reason
 			);
+			record_graphql_resource_response(attempt, path, 200, remaining, &error);
 			return Err(graphql_api_error(error, lane, oauth.generation, &headers));
 		}
 		values.push(value);
@@ -3035,6 +3093,7 @@ async fn reddit_pages(
 			endpoint_class(path),
 			error.reason
 		);
+		record_graphql_resource_response(attempt, path, 200, remaining, &error);
 		graphql_api_error(error, lane, oauth.generation, &headers)
 	})?;
 	// Reuse the common status, cooldown and success handling for the complete
@@ -3083,7 +3142,6 @@ async fn reddit_get(
 		let response = request_once(&Method::GET, transport_path.into_owned(), quarantine, origin, oauth_client.clone(), lane, None)
 			.await
 			.map_err(ApiRequestError::Upstream)?;
-		record_upstream_response(attempt, &path, response.status().as_u16());
 		if !response.status().is_redirection() {
 			return Ok(RedditReadResponse::Rest(response));
 		}
@@ -3110,6 +3168,7 @@ async fn reddit_get(
 			.and_then(|value| value.to_str().ok())
 			.and_then(|value| parse_delay_seconds(Some(value)));
 		reserve_redirect_hop(attempt, generation, remaining, reset, allow_quota_refresh)?;
+		record_upstream_response(attempt, &path, response.status().as_u16());
 		path = next_path;
 	}
 
@@ -3309,6 +3368,9 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 
 async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String> {
 	let key = (path.clone(), quarantine);
+	if let Some(value) = json_cached_during_pause(&key).await {
+		return Ok(value);
+	}
 	coalesce_json_request(&JSON_FLIGHTS, key, move || async move {
 		match json_cache_policy(&path) {
 			JsonCachePolicy::Metadata => json_metadata_cached(path, quarantine).await,
@@ -3317,6 +3379,47 @@ async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String>
 		}
 	})
 	.await
+}
+
+fn json_pause_cache_eligible(now: Instant, path: &str) -> bool {
+	let selected = preferred_api_lane(now, path);
+	match lane_availability(selected, now, path) {
+		LaneAvailability::Ready => false,
+		// Existing routing intentionally waits on an explicit upstream quota
+		// pause. Local reserve pauses may still have a ready bounded spillover.
+		LaneAvailability::UpstreamQuotaCooldown => true,
+		_ => {
+			let alternate = match selected {
+				RedditLane::Direct => RedditLane::Tor,
+				RedditLane::Tor => RedditLane::Direct,
+			};
+			lane_availability(alternate, now, path) != LaneAvailability::Ready
+		}
+	}
+}
+
+fn json_pause_cache_value(cache: &cached::TimedSizedCache<JsonRequestKey, Value>, key: &JsonRequestKey) -> Option<Value> {
+	// The outer timed cache removes expired entries on lookup. Read the inner
+	// LRU under the same lock instead: no eviction, promotion or TTL renewal.
+	let store = cache.get_store();
+	store
+		.key_order()
+		.zip(store.value_order())
+		.find_map(|(stored, (_, value))| (stored == key).then(|| value.clone()))
+}
+
+async fn json_cached_during_pause(key: &JsonRequestKey) -> Option<Value> {
+	if !json_pause_cache_eligible(Instant::now(), &key.0) {
+		return None;
+	}
+	let value = match json_cache_policy(&key.0) {
+		JsonCachePolicy::Dynamic => json_pause_cache_value(&*JSON_DYNAMIC_CACHED.lock().await, key),
+		JsonCachePolicy::Comments => json_pause_cache_value(&*JSON_COMMENTS_CACHED.lock().await, key),
+		JsonCachePolicy::Metadata => json_pause_cache_value(&*JSON_METADATA_CACHED.lock().await, key),
+	};
+	// Taking the cache lock can yield; a recovered lane or ready standby must
+	// retain its normal refresh/fallback path after that wait.
+	value.filter(|_| json_pause_cache_eligible(Instant::now(), &key.0))
 }
 
 async fn coalesce_json_request<F, Fut>(flights: &'static JsonFlightMap, key: JsonRequestKey, fetch: F) -> JsonRequestResult
@@ -4042,7 +4145,12 @@ async fn json_uncached_on_lane_with_options(
 					},
 				);
 
-				if let Some(reason) = resource_reason { return Err(reason.to_string()); }
+				if let Some(reason) = resource_reason {
+					if !auth_rejected && parsed_remaining != Some(0) && !matches!(throttle_kind, Some(ThrottleKind::Quota)) {
+						record_upstream_response(&upstream_attempt, &path, status_code);
+					}
+					return Err(reason.to_string());
+				}
 
 				match throttle_kind {
 					Some(ThrottleKind::Quota) => {
@@ -4064,6 +4172,9 @@ async fn json_uncached_on_lane_with_options(
 					Some(ThrottleKind::Edge) => {
 						retry_reason = TorRetryReason::EdgeRejected;
 						let decision = block_for_edge_throttle(&mut upstream_attempt, retry_after_duration);
+						if parsed_remaining != Some(0) {
+							record_upstream_response(&upstream_attempt, &path, status_code);
+						}
 						match decision {
 							_ if lane == RedditLane::Tor => debug!(
 								"Reddit edge rejection: lane=tor endpoint={} cooldown_disabled=true",
@@ -4142,6 +4253,7 @@ async fn json_uncached_on_lane_with_options(
 										Ok(json) => json,
 										Err(error) => {
 											warn!("Reddit comments response rejected: lane={} stage=comments reason={}",lane.label(),error.reason);
+											record_graphql_resource_response(&upstream_attempt, &path, status_code, parsed_remaining, &error);
 											if error.kind == GraphqlErrorKind::Session {
 												start_rejected_session_refresh(lane, request_generation);
 												retry_reason = TorRetryReason::SessionUnavailable;
@@ -4163,6 +4275,7 @@ async fn json_uncached_on_lane_with_options(
 								if let Some(data) = json.get("data") {
 									if let Some(is_suspended) = data.get("is_suspended").and_then(Value::as_bool) {
 										if is_suspended {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
 											return Err("suspended".into());
 										}
 									}
@@ -4185,23 +4298,33 @@ async fn json_uncached_on_lane_with_options(
 
 									// Handle quarantined
 									if json["reason"] == "quarantined" {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
 										return Err("quarantined".into());
 									}
 									// Handle gated
 									if json["reason"] == "gated" {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
 										return Err("gated".into());
 									}
 									// Handle private subs
 									if json["reason"] == "private" {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
 										return Err("private".into());
 									}
 									// Handle banned subs
 									if json["reason"] == "banned" {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
 										return Err("banned".into());
 									}
 
+									if json["error"] == 404 {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
+									}
 									Err(format!("Reddit error {} \"{}\": {} | {path}", json["error"], json["reason"], json["message"]))
 								} else if !status.is_success() {
+									if status_code == 404 {
+										record_resource_response(&upstream_attempt, &path, status_code, parsed_remaining);
+									}
 									Err(format!("Reddit returned an unexpected response status: {status}"))
 								} else {
 									if !quota_headers_present {
@@ -4665,6 +4788,123 @@ mod tests {
 	}
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+
+	#[test]
+	fn test_json_pause_cache_snapshot_preserves_expired_values_timestamp_and_lru() {
+		use cached::Cached;
+		let mut cache = cached::TimedSizedCache::with_size_and_lifespan(4, Duration::ZERO);
+		let key = ("/r/fixture/hot.json".to_string(), false);
+		cache.cache_set(key.clone(), Value::from("cached"));
+		cache.cache_set(("/r/other/hot.json".to_string(), false), Value::from("other"));
+		let order = cache.get_store().key_order().cloned().collect::<Vec<_>>();
+		let values = cache.get_store().value_order().cloned().collect::<Vec<_>>();
+		assert_eq!(json_pause_cache_value(&cache, &key), Some(Value::from("cached")));
+		assert_eq!(json_pause_cache_value(&cache, &(key.0.clone(), true)), None);
+		assert_eq!(json_pause_cache_value(&cache, &("/r/missing/hot.json".into(), false)), None);
+		assert_eq!(cache.get_store().key_order().cloned().collect::<Vec<_>>(), order);
+		assert_eq!(cache.get_store().value_order().cloned().collect::<Vec<_>>(), values);
+		assert_eq!(cache.cache_lifespan(), Some(Duration::ZERO));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_PRIMARY_LANE", "tor")])]
+	fn test_json_pause_cache_blocked_lane_returns_without_waiting_on_flights() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			use cached::Cached;
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			upstream_guard(lane).transport.blocked_until = Some(Instant::now() + Duration::from_secs(60));
+			upstream_guard(lane).onion_transport.blocked_until = Some(Instant::now() + Duration::from_secs(60));
+			let keys = [
+				(normalize_reddit_api_path("/r/fixture/hot.json?sort=hot"), false),
+				(normalize_reddit_api_path("/comments/abc.json?sort=new"), false),
+				(normalize_reddit_api_path("/r/fixture/about.json"), false),
+			];
+			for key in &keys {
+				let cache = match json_cache_policy(&key.0) {
+					JsonCachePolicy::Dynamic => &*JSON_DYNAMIC_CACHED,
+					JsonCachePolicy::Comments => &*JSON_COMMENTS_CACHED,
+					JsonCachePolicy::Metadata => &*JSON_METADATA_CACHED,
+				};
+				let mut cache = cache.lock().await;
+				cache.cache_set_lifespan(Duration::ZERO);
+				cache.cache_set(key.clone(), Value::from(key.0.clone()));
+			}
+			let flights = JSON_FLIGHTS.lock().await;
+			let started = Instant::now();
+			for key in &keys {
+				let value = tokio::time::timeout(Duration::from_millis(100), json_coalesced(key.0.clone(), key.1))
+					.await
+					.unwrap()
+					.unwrap();
+				assert_eq!(value, Value::from(key.0.clone()));
+				assert_eq!(json_cached_during_pause(&(key.0.clone(), true)).await, None);
+			}
+			println!(
+				"three warm pages returned during an admission pause without joining in-flight work: {} ms",
+				started.elapsed().as_millis()
+			);
+			let wrong_policy = (normalize_reddit_api_path("/r/not-metadata/about.json"), false);
+			JSON_DYNAMIC_CACHED.lock().await.cache_set(wrong_policy.clone(), Value::from("wrong policy"));
+			assert_eq!(json_cached_during_pause(&wrong_policy).await, None);
+			upstream_guard(lane).transport.blocked_until = None;
+			upstream_guard(lane).onion_transport.blocked_until = None;
+			assert!(!json_pause_cache_eligible(Instant::now(), &keys[0].0));
+			assert!(
+				tokio::time::timeout(Duration::from_millis(20), json_coalesced(keys[0].0.clone(), false)).await.is_err(),
+				"after recovery an old entry must rejoin normal coalescing/refresh instead of returning early"
+			);
+			drop(flights);
+			use cached::CloneCached;
+			let (value, expired) = JSON_DYNAMIC_CACHED.lock().await.cache_get_expired(&keys[0]);
+			assert!(expired, "pause hits must not renew freshness");
+			assert_eq!(value, Some(Value::from(keys[0].0.clone())));
+		});
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_PRIMARY_LANE", "direct")])]
+	fn test_json_pause_cache_ready_alternate_preserves_standby_and_quota_spillover() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			for lane in [RedditLane::Direct, RedditLane::Tor] {
+				*upstream_guard(lane) = UpstreamGuard::new(lane);
+				let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+				assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			}
+			{
+				let mut direct = upstream_guard(RedditLane::Direct);
+				let window = || QuotaWindow::Known {
+					available: 0,
+					reset_at: Instant::now() + Duration::from_secs(120),
+				};
+				direct.quota.window = window();
+				direct.graphql_quota.window = window();
+			}
+			for path in ["/comments/abc.json", "/r/fixture/wiki/page.json"] {
+				assert_eq!(preferred_api_lane(Instant::now(), path), RedditLane::Direct);
+				assert_eq!(lane_availability(RedditLane::Direct, Instant::now(), path), LaneAvailability::LocalQuotaPause);
+				assert_eq!(lane_availability(RedditLane::Tor, Instant::now(), path), LaneAvailability::Ready);
+				assert!(
+					!json_pause_cache_eligible(Instant::now(), path),
+					"a ready bounded spillover must retain its fresh request path"
+				);
+			}
+			upstream_guard(RedditLane::Direct).transport.blocked_until = Some(Instant::now() + Duration::from_secs(60));
+			assert_eq!(preferred_api_lane(Instant::now(), "/comments/abc.json"), RedditLane::Tor);
+			assert!(
+				!json_pause_cache_eligible(Instant::now(), "/comments/abc.json"),
+				"a ready selected standby must not return expired cache early"
+			);
+			upstream_guard(RedditLane::Direct).graphql_rate_limit_blocked_until = Some(Instant::now() + Duration::from_secs(60));
+			assert!(
+				json_pause_cache_eligible(Instant::now(), "/comments/abc.json"),
+				"explicit upstream quota pauses retain their original lane's existing policy"
+			);
+		});
+	}
+
 	static COALESCED_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 	static COALESCED_RESULT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 	static COALESCED_PANIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -5739,18 +5979,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_recovery_capacity_serializes_probes_and_releases_on_cancel() {
+		let changed = Notify::new();
 		let capacity = Semaphore::new(4);
 		let gate = Semaphore::new(1);
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-		let first = acquire_recovery_capacity(&capacity, &gate, deadline, || true).await.unwrap();
-		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, || true));
+		let first = acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || true).await.unwrap();
+		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || true));
 		assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
 		assert_eq!(capacity.available_permits(), 3, "waiting followers must not occupy transport capacity");
 		drop(follower);
 		drop(first);
 		assert_eq!(capacity.available_permits(), 4);
 		assert_eq!(gate.available_permits(), 1);
-		let next = acquire_recovery_capacity(&capacity, &gate, deadline, || true).await.unwrap();
+		let next = acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || true).await.unwrap();
 		assert!(next.1.is_some());
 	}
 
@@ -5786,12 +6027,13 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_recovery_budget_cancels_capacity_wait_without_leaking_probe() {
+		let changed = Notify::new();
 		let capacity = Semaphore::new(0);
 		let gate = Semaphore::new(1);
 		let now = tokio::time::Instant::now();
 		let mut budget = RecoveryBudget::new(now, Duration::from_secs(100));
 		budget.begin(now - UPSTREAM_RECOVERY_BUDGET);
-		let future = acquire_recovery_capacity(&capacity, &gate, now + CAPACITY_WAIT_BUDGET, || true);
+		let future = acquire_recovery_capacity(&capacity, &gate, now + CAPACITY_WAIT_BUDGET, &changed, || true);
 		assert!(tokio::time::timeout(budget.remaining(now), future).await.is_err());
 		assert_eq!(gate.available_permits(), 1);
 		assert_eq!(capacity.available_permits(), 0);
@@ -5799,19 +6041,20 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_recovery_capacity_rechecks_after_queue_and_success() {
+		let changed = Notify::new();
 		let capacity = Semaphore::new(1);
 		let gate = Semaphore::new(1);
 		let recovering = AtomicBool::new(false);
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 		let busy = capacity.acquire().await.unwrap();
-		let mut queued = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, || recovering.load(Ordering::SeqCst)));
+		let mut queued = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || recovering.load(Ordering::SeqCst)));
 		assert!(futures_lite::future::poll_once(queued.as_mut()).await.is_none());
 		recovering.store(true, Ordering::SeqCst);
 		drop(busy);
 		assert!(queued.await.is_err(), "a pre-cooldown waiter must not bypass recovery serialization");
 		assert_eq!(capacity.available_permits(), 1);
 		let probe = gate.acquire().await.unwrap();
-		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, || recovering.load(Ordering::SeqCst)));
+		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || recovering.load(Ordering::SeqCst)));
 		assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
 		recovering.store(false, Ordering::SeqCst);
 		drop(probe);
@@ -5831,6 +6074,159 @@ mod tests {
 		let mut attempt = guard.try_admit(now, 7).unwrap();
 		guard.reconcile_quota(now + Duration::from_secs(1), &mut attempt, None, None, true);
 		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 0, reset_at } if reset_at == now + Duration::from_secs(120)));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_MAX_CONCURRENCY", "4")])]
+	fn test_recovery_capacity_queued_followers_resume_before_the_probe_finishes() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			upstream_guard(lane).transport.blocked_until = Some(Instant::now() - Duration::from_secs(1));
+			let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+			let owner = acquire_attempt_capacity(lane, 4, AdmissionRetryMode::Bounded, deadline).await.unwrap();
+			assert!(owner.1.is_some());
+			let mut followers = Box::pin(async {
+				let (first, second, third) = tokio::join!(
+					acquire_attempt_capacity(lane, 4, AdmissionRetryMode::Bounded, deadline),
+					acquire_attempt_capacity(lane, 4, AdmissionRetryMode::Bounded, deadline),
+					acquire_attempt_capacity(lane, 4, AdmissionRetryMode::Bounded, deadline),
+				);
+				[first.unwrap(), second.unwrap(), third.unwrap()]
+			});
+			assert!(tokio::time::timeout(Duration::from_millis(20), &mut followers).await.is_err());
+			upstream_guard(lane).transport.blocked_until = None;
+			quota_notify(lane).notify_waiters();
+			let resumed = tokio::time::timeout(Duration::from_millis(100), &mut followers)
+				.await
+				.expect("queued followers must notice recovery while the original logical request still owns its probe");
+			assert!(resumed.iter().all(|(_, probe)| probe.is_none()));
+			assert_eq!(TOR_RECOVERY_PROBE.available_permits(), 0, "the original slow request has not finished");
+			drop(resumed);
+			drop(owner);
+			assert_eq!(TOR_RECOVERY_PROBE.available_permits(), 1);
+		});
+	}
+
+	#[test]
+	fn test_recovery_capacity_429_cannot_release_expired_guards() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		guard.transport.blocked_until = Some(now - Duration::from_secs(1));
+		guard.graphql_rate_limit_blocked_until = Some(now - Duration::from_secs(1));
+		assert!(!guard.record_http_response(now, 7, 4, 429));
+		assert!(guard.transport.blocked_until.is_some());
+		assert!(guard.graphql_rate_limit_blocked_until.is_some());
+	}
+
+	#[test]
+	fn test_recovery_capacity_success_retires_only_its_own_quota_budget() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.rate_limit_blocked_until = Some(now - Duration::from_secs(1));
+		guard.graphql_rate_limit_blocked_until = Some(now - Duration::from_secs(1));
+		let rest = EdgeAttempt {
+			endpoint: 0,
+			epoch: 0,
+			half_open: false,
+		};
+		let graphql = EdgeAttempt {
+			endpoint: 4,
+			epoch: 0,
+			half_open: false,
+		};
+		guard.record_api_success(now, rest);
+		assert!(guard.rate_limit_blocked_until.is_none());
+		assert!(
+			guard.graphql_rate_limit_blocked_until.is_some(),
+			"REST success cannot retire an unrelated GraphQL recovery probe"
+		);
+		guard.rate_limit_blocked_until = Some(now + Duration::from_secs(30));
+		guard.record_api_success(now, graphql);
+		assert!(guard.graphql_rate_limit_blocked_until.is_none());
+		assert_eq!(guard.rate_limit_blocked_until, Some(now + Duration::from_secs(30)));
+		guard.graphql_rate_limit_blocked_until = Some(now + Duration::from_secs(60));
+		guard.record_api_success(now, graphql);
+		assert_eq!(guard.graphql_rate_limit_blocked_until, Some(now + Duration::from_secs(60)));
+	}
+
+	#[tokio::test]
+	async fn test_recovery_capacity_notifications_keep_active_probe_fifo() {
+		let capacity = Semaphore::new(4);
+		let gate = Semaphore::new(1);
+		let changed = Notify::new();
+		let recovering = AtomicBool::new(true);
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+		let owner = gate.acquire().await.unwrap();
+		let mut first = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || recovering.load(Ordering::SeqCst)));
+		assert!(futures_lite::future::poll_once(first.as_mut()).await.is_none());
+		let mut second = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || recovering.load(Ordering::SeqCst)));
+		assert!(futures_lite::future::poll_once(second.as_mut()).await.is_none());
+		for _ in 0..5 {
+			changed.notify_waiters();
+			assert!(futures_lite::future::poll_once(first.as_mut()).await.is_none());
+			assert!(futures_lite::future::poll_once(second.as_mut()).await.is_none());
+			assert_eq!(capacity.available_permits(), 4);
+		}
+		drop(owner);
+		let first = tokio::time::timeout(Duration::from_millis(100), first).await.unwrap().unwrap();
+		assert!(first.1.is_some(), "unrelated notifications must not move the first waiter behind a later one");
+		assert!(futures_lite::future::poll_once(second.as_mut()).await.is_none());
+		recovering.store(false, Ordering::SeqCst);
+		changed.notify_waiters();
+		let second = tokio::time::timeout(Duration::from_millis(100), second).await.unwrap().unwrap();
+		assert!(second.1.is_none());
+		assert_eq!(gate.available_permits(), 0, "the first waiter still owns the recovery probe");
+		drop(first);
+		drop(second);
+		assert_eq!(capacity.available_permits(), 4);
+		assert_eq!(gate.available_permits(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_recovery_capacity_releases_gate_queue_before_total_capacity_and_rechecks_new_pause() {
+		let capacity = Semaphore::new(0);
+		let gate = Semaphore::new(1);
+		let changed = Notify::new();
+		let recovering = AtomicBool::new(true);
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+		let owner = gate.acquire().await.unwrap();
+		let mut follower = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || recovering.load(Ordering::SeqCst)));
+		assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
+		recovering.store(false, Ordering::SeqCst);
+		changed.notify_waiters();
+		assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
+		drop(owner);
+		assert_eq!(gate.available_permits(), 1, "a normal-capacity waiter must cancel its old probe acquisition");
+		recovering.store(true, Ordering::SeqCst);
+		capacity.add_permits(1);
+		assert!(follower.await.is_err(), "a newer pause must still prevent an unprobed request");
+		assert_eq!(capacity.available_permits(), 1);
+	}
+
+	#[tokio::test]
+	async fn test_recovery_capacity_notifications_keep_original_queue_deadline() {
+		let capacity = Semaphore::new(1);
+		let gate = Semaphore::new(1);
+		let changed = Notify::new();
+		let owner = gate.acquire().await.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+		let mut waiting = Box::pin(acquire_recovery_capacity(&capacity, &gate, deadline, &changed, || true));
+		assert!(futures_lite::future::poll_once(waiting.as_mut()).await.is_none());
+		for _ in 0..5 {
+			changed.notify_waiters();
+			assert!(futures_lite::future::poll_once(waiting.as_mut()).await.is_none());
+		}
+		tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+		changed.notify_waiters();
+		assert!(
+			matches!(futures_lite::future::poll_once(waiting.as_mut()).await, Some(Err(()))),
+			"notifications must not restart the absolute queue deadline"
+		);
+		assert_eq!(capacity.available_permits(), 1);
+		drop(owner);
+		assert_eq!(gate.available_permits(), 1);
 	}
 
 	#[test]
