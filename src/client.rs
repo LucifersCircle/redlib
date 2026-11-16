@@ -271,6 +271,7 @@ struct UpstreamAttempt {
 	generation: u64,
 	quota_epoch: u64,
 	request_id: u64,
+	quota_admission: QuotaSnapshot,
 	quota_consumption_watermark: u64,
 	discovery_probe: bool,
 	sent: bool,
@@ -324,12 +325,61 @@ enum QuotaWindow {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum QuotaReserveError {
 	ReserveExhausted(Duration),
+	DiscoveryPending,
 	StaleGeneration,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct QuotaSnapshot {
+	generation: u64,
+	epoch: u64,
+	window: &'static str,
+	available: Option<u16>,
+	outstanding: u16,
+	rollover_reserve: u16,
+	headerless_consumption: u64,
+	reset_milliseconds: Option<u64>,
+	safety_reserve: Option<u16>,
+}
+
+impl Default for QuotaSnapshot {
+	fn default() -> Self {
+		Self {
+			generation: 0,
+			epoch: 0,
+			window: "unknown",
+			available: None,
+			outstanding: 0,
+			rollover_reserve: 0,
+			headerless_consumption: 0,
+			reset_milliseconds: None,
+			safety_reserve: None,
+		}
+	}
+}
+
+impl std::fmt::Display for QuotaSnapshot {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"window={} generation={} epoch={} available={:?} outstanding={} rollover_reserve={} headerless_consumption={} reset_milliseconds={:?} safety_reserve={:?}",
+			self.window,
+			self.generation,
+			self.epoch,
+			self.available,
+			self.outstanding,
+			self.rollover_reserve,
+			self.headerless_consumption,
+			self.reset_milliseconds,
+			self.safety_reserve
+		)
+	}
 }
 
 #[derive(Debug)]
 struct QuotaGovernor {
 	generation: u64,
+	discovery_owner: Option<u64>,
 	epoch: u64,
 	next_request_id: u64,
 	outstanding: u16,
@@ -342,6 +392,7 @@ impl Default for QuotaGovernor {
 	fn default() -> Self {
 		Self {
 			generation: 0,
+			discovery_owner: None,
 			epoch: 0,
 			next_request_id: 0,
 			outstanding: 0,
@@ -353,6 +404,44 @@ impl Default for QuotaGovernor {
 }
 
 impl QuotaGovernor {
+	fn snapshot(&self, now: Instant) -> QuotaSnapshot {
+		let (window, available, reset, safety_reserve) = match self.window {
+			QuotaWindow::Unknown { .. } => ("unknown", None, None, None),
+			QuotaWindow::Unreported => ("unreported", None, None, None),
+			QuotaWindow::Known { available, reset_at } => {
+				let reset = reset_at.saturating_duration_since(now);
+				let reserve = if reset <= EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING {
+					0
+				} else {
+					QUOTA_SAFETY_RESERVE
+				};
+				("known", Some(available), Some(reset.as_millis().min(u128::from(u64::MAX)) as u64), Some(reserve))
+			}
+		};
+		QuotaSnapshot {
+			generation: self.generation,
+			epoch: self.epoch,
+			window,
+			available,
+			outstanding: self.outstanding,
+			rollover_reserve: self.rollover_reserve,
+			headerless_consumption: self.headerless_consumption,
+			reset_milliseconds: reset,
+			safety_reserve,
+		}
+	}
+
+	fn owns_discovery(&self, attempt: &UpstreamAttempt) -> bool {
+		attempt.discovery_probe && attempt.quota_epoch == self.epoch && self.discovery_owner == Some(attempt.request_id)
+	}
+
+	fn release_discovery(&mut self, attempt: &UpstreamAttempt) {
+		if self.owns_discovery(attempt) && matches!(self.window, QuotaWindow::Unknown { .. }) {
+			self.window = QuotaWindow::Unknown { probe_in_flight: false };
+			self.discovery_owner = None;
+		}
+	}
+
 	fn reconcile_same_window_reset(known_reset: &mut Instant, observed_reset: Option<Instant>) {
 		let Some(observed_reset) = observed_reset else {
 			return;
@@ -370,6 +459,7 @@ impl QuotaGovernor {
 	fn install_generation(&mut self, generation: u64, fresh_identity: bool) {
 		self.generation = generation;
 		if fresh_identity {
+			self.discovery_owner = None;
 			// A newly generated anonymous device has its own quota window. Advance
 			// the epoch so late responses from the previous identity cannot alter it.
 			self.epoch = self.epoch.wrapping_add(1);
@@ -385,6 +475,7 @@ impl QuotaGovernor {
 			return Err(QuotaReserveError::StaleGeneration);
 		}
 		if matches!(self.window, QuotaWindow::Known { reset_at, .. } if now >= reset_at + RATE_LIMIT_COOLDOWN_MARGIN) {
+			self.discovery_owner = None;
 			self.epoch = self.epoch.wrapping_add(1);
 			self.rollover_reserve = self.rollover_reserve.saturating_add(self.outstanding);
 			self.outstanding = 0;
@@ -394,13 +485,11 @@ impl QuotaGovernor {
 
 		let discovery_probe = match &mut self.window {
 			QuotaWindow::Unknown { probe_in_flight } => {
-				// Every caller reaches quota admission only after acquiring a
-				// transport permit. Let those already-bounded requests proceed
-				// while the first response discovers the new identity's quota,
-				// instead of returning a recoverable error to the user.
-				let discovery_probe = !*probe_in_flight;
+				if *probe_in_flight {
+					return Err(QuotaReserveError::DiscoveryPending);
+				}
 				*probe_in_flight = true;
-				discovery_probe
+				true
 			}
 			QuotaWindow::Unreported => false,
 			QuotaWindow::Known { available, reset_at } => {
@@ -425,6 +514,9 @@ impl QuotaGovernor {
 
 		self.outstanding = self.outstanding.saturating_add(1);
 		self.next_request_id = self.next_request_id.wrapping_add(1);
+		if discovery_probe {
+			self.discovery_owner = Some(self.next_request_id);
+		}
 		Ok((self.epoch, self.next_request_id, discovery_probe))
 	}
 
@@ -454,15 +546,14 @@ impl QuotaGovernor {
 				// Reddit identity. Preserve conservative debt for a response from
 				// the previous token until current-generation quota headers arrive.
 				self.headerless_consumption = self.headerless_consumption.saturating_add(1);
-				if attempt.discovery_probe {
-					self.window = QuotaWindow::Unknown { probe_in_flight: false };
-				}
+				self.release_discovery(attempt);
 			}
 			return false;
 		}
 
 		let reset_at = reset.map(|delay| now + delay.min(MAX_RATE_LIMIT_COOLDOWN));
 		if quota_exhausted {
+			self.discovery_owner = None;
 			// Missing headers are not evidence that an observed window ends sooner.
 			let known_reset = match self.window {
 				QuotaWindow::Known { reset_at, .. } if reset_at > now => Some(reset_at),
@@ -479,6 +570,7 @@ impl QuotaGovernor {
 
 		if let (QuotaWindow::Known { reset_at: known_reset, .. }, Some(remaining), Some(observed_reset)) = (&self.window, remaining, reset_at) {
 			if now >= *known_reset && observed_reset > *known_reset + RATE_LIMIT_COOLDOWN_MARGIN {
+				self.discovery_owner = None;
 				let unresolved = self.outstanding.saturating_add(self.rollover_reserve);
 				self.epoch = self.epoch.wrapping_add(1);
 				self.outstanding = 0;
@@ -495,6 +587,7 @@ impl QuotaGovernor {
 		let overlapping_headerless = self.headerless_consumption.saturating_sub(attempt.quota_consumption_watermark).min(u64::from(u16::MAX)) as u16;
 		match (&mut self.window, remaining) {
 			(QuotaWindow::Unknown { .. }, Some(remaining)) => {
+				self.discovery_owner = None;
 				self.window = QuotaWindow::Known {
 					available: remaining
 						.saturating_sub(self.outstanding)
@@ -543,17 +636,19 @@ impl QuotaGovernor {
 	}
 
 	fn confirm_headerless_success(&mut self, attempt: &UpstreamAttempt) {
-		if attempt.generation == self.generation && attempt.quota_epoch == self.epoch && matches!(self.window, QuotaWindow::Unknown { .. }) {
+		if attempt.generation == self.generation && self.owns_discovery(attempt) && matches!(self.window, QuotaWindow::Unknown { .. }) {
 			self.window = QuotaWindow::Unreported;
+			self.discovery_owner = None;
 		}
 	}
 
 	fn continue_headerless_discovery_after_redirect(&mut self, _now: Instant, attempt: &UpstreamAttempt) {
-		if attempt.discovery_probe && attempt.generation == self.generation && attempt.quota_epoch == self.epoch && matches!(self.window, QuotaWindow::Unknown { .. }) {
+		if attempt.generation == self.generation && self.owns_discovery(attempt) && matches!(self.window, QuotaWindow::Unknown { .. }) {
 			// The redirect response is accounted for, but it is not evidence that
 			// the final JSON endpoint omits quota headers. Let its next hop inherit
 			// probe ownership immediately.
 			self.window = QuotaWindow::Unknown { probe_in_flight: false };
+			self.discovery_owner = None;
 		}
 	}
 
@@ -562,9 +657,7 @@ impl QuotaGovernor {
 			return;
 		}
 		if attempt.quota_reconciled {
-			if attempt.discovery_probe && matches!(self.window, QuotaWindow::Unknown { .. }) {
-				self.window = QuotaWindow::Unknown { probe_in_flight: false };
-			}
+			self.release_discovery(attempt);
 			return;
 		}
 		self.outstanding = self.outstanding.saturating_sub(1);
@@ -578,13 +671,9 @@ impl QuotaGovernor {
 			QuotaWindow::Known { available, .. } if !attempt.sent => {
 				*available = available.saturating_add(1);
 			}
-			QuotaWindow::Unknown { .. } if attempt.discovery_probe => {
-				self.window = QuotaWindow::Unknown { probe_in_flight: false };
-			}
-			QuotaWindow::Unknown { .. } => {}
-			QuotaWindow::Unreported => {}
-			QuotaWindow::Known { .. } => {}
+			_ => {}
 		}
+		self.release_discovery(attempt);
 	}
 }
 
@@ -943,6 +1032,13 @@ impl UpstreamGuard {
 				local_quota_retry: true,
 				source: "quota_reserve",
 			},
+			QuotaReserveError::DiscoveryPending => AdmissionDenied {
+				delay: LOCAL_QUOTA_RETRY_INTERVAL,
+				reason: CooldownReason::RateLimit,
+				reserve_exhausted: false,
+				local_quota_retry: true,
+				source: "quota_discovery",
+			},
 			QuotaReserveError::StaleGeneration => AdmissionDenied {
 				delay: Duration::from_secs(1),
 				reason: CooldownReason::RateLimit,
@@ -956,6 +1052,7 @@ impl UpstreamGuard {
 			Ok(edge) => edge,
 			Err(error) => {
 				let mut placeholder = UpstreamAttempt {
+					quota_admission: self.quota_budget(budget).snapshot(now),
 					lane: self.lane,
 					edge: EdgeAttempt {
 						endpoint,
@@ -984,6 +1081,7 @@ impl UpstreamGuard {
 		};
 
 		Ok(UpstreamAttempt {
+			quota_admission: self.quota_budget(budget).snapshot(now),
 			lane: self.lane,
 			edge,
 			generation,
@@ -1986,6 +2084,12 @@ async fn wait_for_local_quota_retry(quota_changed: impl std::future::Future<Outp
 }
 
 fn local_admission_message(denial: AdmissionDenied, short_refresh_retry: bool) -> String {
+	if denial.source == "quota_discovery" {
+		return format!(
+			"Reddit requests are temporarily paused while discovering the anonymous session quota. Retry in {} seconds",
+			retry_after_seconds(denial.delay)
+		);
+	}
 	if short_refresh_retry {
 		return format!(
 			"Refreshing the anonymous Reddit session. Retry in {} seconds",
@@ -2111,11 +2215,12 @@ async fn begin_upstream_attempt(
 						record_local_denial(admission.reason);
 						if retry_count > 0 {
 							info!(
-								"Local Reddit admission pause remained after bounded retries: lane={} source={} retries={} wait_milliseconds={}",
+								"Local Reddit admission pause remained after bounded retries: lane={} source={} retries={} wait_milliseconds={} current_quota=[{}]",
 								lane.label(),
 								admission.source,
 								retry_count,
 								elapsed.as_millis(),
+								upstream_guard(lane).quota_budget(QuotaBudget::for_endpoint(endpoint)).snapshot(Instant::now()),
 							);
 						}
 					}
@@ -2269,6 +2374,15 @@ fn reconcile_rate_limit(attempt: &mut UpstreamAttempt, remaining: Option<u16>, r
 	quota_notify(lane).notify_waiters();
 }
 
+fn reconcile_quota_headers(attempt: &mut UpstreamAttempt, validate_comments_body: bool, remaining: Option<u16>, reset: Option<Duration>, quota_error: bool) {
+	// Positive/missing allowance on successful comments waits for body error
+	// classification. Explicit zero is already sufficient exhaustion evidence,
+	// including when that body subsequently stalls or cannot be parsed.
+	if !validate_comments_body || remaining == Some(0) || quota_error {
+		reconcile_rate_limit(attempt, remaining, reset, quota_error || remaining == Some(0));
+	}
+}
+
 fn confirm_headerless_quota(attempt: &UpstreamAttempt) {
 	let lane = attempt.lane;
 	upstream_guard(lane)
@@ -2288,7 +2402,7 @@ fn reserve_redirect_hop(
 	let mut guard = upstream_guard(attempt.lane);
 	let budget = QuotaBudget::for_endpoint(attempt.edge.endpoint);
 	let allow_quota_refresh = allow_quota_refresh && budget == QuotaBudget::Rest;
-	let continue_headerless_discovery = attempt.discovery_probe && remaining.is_none() && reset.is_none();
+	let continue_headerless_discovery = attempt.discovery_probe && remaining.is_none();
 	guard.reconcile_quota(now, attempt, remaining, reset, false);
 	if continue_headerless_discovery {
 		guard.quota_budget_mut(budget).continue_headerless_discovery_after_redirect(now, attempt);
@@ -2318,6 +2432,17 @@ fn reserve_redirect_hop(
 					allow_quota_refresh
 						.then(|| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency))
 						.flatten(),
+				),
+				QuotaReserveError::DiscoveryPending => (
+					AdmissionDenied {
+						delay: LOCAL_QUOTA_RETRY_INTERVAL,
+						reason: CooldownReason::RateLimit,
+						reserve_exhausted: false,
+						local_quota_retry: true,
+						source: "quota_discovery",
+					},
+					None,
+					None,
 				),
 				QuotaReserveError::StaleGeneration => (
 					AdmissionDenied {
@@ -2363,6 +2488,7 @@ fn reserve_redirect_hop(
 	attempt.generation = generation;
 	attempt.quota_epoch = quota_epoch;
 	attempt.request_id = request_id;
+	attempt.quota_admission = guard.quota_budget(budget).snapshot(now);
 	attempt.quota_consumption_watermark = quota_consumption_watermark;
 	attempt.discovery_probe = discovery_probe;
 	attempt.sent = false;
@@ -2374,9 +2500,18 @@ fn block_for_edge_throttle(attempt: &mut UpstreamAttempt, retry_after: Option<Du
 	let now = Instant::now();
 	let mut guard = upstream_guard(attempt.lane);
 	let decision = guard.record_edge_throttle(now, attempt.edge, retry_after);
-	guard.quota_budget_mut(QuotaBudget::for_endpoint(attempt.edge.endpoint)).abandon(now, attempt);
+	let quota = guard.quota_budget_mut(QuotaBudget::for_endpoint(attempt.edge.endpoint));
+	let owned = quota.owns_discovery(attempt) && matches!(quota.window, QuotaWindow::Unknown { .. });
+	quota.abandon(now, attempt);
+	let released = owned && !quota.owns_discovery(attempt);
 	drop(guard);
+	attempt.quota_reconciled = true;
 	attempt.complete();
+	if released {
+		// The earlier header observation can wake followers before this owner
+		// is released. Notify the completed state so they need not await a timer.
+		quota_notify(attempt.lane).notify_waiters();
+	}
 	decision
 }
 
@@ -2442,6 +2577,10 @@ fn record_resource_response(attempt: &UpstreamAttempt, path: &str, status: u16, 
 }
 
 fn record_upstream_success(attempt: &mut UpstreamAttempt, path: &str) {
+	// Only a fully validated successful JSON read can settle an unknown
+	// allowance as unreported. Reset/used-only and invalid remaining headers
+	// carry no usable allowance and must not strand the discovery owner.
+	confirm_headerless_quota(attempt);
 	let recovery = upstream_guard(attempt.lane).record_generation_success(Instant::now(), attempt.generation, attempt.edge);
 	if let Some(recovery) = recovery {
 		info!(
@@ -2980,6 +3119,23 @@ fn graphql_api_error(error: GraphqlError, lane: RedditLane, generation: u64, hea
 	}
 }
 
+fn reconcile_graphql_quota(
+	attempt: &mut UpstreamAttempt,
+	remaining: Option<u16>,
+	reset: Option<Duration>,
+	error: Option<GraphqlErrorKind>,
+	retry_after: Option<&str>,
+	reset_header: Option<&str>,
+) -> Option<Duration> {
+	// A positive allowance on an embedded quota/session error must not publish
+	// successful discovery before its body classification is installed.
+	let quota_error = error == Some(GraphqlErrorKind::RateLimit);
+	let delay = quota_error.then(|| block_for_rate_limit(attempt.lane, attempt.generation, retry_after.or(Some("30")), reset_header, attempt.edge.endpoint).0);
+	let usable_remaining = if error == Some(GraphqlErrorKind::Session) { None } else { remaining };
+	reconcile_rate_limit(attempt, usable_remaining, reset, quota_error || remaining == Some(0));
+	delay
+}
+
 async fn reddit_comments(
 	path: &str,
 	quarantine: bool,
@@ -3007,13 +3163,26 @@ async fn reddit_comments(
 			.and_then(|v| v.to_str().ok())
 			.and_then(|v| parse_rate_limit_count(Some(v)));
 		let reset = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()).and_then(|v| parse_delay_seconds(Some(v)));
+		if remaining == Some(0) {
+			reconcile_rate_limit(attempt, remaining, reset, true);
+		}
 		let value = response.json::<Value>().await.map_err(|error| ApiRequestError::Upstream(error.to_string()))?;
 		post = Some(match request.post(&value, quarantine) {
 			Ok(post) => post,
 			Err(error) => {
 				warn!("Reddit comments response rejected: lane={} stage=post reason={}", lane.label(), error.reason);
-				reconcile_rate_limit(attempt, remaining, reset, remaining == Some(0));
+				let delay = reconcile_graphql_quota(
+					attempt,
+					remaining,
+					reset,
+					Some(error.kind),
+					headers.get("retry-after").and_then(|value| value.to_str().ok()),
+					headers.get("x-ratelimit-reset").and_then(|value| value.to_str().ok()),
+				);
 				record_graphql_resource_response(attempt, path, 200, remaining, &error);
+				if let Some(delay) = delay {
+					return Err(ApiRequestError::deferred(error.message, CooldownReason::RateLimit, delay));
+				}
 				return Err(graphql_api_error(error, lane, oauth.generation, &headers));
 			}
 		});
@@ -3067,12 +3236,23 @@ async fn reddit_pages(
 			.and_then(|v| v.to_str().ok())
 			.and_then(|v| parse_rate_limit_count(Some(v)));
 		reset = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()).and_then(|v| parse_delay_seconds(Some(v)));
+		if remaining == Some(0) {
+			reconcile_rate_limit(attempt, remaining, reset, true);
+		}
 		let value = response
 			.json::<Value>()
 			.await
 			.map_err(|_| ApiRequestError::Upstream("Reddit returned an invalid GraphQL page response".into()))?;
-		reconcile_rate_limit(attempt, remaining, reset, remaining == Some(0));
-		if let Some(mut error) = crate::reddit_graphql::response_error(&value) {
+		let body_error = crate::reddit_graphql::response_error(&value);
+		let quota_delay = reconcile_graphql_quota(
+			attempt,
+			remaining,
+			reset,
+			body_error.as_ref().map(|error| error.kind),
+			headers.get("retry-after").and_then(|value| value.to_str().ok()),
+			headers.get("x-ratelimit-reset").and_then(|value| value.to_str().ok()),
+		);
+		if let Some(mut error) = body_error {
 			error.message = error.message.replace("comments", "page");
 			warn!(
 				"Reddit GraphQL page response rejected: lane={} endpoint={} reason={}",
@@ -3081,6 +3261,9 @@ async fn reddit_pages(
 				error.reason
 			);
 			record_graphql_resource_response(attempt, path, 200, remaining, &error);
+			if let Some(delay) = quota_delay {
+				return Err(ApiRequestError::deferred(error.message, CooldownReason::RateLimit, delay));
+			}
 			return Err(graphql_api_error(error, lane, oauth.generation, &headers));
 		}
 		values.push(value);
@@ -3384,7 +3567,20 @@ async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String>
 fn json_pause_cache_eligible(now: Instant, path: &str) -> bool {
 	let selected = preferred_api_lane(now, path);
 	match lane_availability(selected, now, path) {
-		LaneAvailability::Ready => false,
+		LaneAvailability::Ready => {
+			let pending = {
+				let guard = upstream_guard(selected);
+				let quota = guard.quota_budget(QuotaBudget::for_endpoint(api_endpoint_index(path)));
+				matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true }) && quota.discovery_owner.is_some()
+			};
+			// The first discovery owner still refreshes normally. Existing warm
+			// successes may avoid following it, without changing lane routing.
+			let alternate = match selected {
+				RedditLane::Direct => RedditLane::Tor,
+				RedditLane::Tor => RedditLane::Direct,
+			};
+			pending && lane_availability(alternate, now, path) != LaneAvailability::Ready
+		}
 		// Existing routing intentionally waits on an explicit upstream quota
 		// pause. Local reserve pauses may still have a ready bounded spillover.
 		LaneAvailability::UpstreamQuotaCooldown => true,
@@ -4121,12 +4317,10 @@ async fn json_uncached_on_lane_with_options(
 						lane.label(), endpoint_class(&path), upstream_attempt.request_id, request_generation,
 						rejection.as_ref().map_or("missing", |details| details.body_kind), resource_reason.unwrap_or("none"));
 				}
-				reconcile_rate_limit(
-					&mut upstream_attempt,
-					parsed_remaining,
-					reset_duration,
-					matches!(throttle_kind, Some(ThrottleKind::Quota)) || parsed_remaining == Some(0),
-				);
+				let quota_budget = QuotaBudget::for_endpoint(api_endpoint_index(&path));
+				let quota_before_response = upstream_guard(lane).quota_budget(quota_budget).snapshot(Instant::now());
+				reconcile_quota_headers(&mut upstream_attempt, graphql.is_some() && status.is_success(), parsed_remaining, reset_duration,
+					matches!(throttle_kind, Some(ThrottleKind::Quota)));
 				if throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
 					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path);
 				}
@@ -4159,13 +4353,29 @@ async fn json_uncached_on_lane_with_options(
 							recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
 						}
 						warn!(
-							"Reddit quota response: status={} endpoint={} retry_after_seconds={} remaining_present={} reset_seconds={} used_present={} current_generation={response_is_current}",
+							"Reddit quota response: lane={} budget={} status={} endpoint={} request_id={} request_generation={} request_epoch={} observed_generation={} observed_epoch={} current_generation={response_is_current} observed_epoch_matches={} discovery_probe={} remaining={:?} remaining_present={} used={:?} used_present={} reset_seconds={:?} reset_present={} retry_after_seconds={:?} retry_after_present={} cooldown_milliseconds={} admission_after_reservation=[{}] before_response_reconcile=[{}]",
+							lane.label(),
+							match quota_budget { QuotaBudget::Rest => "rest", QuotaBudget::Graphql => "graphql" },
 							status,
 							endpoint_class(&path),
-							retry_after_duration.map_or(0, |duration| duration.as_secs()),
-							remaining.is_some(),
-							reset_duration.map_or(0, |duration| duration.as_secs()),
-							used.is_some(),
+							upstream_attempt.request_id,
+							request_generation,
+							upstream_attempt.quota_epoch,
+							quota_before_response.generation,
+							quota_before_response.epoch,
+							upstream_attempt.quota_epoch == quota_before_response.epoch,
+							upstream_attempt.discovery_probe,
+							parsed_remaining,
+							response_headers.contains_key("x-ratelimit-remaining"),
+							parsed_used,
+							response_headers.contains_key("x-ratelimit-used"),
+							reset_duration.map(|duration| duration.as_secs_f64()),
+							response_headers.contains_key("x-ratelimit-reset"),
+							retry_after_duration.map(|duration| duration.as_secs_f64()),
+							response_headers.contains_key(header::RETRY_AFTER),
+							delay.as_millis(),
+							upstream_attempt.quota_admission,
+							quota_before_response,
 						);
 						return Err(format!("Reddit rate limit exceeded. Retry in {} seconds", retry_after_seconds(delay)));
 					}
@@ -4249,21 +4459,20 @@ async fn json_uncached_on_lane_with_options(
 							Ok(value) => {
 								let json: Value = value;
 								let json = if let Some((post, request)) = graphql {
+									let body_error = crate::reddit_graphql::response_error(&json).map(|error| error.kind);
+									if body_error == Some(GraphqlErrorKind::Session) {
+										start_rejected_session_refresh(lane, request_generation);
+										retry_reason = TorRetryReason::SessionUnavailable;
+									}
+									if let Some(delay) = reconcile_graphql_quota(&mut upstream_attempt, parsed_remaining, reset_duration, body_error, retry_after, reset) {
+										recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
+									}
 									match request.finish(post.unwrap_or(Value::Null), &json) {
 										Ok(json) => json,
 										Err(error) => {
 											warn!("Reddit comments response rejected: lane={} stage=comments reason={}",lane.label(),error.reason);
 											record_graphql_resource_response(&upstream_attempt, &path, status_code, parsed_remaining, &error);
-											if error.kind == GraphqlErrorKind::Session {
-												start_rejected_session_refresh(lane, request_generation);
-												retry_reason = TorRetryReason::SessionUnavailable;
-											}
-											if error.kind == GraphqlErrorKind::RateLimit {
-												let (delay, current) = block_for_rate_limit(lane, request_generation, retry_after.or(Some("30")), reset, api_endpoint_index(&path));
-												if current {
-													recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
-												}
-											}
+
 											return Err(error.message);
 										}
 									}
@@ -4327,9 +4536,6 @@ async fn json_uncached_on_lane_with_options(
 									}
 									Err(format!("Reddit returned an unexpected response status: {status}"))
 								} else {
-									if !quota_headers_present {
-										confirm_headerless_quota(&upstream_attempt);
-									}
 									record_upstream_success(&mut upstream_attempt, &path);
 									Ok(json)
 								}
@@ -5506,6 +5712,289 @@ mod tests {
 	}
 
 	#[test]
+	fn test_quota_discovery_serializes_unknown_startup_and_reset_before_any_headers() {
+		let now = Instant::now();
+		for reset in [false, true] {
+			let mut guard = UpstreamGuard::new(RedditLane::Tor);
+			guard.install_oauth_generation(7, true);
+			if reset {
+				guard.graphql_quota.window = QuotaWindow::Known {
+					available: 8,
+					reset_at: now - Duration::from_secs(3),
+				};
+			}
+			let mut first = guard.try_admit_endpoint(now, 7, 4).unwrap();
+			assert!(first.discovery_probe);
+			for _ in 0..7 {
+				assert!(
+					guard.try_admit_endpoint(now, 7, 4).is_err(),
+					"only one unknown-quota wire may start before allowance is observed"
+				);
+			}
+			assert_eq!(guard.graphql_quota.outstanding, 1);
+			assert_eq!(guard.graphql_quota.next_request_id, 1);
+			first.complete();
+			first.quota_reconciled = true;
+		}
+	}
+
+	#[test]
+	fn test_quota_discovery_known_or_valid_unreported_success_restores_concurrency() {
+		let now = Instant::now();
+		for remaining in [Some(100), None] {
+			let mut guard = UpstreamGuard::new(RedditLane::Tor);
+			guard.install_oauth_generation(7, true);
+			let mut first = guard.try_admit_endpoint(now, 7, 4).unwrap();
+			let admission = first.quota_admission;
+			guard.reconcile_quota(now, &mut first, remaining, Some(Duration::from_secs(60)), false);
+			if remaining.is_none() {
+				assert!(guard.try_admit_endpoint(now, 7, 4).is_err(), "a partial observation needs a validated JSON outcome");
+				guard.graphql_quota.confirm_headerless_success(&first);
+			}
+			assert_eq!(first.quota_admission, admission, "admission diagnostics are immutable across response reconciliation");
+			first.complete();
+			for _ in 0..8 {
+				let mut follower = guard.try_admit_endpoint(now, 7, 4).unwrap();
+				assert!(!follower.discovery_probe);
+				follower.quota_reconciled = true;
+				follower.complete();
+			}
+		}
+	}
+
+	#[test]
+	fn test_quota_discovery_old_owner_cleanup_cannot_release_a_replacement() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		let mut old = guard.try_admit_endpoint(now, 7, 4).unwrap();
+		guard.abandon_attempt(now, &old);
+		old.quota_reconciled = true;
+		old.complete();
+		let mut current = guard.try_admit_endpoint(now, 7, 4).unwrap();
+		guard.abandon_attempt(now, &old);
+		assert!(guard.try_admit_endpoint(now, 7, 4).is_err());
+		guard.install_oauth_generation(8, false);
+		guard.reconcile_quota(now, &mut current, Some(100), Some(Duration::from_secs(60)), false);
+		let mut replacement = guard.try_admit_endpoint(now, 8, 4).unwrap();
+		guard.abandon_attempt(now, &current);
+		assert!(
+			guard.try_admit_endpoint(now, 8, 4).is_err(),
+			"stale-token cleanup must not release the newer request's discovery owner"
+		);
+		assert_eq!(guard.graphql_quota.discovery_owner, Some(replacement.request_id));
+		current.complete();
+		replacement.quota_reconciled = true;
+		replacement.complete();
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_MAX_CONCURRENCY", "4"), ("REDLIB_REDDIT_PRIMARY_LANE", "tor")])]
+	fn test_quota_discovery_waiters_release_transport_capacity_until_notified() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			let mut owner_refresh = TorQuotaRefreshRetryState::default();
+			let (_, mut owner, owner_permit, owner_probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut owner_refresh).await.unwrap();
+			let mut follower_refresh = TorQuotaRefreshRetryState::default();
+			let mut follower = Box::pin(begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut follower_refresh));
+			assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
+			assert_eq!(api_concurrency(lane).available_permits(), 3, "only the actual discovery owner may hold a transport slot");
+			assert_eq!(TOR_RECOVERY_PROBE.available_permits(), 1);
+			reconcile_rate_limit(&mut owner, Some(100), Some(Duration::from_secs(60)), false);
+			let admitted = tokio::time::timeout(Duration::from_millis(100), follower).await.unwrap().unwrap();
+			assert!(!admitted.1.discovery_probe);
+			drop(admitted);
+			owner.complete();
+			drop(owner_permit);
+			drop(owner_probe);
+			assert_eq!(api_concurrency(lane).available_permits(), 4);
+		});
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_MAX_CONCURRENCY", "4"), ("REDLIB_REDDIT_PRIMARY_LANE", "tor")])]
+	fn test_quota_discovery_edge_failure_wakes_a_rearmed_waiter() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			let mut owner_refresh = TorQuotaRefreshRetryState::default();
+			let (_, mut owner, owner_permit, owner_probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut owner_refresh).await.unwrap();
+			owner.mark_sent();
+			let mut waiter_refresh = TorQuotaRefreshRetryState::default();
+			let mut waiter = Box::pin(begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut waiter_refresh));
+			assert!(futures_lite::future::poll_once(waiter.as_mut()).await.is_none());
+			reconcile_rate_limit(&mut owner, None, None, false);
+			assert!(
+				futures_lite::future::poll_once(waiter.as_mut()).await.is_none(),
+				"the early header notification still sees the occupied discovery owner"
+			);
+			let decision = block_for_edge_throttle(&mut owner, Some(Duration::ZERO));
+			assert_eq!(decision.delay, Duration::ZERO);
+			assert!(!decision.started_cooldown);
+			let Some(Ok(next)) = futures_lite::future::poll_once(waiter.as_mut()).await else {
+				panic!("releasing a failed discovery owner must wake an already rearmed waiter without its retry timer");
+			};
+			let replacement_id = next.1.request_id;
+			drop(owner);
+			assert_eq!(upstream_guard(lane).graphql_quota.discovery_owner, Some(replacement_id));
+			assert_eq!(upstream_guard(lane).graphql_quota.outstanding, 1);
+			drop(next);
+			drop(owner_permit);
+			drop(owner_probe);
+			assert_eq!(api_concurrency(lane).available_permits(), 4);
+		});
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_PRIMARY_LANE", "tor")])]
+	fn test_quota_discovery_warm_cache_does_not_follow_an_owned_probe() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			use cached::Cached;
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			let path = normalize_reddit_api_path("/comments/abc.json");
+			let key = (path.clone(), false);
+			{
+				let mut cache = JSON_COMMENTS_CACHED.lock().await;
+				cache.cache_set_lifespan(Duration::ZERO);
+				cache.cache_set(key.clone(), Value::from("warm"));
+			}
+			assert!(!json_pause_cache_eligible(Instant::now(), &path), "the first owner must still use normal refresh");
+			let mut refresh = TorQuotaRefreshRetryState::default();
+			let (_, mut owner, _permit, _probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut refresh).await.unwrap();
+			let snapshot = owner.quota_admission;
+			let flights = JSON_FLIGHTS.lock().await;
+			assert_eq!(
+				tokio::time::timeout(Duration::from_millis(100), json_coalesced(path.clone(), false))
+					.await
+					.unwrap()
+					.unwrap(),
+				Value::from("warm")
+			);
+			assert_eq!(owner.quota_admission, snapshot);
+			assert_eq!(upstream_guard(lane).graphql_quota.discovery_owner, Some(owner.request_id));
+			assert!(
+				!json_pause_cache_eligible(Instant::now(), "/r/fixture/wiki/page.json"),
+				"GraphQL discovery must not pause REST"
+			);
+			let direct = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(RedditLane::Direct, direct), true, None));
+			assert!(!json_pause_cache_eligible(Instant::now(), &path), "a ready alternate retains the normal fresh request path");
+			OAUTH_CLIENT.store(None);
+			reconcile_rate_limit(&mut owner, Some(100), Some(Duration::from_secs(60)), false);
+			assert!(!json_pause_cache_eligible(Instant::now(), &path), "settled discovery restores normal cache handling");
+			drop(flights);
+			owner.complete();
+			let rest_path = "/r/fixture/wiki/page.json";
+			let mut rest_refresh = TorQuotaRefreshRetryState::default();
+			let rest_owner = begin_upstream_attempt(lane, api_endpoint_index(rest_path), AdmissionRetryMode::Bounded, &mut rest_refresh)
+				.await
+				.unwrap();
+			assert!(json_pause_cache_eligible(Instant::now(), rest_path));
+			assert!(!json_pause_cache_eligible(Instant::now(), &path), "REST discovery must not pause GraphQL");
+			drop(rest_owner);
+		});
+	}
+
+	#[test]
+	fn test_quota_diagnostics_snapshots_distinguish_unknown_zero_and_headroom() {
+		let now = Instant::now();
+		let mut quota = QuotaGovernor::default();
+		assert_eq!(quota.snapshot(now).available, None);
+		assert_eq!(quota.snapshot(now).window, "unknown");
+		quota.window = QuotaWindow::Known {
+			available: 0,
+			reset_at: now + Duration::from_secs(60),
+		};
+		quota.headerless_consumption = 3;
+		quota.rollover_reserve = 2;
+		let full = quota.snapshot(now);
+		assert_eq!(full.available, Some(0));
+		assert_eq!(full.safety_reserve, Some(QUOTA_SAFETY_RESERVE));
+		assert_eq!(full.reset_milliseconds, Some(60_000));
+		assert_eq!(full.headerless_consumption, 3);
+		assert_eq!(full.rollover_reserve, 2);
+		quota.window = QuotaWindow::Known {
+			available: 5,
+			reset_at: now + Duration::from_secs(20),
+		};
+		assert_eq!(quota.snapshot(now).safety_reserve, Some(0));
+		assert_eq!(full.available, Some(0), "captured snapshots do not change with the governor");
+		assert!(full.to_string().contains("available=Some(0)"));
+		assert!(QuotaSnapshot::default().to_string().contains("available=None"));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_PRIMARY_LANE", "tor")])]
+	fn test_quota_diagnostics_captures_each_reservation_before_response_reconcile() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			upstream_guard(lane).graphql_quota.window = QuotaWindow::Known {
+				available: 100,
+				reset_at: Instant::now() + Duration::from_secs(60),
+			};
+			let mut refresh = TorQuotaRefreshRetryState::default();
+			let (_, mut attempt, _permit, _probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut refresh).await.unwrap();
+			let initial = attempt.quota_admission;
+			assert_eq!(initial.available, Some(99));
+			assert_eq!(initial.outstanding, 1);
+			attempt.mark_sent();
+			reserve_redirect_hop(&mut attempt, 0, Some(80), Some(Duration::from_secs(60)), false).unwrap();
+			assert_eq!(attempt.quota_admission.available, Some(79));
+			assert_eq!(attempt.quota_admission.safety_reserve, Some(5));
+			assert_eq!(initial.available, Some(99));
+			let before = upstream_guard(lane).graphql_quota.snapshot(Instant::now());
+			reconcile_rate_limit(&mut attempt, Some(0), Some(Duration::from_secs(7)), true);
+			assert_eq!(before.available, Some(79));
+			assert_eq!(before.outstanding, 1);
+			assert_eq!(upstream_guard(lane).graphql_quota.snapshot(Instant::now()).available, Some(0));
+			attempt.complete();
+		});
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_TOR_FALLBACK", "on"), ("REDLIB_REDDIT_PRIMARY_LANE", "tor")])]
+	fn test_quota_discovery_zero_comments_headers_stop_admission_before_a_slow_or_invalid_body() {
+		tokio::runtime::Runtime::new().unwrap().block_on(async {
+			let lane = RedditLane::Tor;
+			for known in [false, true] {
+				*upstream_guard(lane) = UpstreamGuard::new(lane);
+				let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+				assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+				if known {
+					upstream_guard(lane).graphql_quota.window = QuotaWindow::Known {
+						available: 100,
+						reset_at: Instant::now() + Duration::from_secs(60),
+					};
+				}
+				let mut refresh = TorQuotaRefreshRetryState::default();
+				let (_, mut attempt, _permit, _probe) = begin_upstream_attempt(lane, 4, AdmissionRetryMode::Bounded, &mut refresh).await.unwrap();
+				reconcile_quota_headers(&mut attempt, true, Some(0), Some(Duration::from_secs(7)), false);
+				let (sender, body) = Body::channel();
+				let mut body = Box::pin(hyper::body::to_bytes(body));
+				assert!(tokio::time::timeout(Duration::from_millis(5), &mut body).await.is_err());
+				assert!(upstream_guard(lane).try_admit_endpoint(Instant::now(), 0, 4).is_err());
+				assert!(matches!(upstream_guard(lane).graphql_quota.window, QuotaWindow::Known { available: 0, .. }));
+				drop(sender);
+				let invalid = hyper::body::to_bytes(Body::from("{")).await.unwrap();
+				assert!(serde_json::from_slice::<Value>(&invalid).is_err());
+				assert!(upstream_guard(lane).try_admit_endpoint(Instant::now(), 0, 4).is_err());
+				attempt.complete();
+			}
+		});
+	}
+
+	#[test]
 	fn test_parse_rate_limit_count_rejects_invalid_values() {
 		assert_eq!(parse_rate_limit_count(Some("9.4")), Some(9));
 		assert_eq!(parse_rate_limit_count(Some("9.6")), Some(9));
@@ -5580,6 +6069,7 @@ mod tests {
 	fn test_quota_admission_never_uses_safety_reserve() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 7,
 			epoch: 2,
 			next_request_id: 0,
@@ -5602,6 +6092,7 @@ mod tests {
 	fn test_quota_admission_uses_remaining_allowance_near_reset() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 7,
 			epoch: 2,
 			next_request_id: 0,
@@ -6491,6 +6982,7 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard {
 			quota: QuotaGovernor {
+				discovery_owner: None,
 				generation: 7,
 				epoch: 1,
 				next_request_id: 0,
@@ -6561,6 +7053,7 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard {
 			quota: QuotaGovernor {
+				discovery_owner: None,
 				generation: 7,
 				epoch: 4,
 				next_request_id: 0,
@@ -6637,6 +7130,7 @@ mod tests {
 		let emergency_reset = now + EMERGENCY_QUOTA_ROTATION_MIN_RESET_REMAINING + Duration::from_secs(1);
 		let mut guard = UpstreamGuard {
 			quota: QuotaGovernor {
+				discovery_owner: None,
 				generation: 7,
 				epoch: 4,
 				next_request_id: 0,
@@ -6684,6 +7178,7 @@ mod tests {
 		let now = Instant::now();
 		let mut guard = UpstreamGuard {
 			quota: QuotaGovernor {
+				discovery_owner: None,
 				generation: 3,
 				epoch: 8,
 				next_request_id: 0,
@@ -6767,6 +7262,7 @@ mod tests {
 	fn test_out_of_order_quota_responses_cannot_replenish_budget() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 3,
 			epoch: 4,
 			next_request_id: 2,
@@ -6779,6 +7275,7 @@ mod tests {
 			},
 		};
 		let attempt = |request_id| UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -6804,6 +7301,7 @@ mod tests {
 		let now = Instant::now();
 		let old_reset = now + Duration::from_secs(5);
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 3,
 			epoch: 4,
 			next_request_id: 2,
@@ -6816,6 +7314,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -6854,6 +7353,7 @@ mod tests {
 		assert_eq!(quota_epoch, 5);
 		assert!(discovery_probe);
 		let discovery_attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -6875,6 +7375,7 @@ mod tests {
 		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 80, .. }));
 
 		let late_old_attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -6906,6 +7407,7 @@ mod tests {
 		let now = Instant::now();
 		let old_reset = now + Duration::from_secs(5);
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 2,
 			epoch: 3,
 			next_request_id: 1,
@@ -6918,6 +7420,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -6943,6 +7446,7 @@ mod tests {
 		let now = Instant::now();
 		let old_reset = now + Duration::from_secs(60);
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 2,
 			epoch: 3,
 			next_request_id: 1,
@@ -6955,6 +7459,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -6979,6 +7484,7 @@ mod tests {
 	fn test_token_refresh_preserves_quota_window() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 4,
 			epoch: 2,
 			next_request_id: 8,
@@ -6999,6 +7505,7 @@ mod tests {
 	fn test_fresh_identity_starts_unknown_quota_window_and_ignores_late_responses() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 4,
 			epoch: 2,
 			next_request_id: 8,
@@ -7011,6 +7518,7 @@ mod tests {
 			},
 		};
 		let stale_attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7027,6 +7535,7 @@ mod tests {
 			completed: true,
 		};
 		let mut stale_unsent_attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7053,21 +7562,23 @@ mod tests {
 
 		quota.reconcile(now, &stale_attempt, Some(99), Some(Duration::from_secs(300)), false);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
-		assert!(quota.reserve(fresh_now + Duration::from_secs(1), 5).is_ok());
+		let (_, fresh_request_id, fresh_is_probe) = quota.reserve(fresh_now + Duration::from_secs(1), 5).unwrap();
+		assert!(fresh_is_probe);
 		quota.abandon(fresh_now + Duration::from_secs(1), &stale_unsent_attempt);
 		stale_unsent_attempt.quota_reconciled = true;
 		stale_unsent_attempt.completed = true;
 		assert_eq!(quota.outstanding, 1);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
-		let (_, _, follower_is_probe) = quota.reserve(fresh_now + Duration::from_secs(1), 5).unwrap();
-		assert!(!follower_is_probe);
-		assert_eq!(quota.outstanding, 2);
+		assert_eq!(quota.discovery_owner, Some(fresh_request_id));
+		assert_eq!(quota.reserve(fresh_now + Duration::from_secs(1), 5), Err(QuotaReserveError::DiscoveryPending));
+		assert_eq!(quota.outstanding, 1);
 	}
 
 	#[test]
 	fn test_stale_generation_cannot_reserve_or_replace_budget() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 5,
 			epoch: 3,
 			next_request_id: 1,
@@ -7083,6 +7594,7 @@ mod tests {
 		assert_eq!(quota.generation, 5);
 
 		let stale_attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7107,6 +7619,7 @@ mod tests {
 	fn test_headerless_backend_leaves_discovery_mode() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 2,
 			epoch: 0,
 			next_request_id: 0,
@@ -7118,6 +7631,7 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		assert!(discovery_probe);
 		let attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7135,30 +7649,53 @@ mod tests {
 		};
 		quota.reconcile(now, &attempt, None, None, false);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
-		assert!(!quota.reserve(now, 2).unwrap().2);
+		assert_eq!(quota.reserve(now, 2), Err(QuotaReserveError::DiscoveryPending));
 		quota.confirm_headerless_success(&attempt);
 		assert!(matches!(quota.window, QuotaWindow::Unreported));
 		assert!(quota.reserve(now, 2).is_ok());
 	}
 
+	fn quota_after_successful_unreported_discovery(now: Instant, generation: u64, epoch: u64) -> QuotaGovernor {
+		let mut quota = QuotaGovernor {
+			generation,
+			epoch,
+			..QuotaGovernor::default()
+		};
+		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, generation).unwrap();
+		let attempt = UpstreamAttempt {
+			lane: RedditLane::Direct,
+			edge: EdgeAttempt {
+				endpoint: 0,
+				epoch: 0,
+				half_open: false,
+			},
+			generation,
+			quota_epoch,
+			request_id,
+			quota_admission: quota.snapshot(now),
+			quota_consumption_watermark: 0,
+			discovery_probe,
+			sent: true,
+			quota_reconciled: true,
+			completed: true,
+		};
+		quota.reconcile(now, &attempt, None, None, false);
+		quota.confirm_headerless_success(&attempt);
+		assert!(matches!(quota.window, QuotaWindow::Unreported));
+		quota
+	}
+
 	#[test]
 	fn test_follower_redirect_during_headerless_discovery_remains_admitted() {
 		let now = Instant::now();
-		let mut quota = QuotaGovernor {
-			generation: 2,
-			epoch: 4,
-			next_request_id: 0,
-			outstanding: 0,
-			rollover_reserve: 0,
-			headerless_consumption: 0,
-			window: QuotaWindow::Unknown { probe_in_flight: false },
-		};
+		let mut quota = quota_after_successful_unreported_discovery(now, 2, 4);
 		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
-		assert!(discovery_probe);
+		assert!(!discovery_probe);
 		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
 		assert!(!follower_is_probe);
 
 		let probe = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7168,22 +7705,23 @@ mod tests {
 			generation: 2,
 			quota_epoch,
 			request_id: probe_request_id,
-			quota_consumption_watermark: 0,
-			discovery_probe: true,
+			quota_consumption_watermark: 1,
+			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
 			completed: true,
 		};
 		let follower = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			request_id: follower_request_id,
-			quota_consumption_watermark: 0,
+			quota_consumption_watermark: 1,
 			discovery_probe: false,
 			..probe
 		};
 		quota.reconcile(now, &probe, None, None, false);
 		quota.reconcile(now, &follower, None, None, false);
 		quota.continue_headerless_discovery_after_redirect(now, &follower);
-		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
+		assert!(matches!(quota.window, QuotaWindow::Unreported));
 		let (_, _, redirect_is_probe) = quota.reserve(now, 2).unwrap();
 		assert!(!redirect_is_probe);
 
@@ -7194,21 +7732,14 @@ mod tests {
 	#[test]
 	fn test_headerless_follower_consumption_is_debited_from_first_quota_snapshot() {
 		let now = Instant::now();
-		let mut quota = QuotaGovernor {
-			generation: 2,
-			epoch: 4,
-			next_request_id: 0,
-			outstanding: 0,
-			rollover_reserve: 0,
-			headerless_consumption: 0,
-			window: QuotaWindow::Unknown { probe_in_flight: false },
-		};
+		let mut quota = quota_after_successful_unreported_discovery(now, 2, 4);
 		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
-		assert!(discovery_probe);
+		assert!(!discovery_probe);
 		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
 		assert!(!follower_is_probe);
 
 		let follower = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7218,21 +7749,22 @@ mod tests {
 			generation: 2,
 			quota_epoch,
 			request_id: follower_request_id,
-			quota_consumption_watermark: 0,
+			quota_consumption_watermark: 1,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
 			completed: true,
 		};
 		quota.reconcile(now, &follower, None, None, false);
-		assert_eq!(quota.headerless_consumption, 1);
+		assert_eq!(quota.headerless_consumption, 2);
 		let (_, _, redirect_is_probe) = quota.reserve(now, 2).unwrap();
 		assert!(!redirect_is_probe);
 
 		let probe = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			request_id: probe_request_id,
-			quota_consumption_watermark: 0,
-			discovery_probe: true,
+			quota_consumption_watermark: 1,
+			discovery_probe: false,
 			..follower
 		};
 		quota.reconcile(now, &probe, Some(99), Some(Duration::from_secs(300)), false);
@@ -7243,21 +7775,14 @@ mod tests {
 	#[test]
 	fn test_successful_headerless_follower_keeps_debt_until_first_quota_snapshot() {
 		let now = Instant::now();
-		let mut quota = QuotaGovernor {
-			generation: 2,
-			epoch: 4,
-			next_request_id: 0,
-			outstanding: 0,
-			rollover_reserve: 0,
-			headerless_consumption: 0,
-			window: QuotaWindow::Unknown { probe_in_flight: false },
-		};
+		let mut quota = quota_after_successful_unreported_discovery(now, 2, 4);
 		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
-		assert!(discovery_probe);
+		assert!(!discovery_probe);
 		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
 		assert!(!follower_is_probe);
 
 		let follower = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7267,7 +7792,7 @@ mod tests {
 			generation: 2,
 			quota_epoch,
 			request_id: follower_request_id,
-			quota_consumption_watermark: 0,
+			quota_consumption_watermark: 1,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
@@ -7276,12 +7801,13 @@ mod tests {
 		quota.reconcile(now, &follower, None, None, false);
 		quota.confirm_headerless_success(&follower);
 		assert!(matches!(quota.window, QuotaWindow::Unreported));
-		assert_eq!(quota.headerless_consumption, 1);
+		assert_eq!(quota.headerless_consumption, 2);
 
 		let probe = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			request_id: probe_request_id,
-			quota_consumption_watermark: 0,
-			discovery_probe: true,
+			quota_consumption_watermark: 1,
+			discovery_probe: false,
 			..follower
 		};
 		quota.reconcile(now, &probe, Some(99), Some(Duration::from_secs(300)), false);
@@ -7293,6 +7819,7 @@ mod tests {
 	fn test_sequential_headerless_history_is_not_charged_to_later_quota_snapshot() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 2,
 			epoch: 4,
 			next_request_id: 0,
@@ -7306,6 +7833,7 @@ mod tests {
 			let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 			let watermark = quota.headerless_consumption;
 			let attempt = UpstreamAttempt {
+				quota_admission: QuotaSnapshot::default(),
 				lane: RedditLane::Direct,
 				edge: EdgeAttempt {
 					endpoint: 0,
@@ -7331,6 +7859,7 @@ mod tests {
 
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let snapshot = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7355,6 +7884,7 @@ mod tests {
 	fn test_reconciled_discovery_probe_failure_releases_probe() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 2,
 			epoch: 4,
 			next_request_id: 0,
@@ -7365,6 +7895,7 @@ mod tests {
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let mut probe = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7392,6 +7923,7 @@ mod tests {
 	fn test_sent_abandoned_discovery_request_remains_uncertain_quota_debt() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 2,
 			epoch: 4,
 			next_request_id: 0,
@@ -7402,6 +7934,7 @@ mod tests {
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let abandoned = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7423,6 +7956,7 @@ mod tests {
 
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let snapshot = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			quota_epoch,
 			request_id,
 			quota_consumption_watermark: quota.headerless_consumption,
@@ -7438,20 +7972,8 @@ mod tests {
 	#[test]
 	fn test_discovery_follower_failure_does_not_release_probe() {
 		let now = Instant::now();
-		let mut quota = QuotaGovernor {
-			generation: 2,
-			epoch: 4,
-			next_request_id: 0,
-			outstanding: 0,
-			rollover_reserve: 0,
-			headerless_consumption: 0,
-			window: QuotaWindow::Unknown { probe_in_flight: false },
-		};
-		let (quota_epoch, probe_request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
-		assert!(discovery_probe);
-		let (_, follower_request_id, follower_is_probe) = quota.reserve(now, 2).unwrap();
-		assert!(!follower_is_probe);
-
+		let mut quota = quota_after_successful_unreported_discovery(now, 2, 4);
+		let (old_epoch, follower_id, _) = quota.reserve(now, 2).unwrap();
 		let follower = UpstreamAttempt {
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7460,37 +7982,30 @@ mod tests {
 				half_open: false,
 			},
 			generation: 2,
-			quota_epoch,
-			request_id: follower_request_id,
-			quota_consumption_watermark: 0,
+			quota_epoch: old_epoch,
+			request_id: follower_id,
+			quota_admission: quota.snapshot(now),
+			quota_consumption_watermark: 1,
 			discovery_probe: false,
 			sent: true,
 			quota_reconciled: true,
 			completed: true,
 		};
+		quota.window = QuotaWindow::Known {
+			available: 10,
+			reset_at: now - RATE_LIMIT_COOLDOWN_MARGIN,
+		};
+		let (epoch, probe_id, discovery_probe) = quota.reserve(now, 2).unwrap();
+		assert!(discovery_probe);
+		quota.abandon(now, &follower);
 		quota.reconcile(now, &follower, None, None, false);
 		assert_eq!(quota.outstanding, 1);
-		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
-
-		let (_, abandoned_request_id, abandoned_is_probe) = quota.reserve(now, 2).unwrap();
-		assert!(!abandoned_is_probe);
-		let mut abandoned_follower = UpstreamAttempt {
-			request_id: abandoned_request_id,
-			quota_consumption_watermark: 0,
-			sent: false,
-			quota_reconciled: false,
-			completed: false,
-			..follower
-		};
-		quota.abandon(now, &abandoned_follower);
-		abandoned_follower.quota_reconciled = true;
-		abandoned_follower.completed = true;
-		assert_eq!(quota.outstanding, 1);
-		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
-
+		assert_eq!(quota.rollover_reserve, 1);
+		assert_eq!(quota.discovery_owner, Some(probe_id));
+		assert_eq!(quota.reserve(now, 2), Err(QuotaReserveError::DiscoveryPending));
 		let mut probe = UpstreamAttempt {
-			request_id: probe_request_id,
-			quota_consumption_watermark: 0,
+			quota_epoch: epoch,
+			request_id: probe_id,
 			discovery_probe: true,
 			sent: false,
 			quota_reconciled: false,
@@ -7499,15 +8014,16 @@ mod tests {
 		};
 		quota.abandon(now, &probe);
 		probe.quota_reconciled = true;
-		probe.completed = true;
+		probe.complete();
 		assert_eq!(quota.outstanding, 0);
-		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false, .. }));
+		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: false }));
 	}
 
 	#[test]
 	fn test_stale_discovery_releases_probe_without_applying_headers() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 1,
 			epoch: 4,
 			next_request_id: 0,
@@ -7519,6 +8035,7 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 1).unwrap();
 		quota.install_generation(2, false);
 		let stale_attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7544,6 +8061,7 @@ mod tests {
 	fn test_headerless_redirect_preserves_discovery_probe_with_a_new_reservation() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 3,
 			epoch: 7,
 			next_request_id: 0,
@@ -7554,6 +8072,7 @@ mod tests {
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 3).unwrap();
 		let mut attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7577,9 +8096,11 @@ mod tests {
 		assert_eq!(next_epoch, quota_epoch);
 		assert_ne!(next_request_id, request_id);
 		assert!(next_discovery_probe);
-		let (_, _, follower_is_probe) = quota.reserve(now, 3).unwrap();
-		assert!(!follower_is_probe);
-		assert_eq!(quota.outstanding, 2);
+		assert_eq!(quota.reserve(now, 3), Err(QuotaReserveError::DiscoveryPending));
+		assert_eq!(quota.outstanding, 1);
+		quota.abandon(now, &attempt);
+		assert_eq!(quota.discovery_owner, Some(next_request_id));
+		assert_eq!(quota.reserve(now, 3), Err(QuotaReserveError::DiscoveryPending));
 		attempt.completed = true;
 	}
 
@@ -7588,6 +8109,7 @@ mod tests {
 		let now = Instant::now();
 		let old_reset = now - RATE_LIMIT_COOLDOWN_MARGIN;
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 8,
 			epoch: 12,
 			next_request_id: 3,
@@ -7600,6 +8122,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
 				endpoint: 0,
@@ -7625,6 +8148,7 @@ mod tests {
 	fn test_reset_allows_exactly_one_discovery_probe() {
 		let now = Instant::now();
 		let mut quota = QuotaGovernor {
+			discovery_owner: None,
 			generation: 1,
 			epoch: 9,
 			next_request_id: 0,
@@ -7638,9 +8162,9 @@ mod tests {
 		};
 		assert!(quota.reserve(now, 1).unwrap().2);
 		for _ in 0..16 {
-			assert!(!quota.reserve(now, 1).unwrap().2);
+			assert_eq!(quota.reserve(now, 1), Err(QuotaReserveError::DiscoveryPending));
 		}
-		assert_eq!(quota.outstanding, 17);
+		assert_eq!(quota.outstanding, 1);
 		assert!(matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true, .. }));
 	}
 
@@ -7863,6 +8387,7 @@ mod tests {
 		let guard = |lane| UpstreamGuard {
 			lane,
 			quota: QuotaGovernor {
+				discovery_owner: None,
 				generation: 7,
 				epoch: 3,
 				next_request_id: 0,

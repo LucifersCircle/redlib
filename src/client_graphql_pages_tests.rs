@@ -3,6 +3,290 @@ use sealed_test::prelude::*;
 use std::sync::atomic::AtomicUsize;
 
 #[test]
+#[sealed_test(env = [("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_discovery_partial_headers_handoff_and_success_settlement() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		use hyper::service::{make_service_fn, service_fn};
+		use std::convert::Infallible;
+		for comments in [false, true] {
+			for partial in 0..3 {
+				let calls = Arc::new(AtomicUsize::new(0));
+				let server_calls = calls.clone();
+				let service = make_service_fn(move |_| {
+					let calls = server_calls.clone();
+					async move {
+						Ok::<_, Infallible>(service_fn(move |request: HyperRequest<Body>| {
+							let calls = calls.clone();
+							async move {
+								calls.fetch_add(1, Ordering::SeqCst);
+								let payload: Value = serde_json::from_slice(&hyper::body::to_bytes(request.into_body()).await.unwrap()).unwrap();
+								let value = match payload["operationName"].as_str().unwrap() {
+									"AllFeedSdui" => {
+										serde_json::json!({"data":{"allV3":{"elements":{"edges":[{"node":{"groupId":"t3_abc"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}})
+									}
+									"PostsByIds" => {
+										serde_json::json!({"data":{"postsInfoByIds":[{"__typename":"SubredditPost","id":"t3_abc","postTitle":"Fixture","subreddit":{"name":"fixture","type":"PUBLIC"}}]}})
+									}
+									"PostComments" => serde_json::json!({"data":{"postInfoById":{"id":"t3_abc","commentForest":{"trees":[]}}}}),
+									name => panic!("unexpected operation {name}"),
+								};
+								let response = HyperResponse::builder().header("content-type", "application/json");
+								let response = match partial {
+									0 => response.header("x-ratelimit-reset", "60"),
+									1 => response.header("x-ratelimit-used", "3"),
+									_ => response.header("x-ratelimit-remaining", "invalid").header("x-ratelimit-reset", "60"),
+								};
+								Ok::<_, Infallible>(response.body(Body::from(value.to_string())).unwrap())
+							}
+						}))
+					}
+				});
+				let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+				let address = server.local_addr();
+				let origin = RedditOrigin {
+					base: Box::leak(format!("http://{address}").into_boxed_str()),
+					host: Box::leak(address.to_string().into_boxed_str()),
+				};
+				let server = tokio::spawn(server);
+				let lane = RedditLane::Tor;
+				*upstream_guard(lane) = UpstreamGuard::new(lane);
+				let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+				assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+				let path = if comments { "/comments/abc.json" } else { "/r/all/hot.json" };
+				let mut refresh = TorQuotaRefreshRetryState::default();
+				let (oauth, mut attempt, _permit, _probe) = begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut refresh)
+					.await
+					.unwrap();
+				let result = if comments {
+					tokio::time::timeout(
+						Duration::from_secs(2),
+						reddit_comments(path, false, oauth, &mut attempt, false, CommentsRequest::from_path(path).unwrap(), origin),
+					)
+					.await
+					.unwrap()
+				} else {
+					tokio::time::timeout(
+						Duration::from_secs(2),
+						reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin),
+					)
+					.await
+					.unwrap()
+				}
+				.unwrap();
+				match result {
+					RedditReadResponse::Pages(response) => {
+						let _: Value = serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap()).unwrap();
+					}
+					RedditReadResponse::Comments { response, post, request } => {
+						let value = response.json::<Value>().await.unwrap();
+						request.finish(post.unwrap(), &value).unwrap();
+						reconcile_rate_limit(&mut attempt, None, None, false);
+					}
+					_ => panic!("GraphQL response"),
+				}
+				assert_eq!(calls.load(Ordering::SeqCst), 2, "the discovery owner must retain its own continuation");
+				assert_eq!(attempt.request_id, 2);
+				assert!(matches!(upstream_guard(lane).graphql_quota.window, QuotaWindow::Unknown { probe_in_flight: true }));
+				record_upstream_success(&mut attempt, path);
+				let mut guard = upstream_guard(lane);
+				assert!(matches!(guard.graphql_quota.window, QuotaWindow::Unreported));
+				assert_eq!(guard.graphql_quota.headerless_consumption, 2);
+				assert_eq!(guard.graphql_quota.discovery_owner, None);
+				let mut next = guard.try_admit_endpoint(Instant::now(), 0, api_endpoint_index(path)).unwrap();
+				assert!(!next.discovery_probe);
+				next.quota_reconciled = true;
+				next.complete();
+				drop(guard);
+				server.abort();
+			}
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env = [("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_discovery_embedded_quota_errors_do_not_publish_positive_allowance() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		use hyper::service::{make_service_fn, service_fn};
+		use std::convert::Infallible;
+		for final_comments in [false, true] {
+			let calls = Arc::new(AtomicUsize::new(0));
+			let server_calls = calls.clone();
+			let released = Arc::new(Notify::new());
+			let seen = Arc::new(Notify::new());
+			let signals = (released.clone(), seen.clone());
+			let service = make_service_fn(move |_| {
+				let calls = server_calls.clone();
+				let signals = signals.clone();
+				async move {
+					Ok::<_, Infallible>(service_fn(move |request: HyperRequest<Body>| {
+						let calls = calls.clone();
+						let (released, seen) = signals.clone();
+						async move {
+							calls.fetch_add(1, Ordering::SeqCst);
+							let payload: Value = serde_json::from_slice(&hyper::body::to_bytes(request.into_body()).await.unwrap()).unwrap();
+							if payload["operationName"] == "PostsByIds" {
+								return Ok::<_, Infallible>(
+									HyperResponse::builder()
+										.header("content-type", "application/json")
+										.body(Body::from(
+											serde_json::json!({"data":{"postsInfoByIds":[{"__typename":"SubredditPost","id":"t3_abc","postTitle":"Fixture","subreddit":{"type":"PUBLIC"}}]}})
+												.to_string(),
+										))
+										.unwrap(),
+								);
+							}
+							let (mut sender, body) = Body::channel();
+							seen.notify_one();
+							tokio::spawn(async move {
+								released.notified().await;
+								let _ = sender
+									.send_data(serde_json::json!({"errors":[{"extensions":{"code":"RATE_LIMITED"}}]}).to_string().into())
+									.await;
+							});
+							Ok::<_, Infallible>(
+								HyperResponse::builder()
+									.header("content-type", "application/json")
+									.header("x-ratelimit-remaining", "100")
+									.header("x-ratelimit-reset", "60")
+									.body(body)
+									.unwrap(),
+							)
+						}
+					}))
+				}
+			});
+			let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+			let address = server.local_addr();
+			let origin = RedditOrigin {
+				base: Box::leak(format!("http://{address}").into_boxed_str()),
+				host: Box::leak(address.to_string().into_boxed_str()),
+			};
+			let server = tokio::spawn(server);
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			let path = if final_comments { "/comments/abc.json" } else { "/r/fixture/hot.json" };
+			let mut refresh = TorQuotaRefreshRetryState::default();
+			let (oauth, mut attempt, _permit, _probe) = begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut refresh)
+				.await
+				.unwrap();
+			let mut read = Box::pin(async {
+				if final_comments {
+					let RedditReadResponse::Comments { response, post, request } =
+						reddit_comments(path, false, oauth, &mut attempt, false, CommentsRequest::from_path(path).unwrap(), origin)
+							.await
+							.unwrap()
+					else {
+						panic!("comments")
+					};
+					let value = response.json::<Value>().await.unwrap();
+					let kind = crate::reddit_graphql::response_error(&value).map(|error| error.kind);
+					reconcile_graphql_quota(&mut attempt, Some(100), Some(Duration::from_secs(60)), kind, None, Some("60"));
+					assert!(request.finish(post.unwrap(), &value).is_err());
+				} else {
+					assert!(reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin)
+						.await
+						.is_err());
+				}
+			});
+			assert!(tokio::time::timeout(Duration::from_millis(20), &mut read).await.is_err());
+			tokio::time::timeout(Duration::from_secs(2), seen.notified()).await.unwrap();
+			let mut waiting_refresh = TorQuotaRefreshRetryState::default();
+			let mut follower = Box::pin(begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut waiting_refresh));
+			assert!(futures_lite::future::poll_once(follower.as_mut()).await.is_none());
+			released.notify_one();
+			tokio::time::timeout(Duration::from_secs(2), &mut read).await.unwrap();
+			drop(read);
+			assert!(tokio::time::timeout(Duration::from_millis(20), &mut follower).await.is_err());
+			assert_eq!(calls.load(Ordering::SeqCst), if final_comments { 2 } else { 1 });
+			assert!(matches!(upstream_guard(lane).graphql_quota.window, QuotaWindow::Known { available: 0, .. }));
+			assert!(upstream_guard(lane).graphql_rate_limit_blocked_until.is_some_and(|until| until > Instant::now()));
+			drop(follower);
+			server.abort();
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env = [("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_discovery_first_operation_zero_headers_block_before_invalid_body() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		use hyper::service::{make_service_fn, service_fn};
+		use std::convert::Infallible;
+		for comments in [false, true] {
+			let release = Arc::new(Notify::new());
+			let received = Arc::new(Notify::new());
+			let signals = (release.clone(), received.clone());
+			let service = make_service_fn(move |_| {
+				let signals = signals.clone();
+				async move {
+					Ok::<_, Infallible>(service_fn(move |_request: HyperRequest<Body>| {
+						let (release, received) = signals.clone();
+						async move {
+							let (mut sender, body) = Body::channel();
+							received.notify_one();
+							tokio::spawn(async move {
+								release.notified().await;
+								let _ = sender.send_data("{".into()).await;
+							});
+							Ok::<_, Infallible>(
+								HyperResponse::builder()
+									.header("content-type", "application/json")
+									.header("x-ratelimit-remaining", "0")
+									.header("x-ratelimit-reset", "60")
+									.body(body)
+									.unwrap(),
+							)
+						}
+					}))
+				}
+			});
+			let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+			let address = server.local_addr();
+			let origin = RedditOrigin {
+				base: Box::leak(format!("http://{address}").into_boxed_str()),
+				host: Box::leak(address.to_string().into_boxed_str()),
+			};
+			let server = tokio::spawn(server);
+			let lane = RedditLane::Tor;
+			*upstream_guard(lane) = UpstreamGuard::new(lane);
+			let http = Arc::new(WreqClient::builder().no_proxy().build().unwrap());
+			assert!(install_oauth_client(Oauth::request_fixture(lane, http), true, None));
+			upstream_guard(lane).graphql_quota.window = QuotaWindow::Known {
+				available: 100,
+				reset_at: Instant::now() + Duration::from_secs(60),
+			};
+			let path = if comments { "/comments/abc.json" } else { "/r/fixture/hot.json" };
+			let mut refresh = TorQuotaRefreshRetryState::default();
+			let (oauth, mut attempt, _permit, _probe) = begin_upstream_attempt(lane, api_endpoint_index(path), AdmissionRetryMode::Bounded, &mut refresh)
+				.await
+				.unwrap();
+			let mut read = Box::pin(async {
+				if comments {
+					reddit_comments(path, false, oauth, &mut attempt, false, CommentsRequest::from_path(path).unwrap(), origin).await
+				} else {
+					reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin).await
+				}
+			});
+			assert!(tokio::time::timeout(Duration::from_millis(20), &mut read).await.is_err());
+			tokio::time::timeout(Duration::from_secs(2), received.notified()).await.unwrap();
+			assert!(matches!(upstream_guard(lane).graphql_quota.window, QuotaWindow::Known { available: 0, .. }));
+			assert!(upstream_guard(lane).try_admit_endpoint(Instant::now(), 0, api_endpoint_index(path)).is_err());
+			release.notify_one();
+			assert!(tokio::time::timeout(Duration::from_secs(2), &mut read).await.unwrap().is_err());
+			drop(read);
+			assert!(
+				upstream_guard(lane).try_admit_endpoint(Instant::now(), 0, api_endpoint_index(path)).is_err(),
+				"invalid JSON must not forget observed exhaustion"
+			);
+			server.abort();
+		}
+	});
+}
+
+#[test]
 #[sealed_test(env = [("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_MAX_CONCURRENCY","4"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
 fn test_graphql_pages_queued_followers_resume_while_second_operation_is_held() {
 	tokio::runtime::Runtime::new().unwrap().block_on(async {
