@@ -1,7 +1,7 @@
 use crate::{
 	client::{
 		claim_quota_rotation, client_for_oauth_profile, install_oauth_client, oauth_client, quota_rotation_still_needed, random_oauth_profile_except, record_oauth_send,
-		OauthTransportProfile, QuotaRotationTicket, OAUTH_BROWSER_PROFILES, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
+		OauthTransportProfile, QuotaBudget, QuotaRotationTicket, OAUTH_BROWSER_PROFILES, OAUTH_IS_ROLLING_OVER, TOR_OAUTH_IS_ROLLING_OVER,
 	},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 	reddit_lane::{RedditLane, RedditOrigin},
@@ -75,6 +75,8 @@ pub struct Oauth {
 	transport_profile: OauthTransportProfile,
 	pub(crate) generation: u64,
 	pub(crate) lane: RedditLane,
+	#[cfg(test)]
+	fixture_refresh: Option<Option<RedditOrigin>>,
 }
 
 struct RefreshedOauth {
@@ -99,7 +101,16 @@ impl Oauth {
 			transport_profile: OauthTransportProfile::Chrome145Android,
 			generation: 0,
 			lane,
+			fixture_refresh: Some(None),
 		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn request_fixture_with_refresh(lane: RedditLane, client: Arc<wreq::Client>, origin: RedditOrigin) -> Self {
+		let mut fixture = Self::request_fixture(lane, client);
+		fixture.fixture_refresh = Some(Some(origin));
+		fixture.headers_map.extend(fixture.backend.get_headers());
+		fixture
 	}
 
 	/// Create a new OAuth client
@@ -196,6 +207,8 @@ impl Oauth {
 			transport_profile,
 			generation: 0,
 			lane: backend.lane,
+			#[cfg(test)]
+			fixture_refresh: None,
 		})
 	}
 
@@ -208,6 +221,33 @@ impl Oauth {
 
 	async fn refreshed(&self, reason: RefreshReason) -> Result<RefreshedOauth, RefreshError> {
 		let (mut backend, fresh_identity) = self.refresh_backend(reason);
+		#[cfg(test)]
+		if let Some(origin) = self.fixture_refresh {
+			let origin = origin.ok_or_else(|| RefreshError::configuration("MobileSpoofAuth", "refresh disabled for request fixture".into()))?;
+			let response = backend
+				.authenticate_with_origins(&self.http_client, origin, origin, Duration::from_secs(2))
+				.await
+				.map_err(|error| RefreshError {
+					backend_name: "MobileSpoofAuth",
+					error,
+				})?;
+			let mut headers_map = backend.get_headers();
+			headers_map.insert("Authorization".into(), format!("Bearer {}", response.token));
+			headers_map.extend(response.additional_headers);
+			return Ok(RefreshedOauth {
+				oauth: Self {
+					headers_map,
+					http_client: self.http_client.clone(),
+					refresh_at: Instant::now() + sampled_token_refresh_delay(response.expires_in),
+					backend,
+					transport_profile: self.transport_profile,
+					generation: 0,
+					lane: self.lane,
+					fixture_refresh: Some(Some(origin)),
+				},
+				fresh_identity,
+			});
+		}
 		let (http_client, transport_profile) = self
 			.http_client_for_refresh(fresh_identity)
 			.map_err(|error| RefreshError::configuration("MobileSpoofAuth", error))?;
@@ -227,6 +267,14 @@ impl Oauth {
 			let transport_profile = random_oauth_profile_except(self.transport_profile);
 			client_for_oauth_profile(self.lane, transport_profile).map(|client| (client, transport_profile))
 		}
+	}
+
+	pub(crate) fn graphql_origin(&self) -> RedditOrigin {
+		#[cfg(test)]
+		if let Some(Some(origin)) = self.fixture_refresh {
+			return origin;
+		}
+		self.lane.graphql_origin()
 	}
 
 	pub fn user_agent(&self) -> &str {
@@ -533,11 +581,11 @@ impl Drop for RolloverGuard {
 	}
 }
 
-pub(crate) fn quota_rotation_in_progress(lane: RedditLane, generation: u64, quota_epoch: u64) -> bool {
+pub(crate) fn quota_rotation_in_progress(lane: RedditLane, budget: QuotaBudget, generation: u64, quota_epoch: u64) -> bool {
 	active_quota_rotation(lane)
 		.lock()
 		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.is_some_and(|ticket| ticket.lane == lane && ticket.generation == generation && ticket.quota_epoch == quota_epoch)
+		.is_some_and(|ticket| ticket.lane == lane && ticket.budget == budget && ticket.generation == generation && ticket.quota_epoch == quota_epoch)
 }
 
 pub(crate) async fn token_daemon(lane: RedditLane) {
@@ -572,13 +620,28 @@ pub(crate) async fn token_daemon(lane: RedditLane) {
 
 pub(crate) fn spawn_rate_limit_refresh(ticket: QuotaRotationTicket) -> bool {
 	let lane = ticket.lane;
+	#[cfg(test)]
+	if oauth_client(lane).is_some_and(|client| client.fixture_refresh == Some(None)) {
+		return false;
+	}
 	if refresh_backoff_remaining(lane).is_some() {
 		return false;
 	}
 
-	let Some(mut rollover_guard) = RolloverGuard::acquire(lane) else {
+	let Some(rollover_guard) = RolloverGuard::acquire(lane) else {
 		return false;
 	};
+	spawn_rate_limit_refresh_with_guard(ticket, rollover_guard)
+}
+
+#[cfg(test)]
+pub(crate) fn stage_quota_refresh_for_test(lane: RedditLane) -> Option<impl FnOnce(QuotaRotationTicket) -> bool> {
+	let guard = RolloverGuard::acquire(lane)?;
+	Some(move |ticket| spawn_rate_limit_refresh_with_guard(ticket, guard))
+}
+
+fn spawn_rate_limit_refresh_with_guard(ticket: QuotaRotationTicket, mut rollover_guard: RolloverGuard) -> bool {
+	let lane = ticket.lane;
 	rollover_guard.track_quota_rotation(ticket);
 
 	if refresh_backoff_remaining(lane).is_some() || !oauth_client(lane).is_some_and(|client| client.generation == ticket.generation) || !claim_quota_rotation(ticket) {
@@ -1259,6 +1322,7 @@ mod tests {
 	#[test]
 	fn test_active_quota_rotation_matches_generation_and_epoch() {
 		let ticket = QuotaRotationTicket {
+			budget: QuotaBudget::Rest,
 			lane: RedditLane::Direct,
 			generation: 12,
 			quota_epoch: 34,
@@ -1269,12 +1333,12 @@ mod tests {
 			let mut rollover_guard = RolloverGuard::acquire(RedditLane::Direct).unwrap();
 			rollover_guard.track_quota_rotation(ticket);
 			assert!(OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst));
-			assert!(quota_rotation_in_progress(RedditLane::Direct, 12, 34));
-			assert!(!quota_rotation_in_progress(RedditLane::Direct, 11, 34));
-			assert!(!quota_rotation_in_progress(RedditLane::Direct, 12, 35));
-			assert!(!quota_rotation_in_progress(RedditLane::Tor, 12, 34));
+			assert!(quota_rotation_in_progress(RedditLane::Direct, QuotaBudget::Rest, 12, 34));
+			assert!(!quota_rotation_in_progress(RedditLane::Direct, QuotaBudget::Rest, 11, 34));
+			assert!(!quota_rotation_in_progress(RedditLane::Direct, QuotaBudget::Rest, 12, 35));
+			assert!(!quota_rotation_in_progress(RedditLane::Tor, QuotaBudget::Rest, 12, 34));
 		}
-		assert!(!quota_rotation_in_progress(RedditLane::Direct, 12, 34));
+		assert!(!quota_rotation_in_progress(RedditLane::Direct, QuotaBudget::Rest, 12, 34));
 		assert!(!OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst));
 	}
 
@@ -1333,6 +1397,7 @@ mod tests {
 			transport_profile,
 			generation: 4,
 			lane: RedditLane::Direct,
+			fixture_refresh: Some(None),
 		};
 
 		let (stable, stable_profile) = oauth.http_client_for_refresh(false).unwrap();
@@ -1376,6 +1441,7 @@ mod tests {
 			transport_profile,
 			generation: 4,
 			lane: RedditLane::Direct,
+			fixture_refresh: Some(None),
 		};
 		assert_eq!(oauth.clone().refresh_at, oauth.refresh_at);
 
