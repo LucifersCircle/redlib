@@ -72,6 +72,7 @@ jobs:
           cargo test --locked --lib test_quota_discovery_
           cargo test --locked --lib test_quota_diagnostics_
           cargo test --locked --lib test_local_quota_retries_are_attempt_and_time_bounded
+          cargo test --locked --lib test_tor_graphql_quota_
           cargo test --locked --lib test_tor_quota_refresh_
           cargo test --locked --lib test_quota_notifications_do_not_consume_timed_retries
           cargo test --locked --lib test_quota_spillover_requires_current_direct_reserve_without_cooldown

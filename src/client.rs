@@ -31,6 +31,10 @@ use wreq::{header as wreq_header, Client as WreqClient, Method, Proxy, Response 
 use wreq_util::{Emulation, Platform, Profile};
 
 #[cfg(test)]
+#[path = "client_tor_graphql_quota_tests.rs"]
+mod tor_graphql_quota_tests;
+
+#[cfg(test)]
 #[path = "client_graphql_pages_tests.rs"]
 mod graphql_pages_tests;
 
@@ -181,7 +185,7 @@ struct AdmissionDenied {
 // Reddit's REST and GraphQL APIs report independent allowances for one token.
 // Endpoint controls and transport capacity stay on their original lane.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum QuotaBudget {
+pub(crate) enum QuotaBudget {
 	Rest,
 	Graphql,
 }
@@ -223,7 +227,9 @@ enum LaneRecoveryReason {
 	TransportFailure,
 	UpstreamCooldown(Duration),
 	QuotaCooldown(Duration),
+	TorGraphqlQuotaCooldown { delay: Duration, scope: QuotaRefreshWaitTicket },
 	TorQuotaRefreshWait(QuotaRefreshWaitTicket),
+	TorQuotaGenerationChanged,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -287,6 +293,7 @@ pub(crate) enum QuotaRotationMode {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct QuotaRotationTicket {
+	pub(crate) budget: QuotaBudget,
 	pub(crate) lane: RedditLane,
 	pub(crate) generation: u64,
 	pub(crate) quota_epoch: u64,
@@ -740,6 +747,10 @@ struct UpstreamGuard {
 	quota_rotation_armed: bool,
 	quota_wait_logged_epoch: Option<u64>,
 	emergency_rotation_claimed_epoch: Option<u64>,
+	graphql_rotation_armed: bool,
+	graphql_wait_logged_epoch: Option<u64>,
+	graphql_rotation_claimed_epoch: Option<u64>,
+	completed_quota_rotation: Option<(u64, u64)>,
 	transport: TransportHealth,
 	onion_transport: TransportHealth,
 	rate_limit_blocked_until: Option<Instant>,
@@ -765,6 +776,10 @@ impl UpstreamGuard {
 			quota_rotation_armed: false,
 			quota_wait_logged_epoch: None,
 			emergency_rotation_claimed_epoch: None,
+			graphql_rotation_armed: false,
+			graphql_wait_logged_epoch: None,
+			graphql_rotation_claimed_epoch: None,
+			completed_quota_rotation: None,
 			transport: TransportHealth::default(),
 			onion_transport: TransportHealth::default(),
 			rate_limit_blocked_until: None,
@@ -864,11 +879,12 @@ impl UpstreamGuard {
 		delay
 	}
 
-	fn known_quota_state(&self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
-		if generation != self.quota.generation {
+	fn known_quota_state_for_budget(&self, now: Instant, generation: u64, budget: QuotaBudget) -> Option<(u16, Duration)> {
+		let quota = self.quota_budget(budget);
+		if generation != quota.generation {
 			return None;
 		}
-		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+		let QuotaWindow::Known { available, reset_at } = quota.window else {
 			return None;
 		};
 		Some((available, reset_at.saturating_duration_since(now)))
@@ -882,23 +898,62 @@ impl UpstreamGuard {
 			self.quota_rotation_armed = false;
 			self.quota_wait_logged_epoch = None;
 			self.emergency_rotation_claimed_epoch = None;
+			self.graphql_rotation_armed = false;
+			self.graphql_wait_logged_epoch = None;
+			self.graphql_rotation_claimed_epoch = None;
+			self.completed_quota_rotation = None;
 			self.rate_limit_blocked_until = None;
 			self.graphql_rate_limit_blocked_until = None;
 			self.identity_installed_at = Instant::now();
 		}
 	}
 
-	fn quota_rotation_allowed(&self, now: Instant, generation: u64) -> bool {
-		if !self.quota_rotation_armed || generation != self.quota.generation {
+	fn quota_rotation_allowed_for_budget(&self, now: Instant, generation: u64, budget: QuotaBudget) -> bool {
+		if !self.rotation_armed_for_budget(budget)
+			|| generation != self.quota_budget(budget).generation
+			|| (budget == QuotaBudget::Graphql && self.rejected_oauth_generation == Some(generation))
+		{
 			return false;
 		}
-		if self.rate_limit_blocked_until.is_some_and(|deadline| deadline > now)
-			|| self.transport_health(0).blocked_until.is_some_and(|deadline| deadline > now)
+		// Only Tor GraphQL may renew its own exhausted allowance while that
+		// allowance is paused. Transport/session/edge failures never authorize it.
+		if (budget == QuotaBudget::Rest && self.rate_limit_deadline(budget).is_some_and(|deadline| deadline > now))
+			|| self.transport_health(budget.endpoint()).blocked_until.is_some_and(|deadline| deadline > now)
 			|| self.edges.iter().any(|edge| !matches!(edge.state, EdgeCircuitState::Closed))
 		{
 			return false;
 		}
-		true
+		budget == QuotaBudget::Rest || self.lane == RedditLane::Tor
+	}
+
+	fn rotation_armed_for_budget(&self, budget: QuotaBudget) -> bool {
+		match budget {
+			QuotaBudget::Rest => self.quota_rotation_armed,
+			QuotaBudget::Graphql => self.graphql_rotation_armed,
+		}
+	}
+
+	fn rotation_claimed_for_budget(&self, budget: QuotaBudget) -> Option<u64> {
+		match budget {
+			QuotaBudget::Rest => self.emergency_rotation_claimed_epoch,
+			QuotaBudget::Graphql => self.graphql_rotation_claimed_epoch,
+		}
+	}
+
+	fn completed_tor_graphql_rotation_matches(&self, attempt: &UpstreamAttempt) -> bool {
+		QuotaBudget::for_endpoint(attempt.edge.endpoint) == QuotaBudget::Graphql
+			&& self.completed_tor_graphql_rotation_matches_scope(QuotaRefreshWaitTicket {
+				budget: QuotaBudget::Graphql,
+				generation: attempt.generation,
+				quota_epoch: attempt.quota_epoch,
+			})
+	}
+
+	fn completed_tor_graphql_rotation_matches_scope(&self, scope: QuotaRefreshWaitTicket) -> bool {
+		self.lane == RedditLane::Tor
+			&& scope.budget == QuotaBudget::Graphql
+			&& self.graphql_quota.generation != scope.generation
+			&& self.completed_quota_rotation == Some((scope.generation, scope.quota_epoch))
 	}
 
 	fn low_rate_limit_threshold(&self) -> u16 {
@@ -916,8 +971,8 @@ impl UpstreamGuard {
 		}
 	}
 
-	fn quota_rotation_window_matches(&self, now: Instant, mode: QuotaRotationMode) -> bool {
-		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+	fn quota_rotation_window_matches_for_budget(&self, now: Instant, mode: QuotaRotationMode, budget: QuotaBudget) -> bool {
+		let QuotaWindow::Known { available, reset_at } = self.quota_budget(budget).window else {
 			return false;
 		};
 		let Some(remaining) = reset_at.checked_duration_since(now) else {
@@ -932,46 +987,55 @@ impl UpstreamGuard {
 		}
 	}
 
+	#[cfg(test)]
 	fn quota_rotation_candidate(&self, now: Instant, generation: u64, mode: QuotaRotationMode) -> Option<QuotaRotationTicket> {
-		if !self.quota_rotation_allowed(now, generation) || !self.quota_rotation_window_matches(now, mode) {
+		self.quota_rotation_candidate_for_budget(now, generation, mode, QuotaBudget::Rest)
+	}
+
+	fn quota_rotation_candidate_for_budget(&self, now: Instant, generation: u64, mode: QuotaRotationMode, budget: QuotaBudget) -> Option<QuotaRotationTicket> {
+		if !self.quota_rotation_allowed_for_budget(now, generation, budget) || !self.quota_rotation_window_matches_for_budget(now, mode, budget) {
 			return None;
 		}
-		if mode == QuotaRotationMode::Emergency && self.emergency_rotation_claimed_epoch == Some(self.quota.epoch) {
+		let quota_epoch = self.quota_budget(budget).epoch;
+		if (mode == QuotaRotationMode::Emergency || budget == QuotaBudget::Graphql) && self.rotation_claimed_for_budget(budget) == Some(quota_epoch) {
 			return None;
 		}
 		Some(QuotaRotationTicket {
 			lane: self.lane,
+			budget,
 			generation,
-			quota_epoch: self.quota.epoch,
+			quota_epoch,
 			mode,
 		})
 	}
 
 	fn claim_quota_rotation(&mut self, now: Instant, ticket: QuotaRotationTicket) -> bool {
-		if self.quota_rotation_candidate(now, ticket.generation, ticket.mode) != Some(ticket) {
+		if self.quota_rotation_candidate_for_budget(now, ticket.generation, ticket.mode, ticket.budget) != Some(ticket) {
 			return false;
 		}
-		if ticket.mode == QuotaRotationMode::Emergency {
-			self.emergency_rotation_claimed_epoch = Some(ticket.quota_epoch);
+		match ticket.budget {
+			QuotaBudget::Graphql => self.graphql_rotation_claimed_epoch = Some(ticket.quota_epoch),
+			QuotaBudget::Rest if ticket.mode == QuotaRotationMode::Emergency => self.emergency_rotation_claimed_epoch = Some(ticket.quota_epoch),
+			_ => {}
 		}
 		true
 	}
 
 	fn quota_rotation_still_needed(&self, now: Instant, ticket: QuotaRotationTicket) -> bool {
-		if ticket.quota_epoch != self.quota.epoch || !self.quota_rotation_allowed(now, ticket.generation) || !self.quota_rotation_window_matches(now, ticket.mode) {
-			return false;
-		}
-		ticket.mode != QuotaRotationMode::Emergency || self.emergency_rotation_claimed_epoch == Some(ticket.quota_epoch)
+		ticket.quota_epoch == self.quota_budget(ticket.budget).epoch
+			&& self.quota_rotation_allowed_for_budget(now, ticket.generation, ticket.budget)
+			&& self.quota_rotation_window_matches_for_budget(now, ticket.mode, ticket.budget)
+			&& ((ticket.mode != QuotaRotationMode::Emergency && ticket.budget == QuotaBudget::Rest) || self.rotation_claimed_for_budget(ticket.budget) == Some(ticket.quota_epoch))
 	}
 
 	fn completed_quota_rotation_still_valid(&self, now: Instant, ticket: QuotaRotationTicket) -> bool {
-		if ticket.quota_epoch != self.quota.epoch || !self.quota_rotation_allowed(now, ticket.generation) {
+		if ticket.quota_epoch != self.quota_budget(ticket.budget).epoch || !self.quota_rotation_allowed_for_budget(now, ticket.generation, ticket.budget) {
 			return false;
 		}
-		if ticket.mode == QuotaRotationMode::Emergency && self.emergency_rotation_claimed_epoch != Some(ticket.quota_epoch) {
+		if (ticket.mode == QuotaRotationMode::Emergency || ticket.budget == QuotaBudget::Graphql) && self.rotation_claimed_for_budget(ticket.budget) != Some(ticket.quota_epoch) {
 			return false;
 		}
-		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+		let QuotaWindow::Known { available, reset_at } = self.quota_budget(ticket.budget).window else {
 			return false;
 		};
 		if now >= reset_at {
@@ -992,18 +1056,31 @@ impl UpstreamGuard {
 			&& self.quota_budget(ticket.budget).reserve_exhausted(now)
 	}
 
+	#[cfg(test)]
 	fn take_short_reset_notice(&mut self, now: Instant, generation: u64) -> Option<(u16, Duration)> {
-		if !self.quota_rotation_armed || generation != self.quota.generation || self.quota_wait_logged_epoch == Some(self.quota.epoch) {
+		self.take_short_reset_notice_for_budget(now, generation, QuotaBudget::Rest)
+	}
+
+	fn take_short_reset_notice_for_budget(&mut self, now: Instant, generation: u64, budget: QuotaBudget) -> Option<(u16, Duration)> {
+		let quota = self.quota_budget(budget);
+		let logged_epoch = match budget {
+			QuotaBudget::Rest => self.quota_wait_logged_epoch,
+			QuotaBudget::Graphql => self.graphql_wait_logged_epoch,
+		};
+		if !self.rotation_armed_for_budget(budget) || generation != quota.generation || logged_epoch == Some(quota.epoch) {
 			return None;
 		}
-		let QuotaWindow::Known { available, reset_at } = self.quota.window else {
+		let QuotaWindow::Known { available, reset_at } = quota.window else {
 			return None;
 		};
 		let reset_remaining = reset_at.saturating_duration_since(now);
 		if available >= self.low_rate_limit_threshold() || reset_remaining > self.quota_rotation_min_reset_remaining(QuotaRotationMode::Proactive) {
 			return None;
 		}
-		self.quota_wait_logged_epoch = Some(self.quota.epoch);
+		match budget {
+			QuotaBudget::Rest => self.quota_wait_logged_epoch = Some(quota.epoch),
+			QuotaBudget::Graphql => self.graphql_wait_logged_epoch = Some(quota.epoch),
+		};
 		Some((available, reset_remaining))
 	}
 
@@ -1101,8 +1178,12 @@ impl UpstreamGuard {
 		}
 		let budget = QuotaBudget::for_endpoint(attempt.edge.endpoint);
 		let applied = self.quota_budget_mut(budget).reconcile(now, attempt, remaining, reset, quota_exhausted);
-		if budget == QuotaBudget::Rest && applied && !quota_exhausted && remaining.is_some_and(|remaining| remaining >= self.low_rate_limit_threshold()) {
-			self.quota_rotation_armed = true;
+		if applied && !quota_exhausted && remaining.is_some_and(|remaining| remaining >= self.low_rate_limit_threshold()) {
+			match budget {
+				QuotaBudget::Rest => self.quota_rotation_armed = true,
+				QuotaBudget::Graphql if self.lane == RedditLane::Tor => self.graphql_rotation_armed = true,
+				_ => {}
+			}
 		}
 		attempt.quota_reconciled = true;
 	}
@@ -1440,6 +1521,7 @@ enum ApiRequestError {
 		message: String,
 		ticket: QuotaRefreshWaitTicket,
 	},
+	TorQuotaGenerationChanged,
 	Terminal {
 		message: String,
 		session_unavailable: bool,
@@ -1560,7 +1642,13 @@ pub(crate) fn install_oauth_client(oauth: Oauth, fresh_identity: bool, expected_
 			TOR_OAUTH_CLIENT.swap(Some(oauth.into()));
 		}
 	}
+	let replay_scope = expected_rotation
+		.filter(|_| fresh_identity && lane == RedditLane::Tor)
+		.map(|ticket| (ticket.generation, guard.graphql_quota.epoch));
 	guard.install_oauth_generation(generation, fresh_identity);
+	if let Some(scope) = replay_scope {
+		guard.completed_quota_rotation = Some(scope);
+	}
 	drop(guard);
 	quota_notify(lane).notify_waiters();
 	true
@@ -1575,14 +1663,15 @@ pub(crate) fn quota_rotation_still_needed(ticket: QuotaRotationTicket) -> bool {
 }
 
 fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str) {
-	if QuotaBudget::for_endpoint(api_endpoint_index(path)) == QuotaBudget::Graphql {
-		return;
-	}
+	let budget = QuotaBudget::for_endpoint(api_endpoint_index(path));
 	let now = Instant::now();
 	let mut guard = upstream_guard(lane);
-	let rotation_ticket = guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Proactive);
-	let effective_quota = guard.known_quota_state(now, generation);
-	let short_reset = rotation_ticket.is_none().then(|| guard.take_short_reset_notice(now, generation)).flatten();
+	let rotation_ticket = guard.quota_rotation_candidate_for_budget(now, generation, QuotaRotationMode::Proactive, budget);
+	let effective_quota = guard.known_quota_state_for_budget(now, generation, budget);
+	let short_reset = rotation_ticket
+		.is_none()
+		.then(|| guard.take_short_reset_notice_for_budget(now, generation, budget))
+		.flatten();
 	drop(guard);
 
 	if let Some((available, reset_remaining)) = short_reset {
@@ -1972,6 +2061,7 @@ struct BeginAttemptDenied {
 	edge_deferred: bool,
 	quota_spillover: Option<QuotaSpilloverTicket>,
 	tor_quota_refresh: Option<QuotaRefreshWaitTicket>,
+	quota_refresh_scope: Option<QuotaRefreshWaitTicket>,
 }
 
 impl BeginAttemptDenied {
@@ -1984,7 +2074,12 @@ impl BeginAttemptDenied {
 			} else if admission.reason == CooldownReason::UpstreamFailures {
 				LaneRecoveryReason::UpstreamCooldown(admission.delay)
 			} else if admission.reason == CooldownReason::RateLimit && (lane == RedditLane::Tor || admission.source == "active_cooldown") && self.tor_quota_refresh.is_none() {
-				LaneRecoveryReason::QuotaCooldown(admission.delay)
+				self
+					.quota_refresh_scope
+					.map_or(LaneRecoveryReason::QuotaCooldown(admission.delay), |scope| LaneRecoveryReason::TorGraphqlQuotaCooldown {
+						delay: admission.delay,
+						scope,
+					})
 			} else {
 				LaneRecoveryReason::None
 			}
@@ -1994,6 +2089,7 @@ impl BeginAttemptDenied {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct QuotaRefreshWaitTicket {
+	budget: QuotaBudget,
 	generation: u64,
 	quota_epoch: u64,
 }
@@ -2009,6 +2105,19 @@ struct TorQuotaRefreshRetryState {
 }
 
 impl TorQuotaRefreshRetryState {
+	fn claim_generation_replay(&mut self, lane: RedditLane, now: Instant) -> bool {
+		if lane != RedditLane::Tor
+			|| self.redirect_replayed
+			|| self.started.is_some_and(|started| now.saturating_duration_since(started) >= TOR_QUOTA_REFRESH_RETRY_BUDGET)
+			|| self.timed_retries >= MAX_TOR_QUOTA_REFRESH_RETRIES
+		{
+			return false;
+		}
+		self.started.get_or_insert(now);
+		self.redirect_replayed = true;
+		true
+	}
+
 	fn claim_redirect_replay(&mut self, lane: RedditLane, ticket: QuotaRefreshWaitTicket, now: Instant) -> bool {
 		if lane != RedditLane::Tor
 			|| self.redirect_replayed
@@ -2058,12 +2167,16 @@ fn local_quota_retry_delay(denied: &BeginAttemptDenied, retry_count: u8, elapsed
 }
 
 fn matching_tor_quota_refresh_wait(lane: RedditLane, owner: &mut Option<QuotaRefreshWaitTicket>, denied: &BeginAttemptDenied) -> bool {
-	if lane != RedditLane::Tor || !denied.admission.is_some_and(|admission| admission.source == "quota_reserve" && admission.reserve_exhausted) {
-		return false;
-	}
 	let Some(ticket) = denied.tor_quota_refresh else {
 		return false;
 	};
+	if lane != RedditLane::Tor
+		|| !denied.admission.is_some_and(|admission| {
+			(admission.source == "quota_reserve" && admission.reserve_exhausted)
+				|| (ticket.budget == QuotaBudget::Graphql && admission.source == "active_cooldown" && admission.reason == CooldownReason::RateLimit)
+		}) {
+		return false;
+	}
 	// Never restart the budget or adopt another identity's refresh mid-wait.
 	*owner.get_or_insert(ticket) == ticket
 }
@@ -2102,13 +2215,14 @@ fn local_admission_message(denial: AdmissionDenied, short_refresh_retry: bool) -
 fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endpoint: usize) -> Result<(Arc<Oauth>, UpstreamAttempt), BeginAttemptDenied> {
 	let mut guard = upstream_guard(lane);
 	let budget = QuotaBudget::for_endpoint(endpoint);
-	let allow_quota_refresh = allow_quota_refresh && budget == QuotaBudget::Rest;
+	let allow_quota_refresh = allow_quota_refresh && (budget == QuotaBudget::Rest || lane == RedditLane::Tor);
 	let oauth_client = oauth_client(lane).ok_or_else(|| BeginAttemptDenied {
 		admission: None,
 		message: oauth_startup_error(),
 		edge_deferred: false,
 		quota_spillover: None,
 		tor_quota_refresh: None,
+		quota_refresh_scope: None,
 	})?;
 	let generation = oauth_client.generation;
 	if guard.rejected_oauth_generation == Some(generation) {
@@ -2118,22 +2232,29 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 			edge_deferred: false,
 			quota_spillover: None,
 			tor_quota_refresh: None,
+			quota_refresh_scope: None,
 		});
 	}
 	let now = Instant::now();
 	let result = guard.try_admit_endpoint(now, generation, endpoint);
-	let denied_quota_epoch = result.as_ref().err().filter(|denial| denial.reserve_exhausted).map(|_| guard.quota_budget(budget).epoch);
+	let denied_quota_epoch = result
+		.as_ref()
+		.err()
+		.filter(|denial| {
+			denial.reserve_exhausted
+				|| (lane == RedditLane::Tor && budget == QuotaBudget::Graphql && denial.reason == CooldownReason::RateLimit && denial.source == "active_cooldown")
+		})
+		.map(|_| guard.quota_budget(budget).epoch);
 	// Capture ownership with the denied generation still locked. A refresh can
 	// install its replacement between dropping this guard and formatting denial.
-	let refresh_was_in_progress =
-		budget == QuotaBudget::Rest && lane == RedditLane::Tor && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(lane, generation, quota_epoch));
+	let refresh_was_in_progress = lane == RedditLane::Tor && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(lane, budget, generation, quota_epoch));
 	let emergency_ticket = allow_quota_refresh
 		.then(|| {
 			result
 				.as_ref()
 				.err()
-				.filter(|denial| denial.reserve_exhausted)
-				.and_then(|_| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency))
+				.filter(|_| denied_quota_epoch.is_some())
+				.and_then(|_| guard.quota_rotation_candidate_for_budget(now, generation, QuotaRotationMode::Emergency, budget))
 		})
 		.flatten();
 	drop(guard);
@@ -2141,7 +2262,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 		let emergency_started = emergency_ticket
 			.filter(|_| is_current_oauth_generation(lane, generation))
 			.is_some_and(spawn_rate_limit_refresh);
-		let matching_refresh_in_progress = budget == QuotaBudget::Rest && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(lane, generation, quota_epoch));
+		let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(lane, budget, generation, quota_epoch));
 		let short_refresh_retry = emergency_started || refresh_was_in_progress || matching_refresh_in_progress;
 		if emergency_started {
 			let reset_remaining = denial.delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
@@ -2162,7 +2283,10 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 			quota_spillover,
 			tor_quota_refresh: denied_quota_epoch
 				.filter(|_| lane == RedditLane::Tor && short_refresh_retry)
-				.map(|quota_epoch| QuotaRefreshWaitTicket { generation, quota_epoch }),
+				.map(|quota_epoch| QuotaRefreshWaitTicket { budget, generation, quota_epoch }),
+			quota_refresh_scope: denied_quota_epoch
+				.filter(|_| lane == RedditLane::Tor && budget == QuotaBudget::Graphql)
+				.map(|quota_epoch| QuotaRefreshWaitTicket { budget, generation, quota_epoch }),
 		}
 	})
 }
@@ -2180,7 +2304,11 @@ async fn begin_upstream_attempt(
 	loop {
 		let quota_changed = quota_notify(lane).notified();
 		let (permit, probe) = acquire_attempt_capacity(lane, endpoint, mode, capacity_deadline).await?;
-		match begin_upstream_attempt_once(lane, mode == AdmissionRetryMode::Bounded && tor_refresh.owner.is_none(), endpoint) {
+		match begin_upstream_attempt_once(
+			lane,
+			mode == AdmissionRetryMode::Bounded && tor_refresh.owner.is_none() && !tor_refresh.redirect_replayed,
+			endpoint,
+		) {
 			Ok(attempt) => {
 				if retry_count > 0 {
 					info!(
@@ -2248,6 +2376,7 @@ async fn acquire_attempt_capacity(
 		edge_deferred: false,
 		quota_spillover: None,
 		tor_quota_refresh: None,
+		quota_refresh_scope: None,
 		admission: Some(AdmissionDenied {
 			delay: TRANSPORT_RETRY_BASE_DELAY,
 			reason: CooldownReason::UpstreamFailures,
@@ -2391,6 +2520,34 @@ fn confirm_headerless_quota(attempt: &UpstreamAttempt) {
 	quota_notify(lane).notify_waiters();
 }
 
+fn start_or_join_tor_graphql_quota_refresh(attempt: &UpstreamAttempt, allow_launch: bool) -> Option<QuotaRefreshWaitTicket> {
+	if attempt.lane != RedditLane::Tor || QuotaBudget::for_endpoint(attempt.edge.endpoint) != QuotaBudget::Graphql {
+		return None;
+	}
+	let guard = upstream_guard(attempt.lane);
+	let budget = QuotaBudget::Graphql;
+	let quota = guard.quota_budget(budget);
+	if quota.generation != attempt.generation || quota.epoch != attempt.quota_epoch {
+		return None;
+	}
+	let ticket = QuotaRefreshWaitTicket {
+		budget,
+		generation: attempt.generation,
+		quota_epoch: attempt.quota_epoch,
+	};
+	let in_progress = quota_rotation_in_progress(attempt.lane, budget, ticket.generation, ticket.quota_epoch);
+	let candidate = allow_launch
+		.then(|| guard.quota_rotation_candidate_for_budget(Instant::now(), ticket.generation, QuotaRotationMode::Emergency, budget))
+		.flatten();
+	drop(guard);
+	let launched = candidate.is_some_and(spawn_rate_limit_refresh);
+	(launched || in_progress || quota_rotation_in_progress(attempt.lane, budget, ticket.generation, ticket.quota_epoch)).then_some(ticket)
+}
+
+fn completed_tor_graphql_rotation_matches(attempt: &UpstreamAttempt) -> bool {
+	upstream_guard(attempt.lane).completed_tor_graphql_rotation_matches(attempt)
+}
+
 fn reserve_redirect_hop(
 	attempt: &mut UpstreamAttempt,
 	generation: u64,
@@ -2401,7 +2558,10 @@ fn reserve_redirect_hop(
 	let now = Instant::now();
 	let mut guard = upstream_guard(attempt.lane);
 	let budget = QuotaBudget::for_endpoint(attempt.edge.endpoint);
-	let allow_quota_refresh = allow_quota_refresh && budget == QuotaBudget::Rest;
+	let allow_quota_refresh = allow_quota_refresh && (budget == QuotaBudget::Rest || attempt.lane == RedditLane::Tor);
+	if guard.completed_tor_graphql_rotation_matches(attempt) {
+		return Err(ApiRequestError::TorQuotaGenerationChanged);
+	}
 	let continue_headerless_discovery = attempt.discovery_probe && remaining.is_none();
 	guard.reconcile_quota(now, attempt, remaining, reset, false);
 	if continue_headerless_discovery {
@@ -2409,6 +2569,17 @@ fn reserve_redirect_hop(
 	}
 	if let Some((delay, reason)) = guard.redirect_cooldown(now, attempt.edge) {
 		drop(guard);
+		if reason == CooldownReason::RateLimit {
+			if let Some(ticket) = start_or_join_tor_graphql_quota_refresh(attempt, allow_quota_refresh) {
+				return Err(ApiRequestError::TorQuotaRefreshWait {
+					message: "Refreshing the anonymous Reddit session".into(),
+					ticket,
+				});
+			}
+			if completed_tor_graphql_rotation_matches(attempt) {
+				return Err(ApiRequestError::TorQuotaGenerationChanged);
+			}
+		}
 		record_local_denial(reason);
 		return Err(ApiRequestError::deferred(
 			format!("{}. Retry in {} seconds", reason.message(), retry_after_seconds(delay)),
@@ -2430,7 +2601,7 @@ fn reserve_redirect_hop(
 					},
 					Some(guard.quota_budget(budget).epoch),
 					allow_quota_refresh
-						.then(|| guard.quota_rotation_candidate(now, generation, QuotaRotationMode::Emergency))
+						.then(|| guard.quota_rotation_candidate_for_budget(now, generation, QuotaRotationMode::Emergency, budget))
 						.flatten(),
 				),
 				QuotaReserveError::DiscoveryPending => (
@@ -2456,15 +2627,13 @@ fn reserve_redirect_hop(
 					None,
 				),
 			};
-			let refresh_was_in_progress = budget == QuotaBudget::Rest
-				&& attempt.lane == RedditLane::Tor
-				&& denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
+			let refresh_was_in_progress =
+				attempt.lane == RedditLane::Tor && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, budget, generation, quota_epoch));
 			drop(guard);
 			let emergency_started = emergency_ticket
 				.filter(|_| is_current_oauth_generation(attempt.lane, generation))
 				.is_some_and(spawn_rate_limit_refresh);
-			let matching_refresh_in_progress =
-				budget == QuotaBudget::Rest && denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, generation, quota_epoch));
+			let matching_refresh_in_progress = denied_quota_epoch.is_some_and(|quota_epoch| quota_rotation_in_progress(attempt.lane, budget, generation, quota_epoch));
 			let short_refresh_retry = emergency_started || refresh_was_in_progress || matching_refresh_in_progress;
 			if emergency_started {
 				let reset_remaining = denial.delay.saturating_sub(RATE_LIMIT_COOLDOWN_MARGIN);
@@ -2478,7 +2647,7 @@ fn reserve_redirect_hop(
 			if let Some(quota_epoch) = denied_quota_epoch.filter(|_| attempt.lane == RedditLane::Tor && short_refresh_retry) {
 				return Err(ApiRequestError::TorQuotaRefreshWait {
 					message,
-					ticket: QuotaRefreshWaitTicket { generation, quota_epoch },
+					ticket: QuotaRefreshWaitTicket { budget, generation, quota_epoch },
 				});
 			}
 			return Err(ApiRequestError::deferred(message, CooldownReason::RateLimit, denial.delay));
@@ -3302,11 +3471,12 @@ async fn reddit_get(
 	allow_quota_refresh: bool,
 ) -> Result<RedditReadResponse, ApiRequestError> {
 	if let Some(request) = CommentsRequest::from_path(&path) {
-		let origin = attempt.lane.graphql_origin();
+		let origin = oauth_client.graphql_origin();
 		return reddit_comments(&path, quarantine, oauth_client, attempt, allow_quota_refresh, request, origin).await;
 	}
 	if let Some(request) = PageRequest::from_path(&path, quarantine) {
-		return reddit_pages(&path, quarantine, oauth_client, attempt, allow_quota_refresh, request, attempt.lane.graphql_origin()).await;
+		let origin = oauth_client.graphql_origin();
+		return reddit_pages(&path, quarantine, oauth_client, attempt, allow_quota_refresh, request, origin).await;
 	}
 	let lane = attempt.lane;
 	let origin = lane.api_origin();
@@ -4077,6 +4247,24 @@ fn tor_redirect_refresh_recovery(lane: RedditLane, mode: AdmissionRetryMode, quo
 	}
 }
 
+async fn wait_for_confirmed_quota_install(changed: &Notify, deadline: tokio::time::Instant, completed: impl Fn() -> bool) -> bool {
+	loop {
+		let notified = changed.notified();
+		tokio::pin!(notified);
+		notified.as_mut().enable();
+		if completed() {
+			return true;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			return false;
+		}
+		tokio::select! {
+			_ = &mut notified => {},
+			_ = tokio::time::sleep_until(deadline) => return false,
+		}
+	}
+}
+
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
 	let initial_timeout = initial_lane_request_timeout(lane, configured_primary_lane(), lane_availability(RedditLane::Direct, Instant::now(), &path));
 	let mut budget = RecoveryBudget::new(tokio::time::Instant::now(), CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + initial_timeout);
@@ -4117,6 +4305,13 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 		}
 
 		let delay = match recovery_reason {
+			LaneRecoveryReason::TorQuotaGenerationChanged => {
+				if !tor_refresh.claim_generation_replay(lane, Instant::now()) {
+					return (result, tor_retry_reason);
+				}
+				info!("Replaying one complete Reddit read after confirmed Tor quota renewal: endpoint={}", endpoint_class(&path));
+				continue;
+			}
 			LaneRecoveryReason::TorQuotaRefreshWait(ticket) => {
 				if !tor_refresh.claim_redirect_replay(lane, ticket, Instant::now()) {
 					return (result, tor_retry_reason);
@@ -4142,6 +4337,19 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 					delay.as_millis(),
 				);
 				delay
+			}
+			LaneRecoveryReason::TorGraphqlQuotaCooldown { delay, scope } => {
+				let elapsed = budget.begin(tokio::time::Instant::now());
+				let Some(delay) = upstream_cooldown_retry_delay(delay, cooldown_waits, elapsed) else {
+					return (result, tor_retry_reason);
+				};
+				cooldown_waits = cooldown_waits.saturating_add(1);
+				let deadline = tokio::time::Instant::now() + delay;
+				let installed = wait_for_confirmed_quota_install(quota_notify(lane), deadline, || upstream_guard(lane).completed_tor_graphql_rotation_matches_scope(scope)).await;
+				if installed && !tor_refresh.claim_generation_replay(lane, Instant::now()) {
+					return (result, tor_retry_reason);
+				}
+				continue;
 			}
 			LaneRecoveryReason::UpstreamCooldown(delay) | LaneRecoveryReason::QuotaCooldown(delay) => {
 				let elapsed = budget.begin(tokio::time::Instant::now());
@@ -4273,7 +4481,11 @@ async fn json_uncached_on_lane_with_options(
 	let timeout_path = path.clone();
 	let mut retry_reason = TorRetryReason::None;
 	let mut recovery_reason = LaneRecoveryReason::None;
-	let allow_quota_refresh = quota_refresh_launch_allowed(admission_mode, quota_spillover_ticket.is_some(), tor_refresh.owner.is_some());
+	let allow_quota_refresh = quota_refresh_launch_allowed(
+		admission_mode,
+		quota_spillover_ticket.is_some(),
+		tor_refresh.owner.is_some() || tor_refresh.redirect_replayed,
+	);
 
 	// Fetch the url...
 	let result = tokio::time::timeout_at(request_deadline, async {
@@ -4321,7 +4533,7 @@ async fn json_uncached_on_lane_with_options(
 				let quota_before_response = upstream_guard(lane).quota_budget(quota_budget).snapshot(Instant::now());
 				reconcile_quota_headers(&mut upstream_attempt, graphql.is_some() && status.is_success(), parsed_remaining, reset_duration,
 					matches!(throttle_kind, Some(ThrottleKind::Quota)));
-				if throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
+				if quota_budget == QuotaBudget::Rest && throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
 					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path);
 				}
 				trace!(
@@ -4351,6 +4563,8 @@ async fn json_uncached_on_lane_with_options(
 						let (delay, response_is_current) = block_for_rate_limit(lane, request_generation, retry_after, reset, api_endpoint_index(&path));
 						if response_is_current {
 							recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
+						} else if completed_tor_graphql_rotation_matches(&upstream_attempt) {
+							recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged;
 						}
 						warn!(
 							"Reddit quota response: lane={} budget={} status={} endpoint={} request_id={} request_generation={} request_epoch={} observed_generation={} observed_epoch={} current_generation={response_is_current} observed_epoch_matches={} discovery_probe={} remaining={:?} remaining_present={} used={:?} used_present={} reset_seconds={:?} reset_present={} retry_after_seconds={:?} retry_after_present={} cooldown_milliseconds={} admission_after_reservation=[{}] before_response_reconcile=[{}]",
@@ -4420,6 +4634,7 @@ async fn json_uncached_on_lane_with_options(
 
 				if auth_rejected {
 					if !is_current_oauth_generation(lane, request_generation) {
+						if completed_tor_graphql_rotation_matches(&upstream_attempt) { recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged; }
 						return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
 					}
 					if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Tor {
@@ -4461,8 +4676,12 @@ async fn json_uncached_on_lane_with_options(
 								let json = if let Some((post, request)) = graphql {
 									let body_error = crate::reddit_graphql::response_error(&json).map(|error| error.kind);
 									if body_error == Some(GraphqlErrorKind::Session) {
-										start_rejected_session_refresh(lane, request_generation);
-										retry_reason = TorRetryReason::SessionUnavailable;
+										if completed_tor_graphql_rotation_matches(&upstream_attempt) {
+											recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged;
+										} else {
+											start_rejected_session_refresh(lane, request_generation);
+											retry_reason = TorRetryReason::SessionUnavailable;
+										}
 									}
 									if let Some(delay) = reconcile_graphql_quota(&mut upstream_attempt, parsed_remaining, reset_duration, body_error, retry_after, reset) {
 										recovery_reason = LaneRecoveryReason::QuotaCooldown(delay);
@@ -4495,6 +4714,7 @@ async fn json_uncached_on_lane_with_options(
 									// OAuth token has expired; http status 401
 									if json["message"] == "Unauthorized" {
 										if !is_current_oauth_generation(lane, request_generation) {
+											if completed_tor_graphql_rotation_matches(&upstream_attempt) { recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged; }
 											return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
 										}
 										error!("Forcing a token refresh");
@@ -4537,6 +4757,7 @@ async fn json_uncached_on_lane_with_options(
 									Err(format!("Reddit returned an unexpected response status: {status}"))
 								} else {
 									record_upstream_success(&mut upstream_attempt, &path);
+									if quota_budget == QuotaBudget::Graphql && allow_quota_refresh { maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path); }
 									Ok(json)
 								}
 							}
@@ -4570,12 +4791,18 @@ async fn json_uncached_on_lane_with_options(
 				}
 				Err(message)
 			}
+			Err(ApiRequestError::TorQuotaGenerationChanged) => {
+				if lane == RedditLane::Tor && admission_mode == AdmissionRetryMode::Bounded && quota_spillover_ticket.is_none() { recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged; }
+				Err("Anonymous Reddit session renewed during this read".into())
+			}
 			Err(ApiRequestError::TorQuotaRefreshWait { message, ticket }) => {
 				recovery_reason = tor_redirect_refresh_recovery(lane, admission_mode, quota_spillover_ticket.is_some(), ticket);
 				Err(message)
 			}
 			Err(ApiRequestError::Terminal { message, session_unavailable }) => {
-				if session_unavailable {
+				if session_unavailable && completed_tor_graphql_rotation_matches(&upstream_attempt) {
+					recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged;
+				} else if session_unavailable {
 					start_rejected_session_refresh(lane, request_generation);
 					retry_reason = TorRetryReason::SessionUnavailable;
 				}
@@ -4604,6 +4831,23 @@ async fn json_uncached_on_lane_with_options(
 			Err(format!("Reddit API request timed out after {} seconds", request_timeout.as_secs()))
 		}
 	};
+	if matches!(recovery_reason, LaneRecoveryReason::QuotaCooldown(_)) && admission_mode == AdmissionRetryMode::Bounded && quota_spillover_ticket.is_none() {
+		if let Some(ticket) = start_or_join_tor_graphql_quota_refresh(&upstream_attempt, allow_quota_refresh) {
+			recovery_reason = LaneRecoveryReason::TorQuotaRefreshWait(ticket);
+		} else if completed_tor_graphql_rotation_matches(&upstream_attempt) {
+			recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged;
+		} else if lane == RedditLane::Tor && QuotaBudget::for_endpoint(upstream_attempt.edge.endpoint) == QuotaBudget::Graphql {
+			let LaneRecoveryReason::QuotaCooldown(delay) = recovery_reason else { unreachable!() };
+			recovery_reason = LaneRecoveryReason::TorGraphqlQuotaCooldown {
+				delay,
+				scope: QuotaRefreshWaitTicket {
+					budget: QuotaBudget::Graphql,
+					generation: upstream_attempt.generation,
+					quota_epoch: upstream_attempt.quota_epoch,
+				},
+			};
+		}
+	}
 	(result, retry_reason, recovery_reason)
 }
 
@@ -5995,6 +6239,24 @@ mod tests {
 	}
 
 	#[test]
+	fn test_tor_graphql_quota_healthy_discovery_arms_renewal() {
+		let now = Instant::now();
+		let mut guard = UpstreamGuard::new(RedditLane::Tor);
+		guard.install_oauth_generation(7, true);
+		let mut read = guard.try_admit_endpoint(now, 7, 4).unwrap();
+		guard.reconcile_quota(now, &mut read, Some(100), Some(Duration::from_secs(60)), false);
+		read.complete();
+		assert!(
+			guard.rotation_armed_for_budget(QuotaBudget::Graphql),
+			"a healthy Tor GraphQL allowance must arm anonymous quota renewal"
+		);
+		assert!(
+			!guard.rotation_armed_for_budget(QuotaBudget::Rest),
+			"GraphQL discovery must not arm an unobserved REST budget"
+		);
+	}
+
+	#[test]
 	fn test_parse_rate_limit_count_rejects_invalid_values() {
 		assert_eq!(parse_rate_limit_count(Some("9.4")), Some(9));
 		assert_eq!(parse_rate_limit_count(Some("9.6")), Some(9));
@@ -6125,6 +6387,7 @@ mod tests {
 			edge_deferred: false,
 			quota_spillover: None,
 			tor_quota_refresh: None,
+			quota_refresh_scope: None,
 		};
 		assert_eq!(
 			local_quota_retry_delay(&retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded, false),
@@ -6152,6 +6415,7 @@ mod tests {
 			edge_deferred: true,
 			quota_spillover: None,
 			tor_quota_refresh: None,
+			quota_refresh_scope: None,
 		};
 		assert_eq!(local_quota_retry_delay(&not_retryable, 0, Duration::ZERO, AdmissionRetryMode::Bounded, false), None);
 		assert_eq!(
@@ -6162,7 +6426,11 @@ mod tests {
 
 	#[test]
 	fn test_tor_quota_refresh_wait_is_scoped_and_bounded() {
-		let ticket = QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 };
+		let ticket = QuotaRefreshWaitTicket {
+			budget: QuotaBudget::Rest,
+			generation: 7,
+			quota_epoch: 4,
+		};
 		let mut denied = BeginAttemptDenied {
 			admission: Some(AdmissionDenied {
 				delay: Duration::from_secs(60),
@@ -6175,6 +6443,7 @@ mod tests {
 			edge_deferred: false,
 			quota_spillover: None,
 			tor_quota_refresh: Some(ticket),
+			quota_refresh_scope: None,
 		};
 		let mut owner = None;
 		assert!(!matching_tor_quota_refresh_wait(RedditLane::Direct, &mut owner, &denied));
@@ -6236,7 +6505,12 @@ mod tests {
 			message: "refreshing".to_string(),
 			edge_deferred: false,
 			quota_spillover: None,
-			tor_quota_refresh: Some(QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 }),
+			tor_quota_refresh: Some(QuotaRefreshWaitTicket {
+				budget: QuotaBudget::Rest,
+				generation: 7,
+				quota_epoch: 4,
+			}),
+			quota_refresh_scope: None,
 		};
 		let started = Instant::now();
 		let mut owner = None;
@@ -6260,7 +6534,11 @@ mod tests {
 	#[test]
 	fn test_tor_quota_refresh_redirect_replay_is_once_and_lane_scoped() {
 		let now = Instant::now();
-		let ticket = QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 };
+		let ticket = QuotaRefreshWaitTicket {
+			budget: QuotaBudget::Rest,
+			generation: 7,
+			quota_epoch: 4,
+		};
 		let mut state = TorQuotaRefreshRetryState::default();
 		assert!(!state.claim_redirect_replay(RedditLane::Direct, ticket, now));
 		assert_eq!(state.owner, None);
@@ -6302,7 +6580,11 @@ mod tests {
 	#[test]
 	fn test_tor_quota_refresh_redirect_replay_preserves_owner_and_budget() {
 		let started = Instant::now();
-		let ticket = QuotaRefreshWaitTicket { generation: 7, quota_epoch: 4 };
+		let ticket = QuotaRefreshWaitTicket {
+			budget: QuotaBudget::Rest,
+			generation: 7,
+			quota_epoch: 4,
+		};
 		let mut state = TorQuotaRefreshRetryState {
 			owner: Some(ticket),
 			started: Some(started),
@@ -6782,6 +7064,7 @@ mod tests {
 			edge_deferred: false,
 			quota_spillover: None,
 			tor_quota_refresh: None,
+			quota_refresh_scope: None,
 		};
 		for lane in [RedditLane::Direct, RedditLane::Tor] {
 			assert_eq!(denied.recovery_reason(lane), LaneRecoveryReason::None);
@@ -6790,7 +7073,11 @@ mod tests {
 		assert_eq!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::UpstreamCooldown(TRANSPORT_RETRY_BASE_DELAY));
 		denied.admission.as_mut().unwrap().reason = CooldownReason::RateLimit;
 		assert_eq!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::QuotaCooldown(TRANSPORT_RETRY_BASE_DELAY));
-		denied.tor_quota_refresh = Some(QuotaRefreshWaitTicket { generation: 7, quota_epoch: 1 });
+		denied.tor_quota_refresh = Some(QuotaRefreshWaitTicket {
+			budget: QuotaBudget::Rest,
+			generation: 7,
+			quota_epoch: 1,
+		});
 		assert_eq!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::None);
 	}
 
@@ -7000,6 +7287,7 @@ mod tests {
 		assert_eq!(
 			guard.quota_rotation_candidate(now, 7, QuotaRotationMode::Proactive),
 			Some(QuotaRotationTicket {
+				budget: QuotaBudget::Rest,
 				lane: RedditLane::Direct,
 				generation: 7,
 				quota_epoch: 1,
@@ -7084,6 +7372,7 @@ mod tests {
 		assert_eq!(
 			ticket,
 			QuotaRotationTicket {
+				budget: QuotaBudget::Rest,
 				lane: RedditLane::Direct,
 				generation: 7,
 				quota_epoch: 4,
@@ -7248,6 +7537,7 @@ mod tests {
 		assert_eq!(
 			candidate,
 			Some(QuotaRotationTicket {
+				budget: QuotaBudget::Rest,
 				lane: RedditLane::Direct,
 				generation: 1,
 				quota_epoch: guard.quota.epoch,
