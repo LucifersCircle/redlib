@@ -69,6 +69,8 @@ jobs:
           cargo test --locked --lib test_media_diagnostics_group_destinations_and_results
           cargo test --locked --lib test_quota_admission_never_uses_safety_reserve
           cargo test --locked --lib test_quota_admission_uses_remaining_allowance_near_reset
+          cargo test --locked --lib test_quota_discovery_
+          cargo test --locked --lib test_quota_diagnostics_
           cargo test --locked --lib test_local_quota_retries_are_attempt_and_time_bounded
           cargo test --locked --lib test_tor_quota_refresh_
           cargo test --locked --lib test_quota_notifications_do_not_consume_timed_retries
