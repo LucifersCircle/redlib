@@ -1583,12 +1583,16 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 }
 
 fn temporary_error_retry_after(msg: &str) -> Option<Option<u64>> {
-	const TEMPORARY_ERRORS: [&str; 22] = [
+	const TEMPORARY_ERRORS: [&str; 26] = [
 		"Redlib is starting its anonymous Reddit session",
 		"The shared Reddit request ended before producing a response",
 		"Reddit requests are temporarily paused",
 		"Reddit is temporarily rejecting this instance",
 		"Reddit is temporarily unable to load comments",
+		"Reddit is temporarily unable to load this page",
+		"Reddit is temporarily unable to load page",
+		"Reddit's anonymous page session is unavailable",
+		"Anonymous Reddit session renewed during this read",
 		"Reddit's anonymous comments session is unavailable",
 		"Reddit rate limit exceeded",
 		"Refreshing the anonymous Reddit session",
@@ -1820,6 +1824,75 @@ mod tests {
 		let response = super::error(request, "Reddit API request timed out").await.unwrap();
 		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 		assert!(!std::str::from_utf8(&body).unwrap().contains("http-equiv=\"refresh\""));
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_session_renewal_stays_retryable() {
+		for msg in [
+			"Anonymous Reddit session renewed during this read",
+			"Refreshing the anonymous Reddit session. Retry in 2 seconds",
+		] {
+			let request = hyper::Request::builder().uri("/r/example/comments/abc?sort=new").body(hyper::Body::empty()).unwrap();
+			let response = super::error(request, msg).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+			assert_eq!(response.headers()["cache-control"], "no-store");
+			assert!(response.headers().contains_key("retry-after"));
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let html = std::str::from_utf8(&body).unwrap();
+			assert!(html.contains("Still trying to load your page"));
+			assert!(html.contains("http-equiv=\"refresh\""));
+			assert!(html.contains(";url=/./r/example/comments/abc?sort=new\""));
+			assert!(!html.contains(msg));
+			assert!(!html.contains("Report"));
+		}
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_graphql_page_stays_retryable() {
+		for (msg, delay) in [
+			("Reddit is temporarily unable to load this page. Retry in 30 seconds", 30),
+			("Reddit is temporarily unable to load page. Retry in 30 seconds", 30),
+			("Reddit's anonymous page session is unavailable. Retry in 5 seconds", 5),
+		] {
+			let request = hyper::Request::builder().uri("/r/example/hot?sort=hot&after=next").body(hyper::Body::empty()).unwrap();
+			let response = super::error(request, msg).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE, "{msg}");
+			assert_eq!(response.headers()["cache-control"], "no-store");
+			let retry_after = response.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap();
+			assert!((delay..=delay + 2).contains(&retry_after));
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let html = std::str::from_utf8(&body).unwrap();
+			assert!(html.contains("Still trying to load your page"));
+			assert!(html.contains(&format!(
+				"http-equiv=\"refresh\" content=\"{};url=/./r/example/hot?sort=hot&#38;after=next\"",
+				retry_after.min(10)
+			)));
+			assert!(!html.contains(msg));
+			assert!(!html.contains("Report"));
+		}
+	}
+
+	#[tokio::test]
+	async fn temporary_errors_recovery_additions_preserve_resources_and_post_behavior() {
+		for msg in ["private", "quarantined", "Post not found"] {
+			let request = hyper::Request::builder().uri("/r/example").body(hyper::Body::empty()).unwrap();
+			let response = super::error(request, msg).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let html = std::str::from_utf8(&body).unwrap();
+			assert!(html.contains(msg));
+			assert!(!html.contains("http-equiv=\"refresh\""));
+		}
+		for msg in [
+			"Anonymous Reddit session renewed during this read",
+			"Refreshing the anonymous Reddit session. Retry in 2 seconds",
+			"Reddit is temporarily unable to load this page. Retry in 30 seconds",
+		] {
+			let request = hyper::Request::builder().method("POST").uri("/settings").body(hyper::Body::empty()).unwrap();
+			let response = super::error(request, msg).await.unwrap();
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			assert!(!std::str::from_utf8(&body).unwrap().contains("http-equiv=\"refresh\""));
+		}
 	}
 
 	#[test]
