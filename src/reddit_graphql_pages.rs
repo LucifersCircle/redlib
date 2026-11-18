@@ -317,7 +317,9 @@ impl PageRequest {
 	/// Empty ID batches are resolved locally, without another wire request.
 	pub(crate) fn next_payload(&self, values: &mut Vec<Value>) -> Result<Option<Value>, GraphqlError> {
 		if self.invalid_cursor {
-			return Err(invalid("invalid_page_cursor"));
+			let mut error = invalid("invalid_page_cursor");
+			error.message = "This page link is invalid. Return to the first page and try again.".into();
+			return Err(error);
 		}
 		loop {
 			let Some(step) = self.steps.get(values.len()) else { return Ok(None) };

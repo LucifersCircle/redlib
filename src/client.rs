@@ -278,6 +278,7 @@ struct UpstreamAttempt {
 	quota_epoch: u64,
 	request_id: u64,
 	quota_admission: QuotaSnapshot,
+	wire_operation: &'static str,
 	quota_consumption_watermark: u64,
 	discovery_probe: bool,
 	sent: bool,
@@ -1129,6 +1130,7 @@ impl UpstreamGuard {
 			Ok(edge) => edge,
 			Err(error) => {
 				let mut placeholder = UpstreamAttempt {
+					wire_operation: "none",
 					quota_admission: self.quota_budget(budget).snapshot(now),
 					lane: self.lane,
 					edge: EdgeAttempt {
@@ -1158,6 +1160,7 @@ impl UpstreamGuard {
 		};
 
 		Ok(UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: self.quota_budget(budget).snapshot(now),
 			lane: self.lane,
 			edge,
@@ -1662,7 +1665,7 @@ pub(crate) fn quota_rotation_still_needed(ticket: QuotaRotationTicket) -> bool {
 	upstream_guard(ticket.lane).quota_rotation_still_needed(Instant::now(), ticket)
 }
 
-fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str) {
+fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<u16>, used: Option<u16>, reset: Option<Duration>, path: &str, operation: &'static str) {
 	let budget = QuotaBudget::for_endpoint(api_endpoint_index(path));
 	let now = Instant::now();
 	let mut guard = upstream_guard(lane);
@@ -1676,12 +1679,13 @@ fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<
 
 	if let Some((available, reset_remaining)) = short_reset {
 		info!(
-			"Reddit request budget is low but resets soon: lane={} remaining={} effective_available={} used={} reset_seconds={} endpoint={}; preserving the current anonymous OAuth identity",
+			"Reddit request budget is low but resets soon: lane={} remaining={} effective_available={} used={} reset_seconds={} operation={} endpoint={}; preserving the current anonymous OAuth identity",
 			lane.label(),
 			remaining.map_or(0, u16::from),
 			available,
 			used.map_or(0, u16::from),
 			reset_remaining.as_secs(),
+			operation,
 			endpoint_class(path),
 		);
 	}
@@ -1694,13 +1698,14 @@ fn maybe_rotate_low_budget(lane: RedditLane, generation: u64, remaining: Option<
 	}
 
 	warn!(
-		"Reddit request budget is low: lane={} remaining={} effective_available={} used={} reset_seconds={} effective_reset_seconds={} endpoint={}; rotating to a fresh anonymous OAuth identity",
+		"Reddit request budget is low: lane={} remaining={} effective_available={} used={} reset_seconds={} effective_reset_seconds={} operation={} endpoint={}; rotating to a fresh anonymous OAuth identity",
 		lane.label(),
 		remaining.map_or(0, u16::from),
 		effective_quota.map_or(0, |(available, _)| available),
 		used.map_or(0, u16::from),
 		reset.map_or(0, |duration| duration.as_secs()),
 		effective_quota.map_or(0, |(_, duration)| duration.as_secs()),
+		operation,
 		endpoint_class(path),
 	);
 }
@@ -3305,6 +3310,27 @@ fn reconcile_graphql_quota(
 	delay
 }
 
+fn wire_operation_label(payload: Option<&Value>) -> &'static str {
+	let Some(payload) = payload else {
+		return "rest";
+	};
+	match payload["operationName"].as_str() {
+		Some("PostsByIds") => "PostsByIds",
+		Some("PostComments") => "PostComments",
+		Some("SubredditInfoByName") => "SubredditInfoByName",
+		Some("PopularFeedElements") => "PopularFeedElements",
+		Some("AllFeedSdui") => "AllFeedSdui",
+		Some("DynamicSearch") => "DynamicSearch",
+		Some("ProfileDetailsByName") => "ProfileDetailsByName",
+		Some("SearchPeople") => "SearchPeople",
+		Some("SubredditFeedElements") => "SubredditFeedElements",
+		Some("UserSubmittedPosts") => "UserSubmittedPosts",
+		Some("SubmittedComments") => "SubmittedComments",
+		Some("LiveCommentsByIds") => "LiveCommentsByIds",
+		_ => "unknown",
+	}
+}
+
 async fn reddit_comments(
 	path: &str,
 	quarantine: bool,
@@ -3317,6 +3343,7 @@ async fn reddit_comments(
 	let lane = attempt.lane;
 	let mut post = None;
 	for (index, payload) in [request.post_payload(), request.comments_payload()].into_iter().enumerate() {
+		attempt.wire_operation = wire_operation_label(Some(&payload));
 		attempt.mark_sent();
 		record_api_send(path, false, lane);
 		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
@@ -3339,7 +3366,12 @@ async fn reddit_comments(
 		post = Some(match request.post(&value, quarantine) {
 			Ok(post) => post,
 			Err(error) => {
-				warn!("Reddit comments response rejected: lane={} stage=post reason={}", lane.label(), error.reason);
+				warn!(
+					"Reddit comments response rejected: lane={} stage=post operation={} reason={}",
+					lane.label(),
+					attempt.wire_operation,
+					error.reason
+				);
 				let delay = reconcile_graphql_quota(
 					attempt,
 					remaining,
@@ -3380,9 +3412,18 @@ async fn reddit_pages(
 	let mut reset = None;
 	let mut sent = false;
 	loop {
-		let payload = request
-			.next_payload(&mut values)
-			.map_err(|error| graphql_api_error(error, lane, oauth.generation, &headers))?;
+		let payload = request.next_payload(&mut values).map_err(|error| {
+			if sent {
+				warn!(
+					"Reddit GraphQL page response rejected: lane={} endpoint={} operation={} reason={}",
+					lane.label(),
+					endpoint_class(path),
+					attempt.wire_operation,
+					error.reason
+				);
+			}
+			graphql_api_error(error, lane, oauth.generation, &headers)
+		})?;
 		let Some(payload) = payload else { break };
 		if sent {
 			reserve_redirect_hop(attempt, oauth.generation, remaining, reset, allow_quota_refresh)?;
@@ -3390,6 +3431,7 @@ async fn reddit_pages(
 			// retire recovery; raw 200 headers may still hide a quota/session error.
 			record_upstream_response(attempt, path, 200);
 		}
+		attempt.wire_operation = wire_operation_label(Some(&payload));
 		attempt.mark_sent();
 		record_api_send(path, false, lane);
 		let response = request_once(&Method::POST, "/".into(), quarantine, origin, oauth.clone(), lane, Some(payload))
@@ -3424,9 +3466,10 @@ async fn reddit_pages(
 		if let Some(mut error) = body_error {
 			error.message = error.message.replace("comments", "page");
 			warn!(
-				"Reddit GraphQL page response rejected: lane={} endpoint={} reason={}",
+				"Reddit GraphQL page response rejected: lane={} endpoint={} operation={} reason={}",
 				lane.label(),
 				endpoint_class(path),
+				attempt.wire_operation,
 				error.reason
 			);
 			record_graphql_resource_response(attempt, path, 200, remaining, &error);
@@ -3440,9 +3483,10 @@ async fn reddit_pages(
 	}
 	let value = request.finish(&values).map_err(|error| {
 		warn!(
-			"Reddit GraphQL page response rejected: lane={} endpoint={} reason={}",
+			"Reddit GraphQL page response rejected: lane={} endpoint={} operation={} reason={}",
 			lane.label(),
 			endpoint_class(path),
+			attempt.wire_operation,
 			error.reason
 		);
 		record_graphql_resource_response(attempt, path, 200, remaining, &error);
@@ -3489,6 +3533,7 @@ async fn reddit_get(
 			return Err(ApiRequestError::Upstream("Reddit returned a redirect loop".to_string()));
 		}
 
+		attempt.wire_operation = wire_operation_label(None);
 		attempt.mark_sent();
 		record_api_send(&path, redirect_count > 0, lane);
 		let transport_path = api_transport_path(&path, lane);
@@ -4534,14 +4579,15 @@ async fn json_uncached_on_lane_with_options(
 				reconcile_quota_headers(&mut upstream_attempt, graphql.is_some() && status.is_success(), parsed_remaining, reset_duration,
 					matches!(throttle_kind, Some(ThrottleKind::Quota)));
 				if quota_budget == QuotaBudget::Rest && throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
-					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path);
+					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path, upstream_attempt.wire_operation);
 				}
 				trace!(
-					"Reddit rate-limit observation: remaining={} reset_seconds={} used={} endpoint={} current_generation={} request_id={} discovery_probe={} rollover={}",
+					"Reddit rate-limit observation: remaining={} reset_seconds={} used={} endpoint={} operation={} current_generation={} request_id={} discovery_probe={} rollover={}",
 					parsed_remaining.map_or(0, u16::from),
 					reset_duration.map_or(0, |duration| duration.as_secs()),
 					parsed_used.map_or(0, u16::from),
 					endpoint_class(&path),
+					upstream_attempt.wire_operation,
 					is_current_oauth_generation(lane, request_generation),
 					upstream_attempt.request_id,
 					upstream_attempt.discovery_probe,
@@ -4567,11 +4613,12 @@ async fn json_uncached_on_lane_with_options(
 							recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged;
 						}
 						warn!(
-							"Reddit quota response: lane={} budget={} status={} endpoint={} request_id={} request_generation={} request_epoch={} observed_generation={} observed_epoch={} current_generation={response_is_current} observed_epoch_matches={} discovery_probe={} remaining={:?} remaining_present={} used={:?} used_present={} reset_seconds={:?} reset_present={} retry_after_seconds={:?} retry_after_present={} cooldown_milliseconds={} admission_after_reservation=[{}] before_response_reconcile=[{}]",
+							"Reddit quota response: lane={} budget={} status={} endpoint={} operation={} request_id={} request_generation={} request_epoch={} observed_generation={} observed_epoch={} current_generation={response_is_current} observed_epoch_matches={} discovery_probe={} remaining={:?} remaining_present={} used={:?} used_present={} reset_seconds={:?} reset_present={} retry_after_seconds={:?} retry_after_present={} cooldown_milliseconds={} admission_after_reservation=[{}] before_response_reconcile=[{}]",
 							lane.label(),
 							match quota_budget { QuotaBudget::Rest => "rest", QuotaBudget::Graphql => "graphql" },
 							status,
 							endpoint_class(&path),
+							upstream_attempt.wire_operation,
 							upstream_attempt.request_id,
 							request_generation,
 							upstream_attempt.quota_epoch,
@@ -4689,7 +4736,7 @@ async fn json_uncached_on_lane_with_options(
 									match request.finish(post.unwrap_or(Value::Null), &json) {
 										Ok(json) => json,
 										Err(error) => {
-											warn!("Reddit comments response rejected: lane={} stage=comments reason={}",lane.label(),error.reason);
+											warn!("Reddit comments response rejected: lane={} stage=comments operation={} reason={}",lane.label(),upstream_attempt.wire_operation,error.reason);
 											record_graphql_resource_response(&upstream_attempt, &path, status_code, parsed_remaining, &error);
 
 											return Err(error.message);
@@ -4757,7 +4804,7 @@ async fn json_uncached_on_lane_with_options(
 									Err(format!("Reddit returned an unexpected response status: {status}"))
 								} else {
 									record_upstream_success(&mut upstream_attempt, &path);
-									if quota_budget == QuotaBudget::Graphql && allow_quota_refresh { maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path); }
+									if quota_budget == QuotaBudget::Graphql && allow_quota_refresh { maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path, upstream_attempt.wire_operation); }
 									Ok(json)
 								}
 							}
@@ -4793,7 +4840,7 @@ async fn json_uncached_on_lane_with_options(
 			}
 			Err(ApiRequestError::TorQuotaGenerationChanged) => {
 				if lane == RedditLane::Tor && admission_mode == AdmissionRetryMode::Bounded && quota_spillover_ticket.is_none() { recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged; }
-				Err("Anonymous Reddit session renewed during this read".into())
+				Err(session_refresh_wait_message(None))
 			}
 			Err(ApiRequestError::TorQuotaRefreshWait { message, ticket }) => {
 				recovery_reason = tor_redirect_refresh_recovery(lane, admission_mode, quota_spillover_ticket.is_some(), ticket);
@@ -7565,6 +7612,7 @@ mod tests {
 			},
 		};
 		let attempt = |request_id| UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7604,6 +7652,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7643,6 +7692,7 @@ mod tests {
 		assert_eq!(quota_epoch, 5);
 		assert!(discovery_probe);
 		let discovery_attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7665,6 +7715,7 @@ mod tests {
 		assert!(matches!(guard.quota.window, QuotaWindow::Known { available: 80, .. }));
 
 		let late_old_attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7710,6 +7761,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7749,6 +7801,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7808,6 +7861,7 @@ mod tests {
 			},
 		};
 		let stale_attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7825,6 +7879,7 @@ mod tests {
 			completed: true,
 		};
 		let mut stale_unsent_attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7884,6 +7939,7 @@ mod tests {
 		assert_eq!(quota.generation, 5);
 
 		let stale_attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7921,6 +7977,7 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		assert!(discovery_probe);
 		let attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -7962,6 +8019,7 @@ mod tests {
 			generation,
 			quota_epoch,
 			request_id,
+			wire_operation: "none",
 			quota_admission: quota.snapshot(now),
 			quota_consumption_watermark: 0,
 			discovery_probe,
@@ -7985,6 +8043,7 @@ mod tests {
 		assert!(!follower_is_probe);
 
 		let probe = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8002,6 +8061,7 @@ mod tests {
 			completed: true,
 		};
 		let follower = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			request_id: follower_request_id,
 			quota_consumption_watermark: 1,
@@ -8029,6 +8089,7 @@ mod tests {
 		assert!(!follower_is_probe);
 
 		let follower = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8051,6 +8112,7 @@ mod tests {
 		assert!(!redirect_is_probe);
 
 		let probe = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			request_id: probe_request_id,
 			quota_consumption_watermark: 1,
@@ -8072,6 +8134,7 @@ mod tests {
 		assert!(!follower_is_probe);
 
 		let follower = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8094,6 +8157,7 @@ mod tests {
 		assert_eq!(quota.headerless_consumption, 2);
 
 		let probe = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			request_id: probe_request_id,
 			quota_consumption_watermark: 1,
@@ -8123,6 +8187,7 @@ mod tests {
 			let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 			let watermark = quota.headerless_consumption;
 			let attempt = UpstreamAttempt {
+				wire_operation: "none",
 				quota_admission: QuotaSnapshot::default(),
 				lane: RedditLane::Direct,
 				edge: EdgeAttempt {
@@ -8149,6 +8214,7 @@ mod tests {
 
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let snapshot = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8185,6 +8251,7 @@ mod tests {
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let mut probe = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8224,6 +8291,7 @@ mod tests {
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let abandoned = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8246,6 +8314,7 @@ mod tests {
 
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 2).unwrap();
 		let snapshot = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			quota_epoch,
 			request_id,
@@ -8274,6 +8343,7 @@ mod tests {
 			generation: 2,
 			quota_epoch: old_epoch,
 			request_id: follower_id,
+			wire_operation: "none",
 			quota_admission: quota.snapshot(now),
 			quota_consumption_watermark: 1,
 			discovery_probe: false,
@@ -8325,6 +8395,7 @@ mod tests {
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 1).unwrap();
 		quota.install_generation(2, false);
 		let stale_attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8362,6 +8433,7 @@ mod tests {
 		};
 		let (quota_epoch, request_id, discovery_probe) = quota.reserve(now, 3).unwrap();
 		let mut attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {
@@ -8412,6 +8484,7 @@ mod tests {
 			},
 		};
 		let attempt = UpstreamAttempt {
+			wire_operation: "none",
 			quota_admission: QuotaSnapshot::default(),
 			lane: RedditLane::Direct,
 			edge: EdgeAttempt {

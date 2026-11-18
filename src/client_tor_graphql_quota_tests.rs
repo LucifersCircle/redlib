@@ -6,6 +6,11 @@ use std::sync::atomic::AtomicUsize;
 enum Scenario {
 	CompleteLow,
 	First429,
+	Final429,
+	FinalThenFirst429,
+	FirstInvalid,
+	MalformedFirstFeed,
+	FinalInvalid,
 	Publication429,
 	FirstQuotaBody,
 	FinalQuotaBody,
@@ -86,7 +91,8 @@ impl Fixture {
 						}
 						let quota = old
 							&& ((matches!(scenario, Scenario::First429 | Scenario::Publication429 | Scenario::FirstQuotaBody) && first)
-								|| (matches!(scenario, Scenario::FinalQuotaBody | Scenario::LateQuota) && !first));
+								|| (matches!(scenario, Scenario::FinalQuotaBody | Scenario::LateQuota | Scenario::Final429) && !first))
+							|| (scenario == Scenario::FinalThenFirst429 && ((old && !first) || (!old && first)));
 						let remaining = if quota || (old && scenario == Scenario::FirstZero && first) {
 							0
 						} else if old && scenario == Scenario::CompleteLow {
@@ -102,8 +108,16 @@ impl Fixture {
 								99
 							}
 						};
-						let value = if quota && !matches!(scenario, Scenario::First429 | Scenario::Publication429 | Scenario::LateQuota) {
+						let value = if quota
+							&& !matches!(
+								scenario,
+								Scenario::First429 | Scenario::Publication429 | Scenario::LateQuota | Scenario::Final429 | Scenario::FinalThenFirst429
+							) {
 							serde_json::json!({"errors":[{"extensions":{"code":"RATE_LIMITED"}}]})
+						} else if old && ((scenario == Scenario::FirstInvalid && first) || (scenario == Scenario::FinalInvalid && !first)) {
+							serde_json::json!({"errors":[{"extensions":{"code":"UNRECOGNIZED_ERROR"}}]})
+						} else if scenario == Scenario::MalformedFirstFeed && op == "AllFeedSdui" {
+							serde_json::json!({"data":{"allV3":{"elements":{"pageInfo":{"hasNextPage":false}}}}})
 						} else if old && scenario == Scenario::LateSession && !first {
 							serde_json::json!({"errors":[{"extensions":{"code":"UNAUTHENTICATED"}}]})
 						} else {
@@ -118,7 +132,11 @@ impl Fixture {
 								other => panic!("unexpected operation {other}"),
 							}
 						};
-						let status = if quota && matches!(scenario, Scenario::First429 | Scenario::Publication429 | Scenario::LateQuota) {
+						let status = if quota
+							&& matches!(
+								scenario,
+								Scenario::First429 | Scenario::Publication429 | Scenario::LateQuota | Scenario::Final429 | Scenario::FinalThenFirst429
+							) {
 							429
 						} else if old && scenario == Scenario::Late401 && !first {
 							401
@@ -458,5 +476,236 @@ fn test_tor_graphql_quota_flag_before_ticket_publication_wakes_on_confirmed_inst
 		result.unwrap();
 		assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 1);
 		assert_eq!(fixture.wires.lock().unwrap().len(), 3);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_tor_graphql_quota_exhausted_replay_returns_retryable_recovery_message() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new(Scenario::LateContinuation, false).await;
+		fixture.install();
+		let capacity = api_concurrency(RedditLane::Tor).available_permits();
+		let read = tokio::spawn(async {
+			let mut refresh = TorQuotaRefreshRetryState {
+				redirect_replayed: true,
+				..TorQuotaRefreshRetryState::default()
+			};
+			let (result, _, recovery) = json_uncached_on_lane_with_options(
+				"/comments/abc.json".into(),
+				false,
+				RedditLane::Tor,
+				AdmissionRetryMode::Bounded,
+				Some(Duration::from_secs(3)),
+				None,
+				&mut refresh,
+			)
+			.await;
+			assert_eq!(recovery, LaneRecoveryReason::TorQuotaGenerationChanged);
+			assert!(
+				!refresh.claim_generation_replay(RedditLane::Tor, Instant::now()),
+				"a used full-read replay must remain exhausted"
+			);
+			result
+		});
+		fixture.data_seen.notified().await;
+		fixture.renew_old_budget(false);
+		fixture.refreshed().await;
+		fixture.data_release.notify_one();
+		let result = tokio::time::timeout(Duration::from_secs(3), read).await.unwrap().unwrap();
+		assert_eq!(result, Err("Refreshing the anonymous Reddit session. Retry in 2 seconds".into()));
+		assert_eq!(
+			fixture.wires.lock().unwrap().len(),
+			1,
+			"exhausted recovery must neither continue the old page nor replay it again"
+		);
+		assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 1);
+		assert_eq!(api_concurrency(RedditLane::Tor).available_permits(), capacity);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_tor_graphql_quota_invalid_cursor_stays_terminal_without_wire_sends() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new(Scenario::CompleteLow, false).await;
+		fixture.install();
+		let path = "/r/one+two/hot.json?after=invalid";
+		let (result, _) = json_uncached_on_lane(path.into(), false, RedditLane::Tor).await;
+		let message = result.unwrap_err();
+		assert_eq!(message, "This page link is invalid. Return to the first page and try again.");
+		let request = HyperRequest::builder().uri(path).body(Body::empty()).unwrap();
+		let response = crate::utils::error(request, &message).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
+		assert!(!response.headers().contains_key("retry-after"));
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let html = std::str::from_utf8(&body).unwrap();
+		assert!(html.contains("Return to the first page"));
+		assert!(!html.contains("http-equiv=\"refresh\""));
+		assert!(fixture.wires.lock().unwrap().is_empty());
+		assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 0);
+	});
+}
+
+struct OperationLogCapture;
+static OPERATION_LOG_ROWS: LazyLock<Mutex<Vec<(log::Level, String)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static OPERATION_LOG_CAPTURE: OperationLogCapture = OperationLogCapture;
+impl log::Log for OperationLogCapture {
+	fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+		metadata.target() == "redlib::client"
+	}
+	fn log(&self, record: &log::Record<'_>) {
+		if !self.enabled(record.metadata()) {
+			return;
+		}
+		let message = record.args().to_string();
+		if [
+			"Reddit quota response:",
+			"Reddit rate-limit observation:",
+			"Reddit comments response rejected:",
+			"Reddit GraphQL page response rejected:",
+			"Reddit request budget is low",
+		]
+		.iter()
+		.any(|prefix| message.starts_with(prefix))
+		{
+			OPERATION_LOG_ROWS.lock().unwrap().push((record.level(), message));
+		}
+	}
+	fn flush(&self) {}
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_diagnostics_operation_labels_follow_each_failed_wire_and_full_replay() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		log::set_logger(&OPERATION_LOG_CAPTURE).unwrap();
+		log::set_max_level(log::LevelFilter::Trace);
+		for (path, first, final_operation) in [("/comments/abc.json", "PostsByIds", "PostComments"), ("/r/all/hot.json", "AllFeedSdui", "PostsByIds")] {
+			for (scenario, expected, prefix, valid) in [
+				(Scenario::First429, first, "Reddit quota response:", true),
+				(Scenario::Final429, final_operation, "Reddit quota response:", true),
+				(
+					Scenario::FirstQuotaBody,
+					first,
+					if first == "PostsByIds" {
+						"Reddit comments response rejected:"
+					} else {
+						"Reddit GraphQL page response rejected:"
+					},
+					true,
+				),
+				(
+					Scenario::FinalQuotaBody,
+					final_operation,
+					if first == "PostsByIds" {
+						"Reddit comments response rejected:"
+					} else {
+						"Reddit GraphQL page response rejected:"
+					},
+					true,
+				),
+				(
+					Scenario::FirstInvalid,
+					first,
+					if first == "PostsByIds" {
+						"Reddit comments response rejected:"
+					} else {
+						"Reddit GraphQL page response rejected:"
+					},
+					false,
+				),
+				(
+					Scenario::FinalInvalid,
+					final_operation,
+					if first == "PostsByIds" {
+						"Reddit comments response rejected:"
+					} else {
+						"Reddit GraphQL page response rejected:"
+					},
+					false,
+				),
+				(Scenario::CompleteLow, final_operation, "Reddit request budget is low:", true),
+			] {
+				OPERATION_LOG_ROWS.lock().unwrap().clear();
+				let fixture = Fixture::new(scenario, false).await;
+				fixture.install();
+				let (result, _) = tokio::time::timeout(Duration::from_secs(4), json_uncached_on_lane(path.into(), false, RedditLane::Tor))
+					.await
+					.unwrap();
+				assert_eq!(result.is_ok(), valid);
+				if fixture.auth_calls.load(Ordering::SeqCst) > 0 {
+					fixture.refreshed().await;
+				}
+				let rows = OPERATION_LOG_ROWS.lock().unwrap();
+				assert!(
+					rows
+						.iter()
+						.any(|(level, row)| *level == log::Level::Warn && row.starts_with(prefix) && row.contains(&format!("operation={expected} "))),
+					"the error/low-budget diagnostic must label its actual wire: {rows:?}"
+				);
+				if valid {
+					assert!(rows
+						.iter()
+						.any(|(level, row)| *level == log::Level::Trace && row.starts_with("Reddit rate-limit observation:") && row.contains(&format!("operation={final_operation} "))));
+				}
+			}
+			OPERATION_LOG_ROWS.lock().unwrap().clear();
+			let fixture = Fixture::new(Scenario::FinalThenFirst429, false).await;
+			fixture.install();
+			let (result, _) = tokio::time::timeout(Duration::from_secs(4), json_uncached_on_lane(path.into(), false, RedditLane::Tor))
+				.await
+				.unwrap();
+			assert!(result.is_err());
+			let rows = OPERATION_LOG_ROWS.lock().unwrap();
+			let quota_rows: Vec<_> = rows.iter().filter(|(_, row)| row.starts_with("Reddit quota response:")).collect();
+			assert_eq!(quota_rows.len(), 2);
+			assert!(quota_rows[0].1.contains(&format!("operation={final_operation} ")));
+			assert!(
+				quota_rows[1].1.contains(&format!("operation={first} ")),
+				"replay must reset the diagnostic to the new first wire"
+			);
+			assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 1, "a fresh exhausted identity must not renew repeatedly");
+		}
+	});
+}
+
+#[test]
+fn test_quota_diagnostics_operation_labels_reject_arbitrary_payload_text() {
+	assert_eq!(wire_operation_label(None), "rest");
+	for operation in ["PostsByIds", "PostComments", "AllFeedSdui"] {
+		assert_eq!(wire_operation_label(Some(&serde_json::json!({"operationName": operation}))), operation);
+	}
+	for payload in [
+		serde_json::json!({"operationName": "PostComments token=untrusted"}),
+		serde_json::json!({"operationName": "https://untrusted.example/?secret=value"}),
+		serde_json::json!({"operationName": 42}),
+		Value::Null,
+	] {
+		assert_eq!(wire_operation_label(Some(&payload)), "unknown");
+	}
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_diagnostics_operation_malformed_feed_labels_the_preceding_wire() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		log::set_logger(&OPERATION_LOG_CAPTURE).unwrap();
+		log::set_max_level(log::LevelFilter::Trace);
+		let fixture = Fixture::new(Scenario::MalformedFirstFeed, false).await;
+		fixture.install();
+		let (result, _) = json_uncached_on_lane("/r/all/hot.json".into(), false, RedditLane::Tor).await;
+		assert_eq!(result, Err("Reddit is temporarily unable to load this page. Retry in 30 seconds".into()));
+		let rows = OPERATION_LOG_ROWS.lock().unwrap();
+		assert!(
+			rows.iter().any(|(level, row)| *level == log::Level::Warn
+				&& row.starts_with("Reddit GraphQL page response rejected:")
+				&& row.contains("operation=AllFeedSdui reason=missing_feed_edges")),
+			"the missing shape must identify the preceding actual response: {rows:?}"
+		);
+		let wires = fixture.wires.lock().unwrap();
+		assert_eq!(wires.len(), 1, "a malformed feed must fail before hydration sends another operation");
+		assert_eq!(wires[0].1, "AllFeedSdui");
+		assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 0);
 	});
 }
