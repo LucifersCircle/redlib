@@ -106,7 +106,7 @@
 				{% endif %}
 			{% endfor %}
 		{% endif %}
-		{% if prefs.use_hls == "on" %}
+		{% if prefs.use_hls == "on" || crate::utils::has_hls_only_video(posts) %}
 		<script src="/hls.min.js"></script>
 		<script src="/playHLSVideo.js"></script>
 		{% endif %}

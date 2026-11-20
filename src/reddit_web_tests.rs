@@ -228,6 +228,16 @@ impl Fixture {
 							}
 						}
 						let challenge_mode = mode.load(Ordering::SeqCst);
+						if matches!(challenge_mode, 24 | 25) && path.starts_with("/svc/shreddit/community-more-posts/") {
+							assert_eq!(
+								query.get("navigationSessionId").map(String::as_str),
+								Some(if challenge_mode == 25 {
+									"12345678-1234-4234-8234-123456789abc"
+								} else {
+									"00000000-0000-4000-8000-000000000001"
+								})
+							);
+						}
 						let rdt = req.uri().query().unwrap_or_default().contains("rdt=");
 						let after = req.uri().query().unwrap_or_default().contains("after=");
 						let method = req.method().to_string();
@@ -299,7 +309,12 @@ impl Fixture {
 						} else if mode.load(Ordering::SeqCst) == 2 {
 							"x".repeat(MAX_HTML + 1)
 						} else if path.starts_with("/svc/shreddit/more-comments/") {
+							if challenge_mode == 25 {
+								assert_eq!(body.as_ref(), b"cursor=fresh%2Bcursor", "renewal must discover a new form token");
+							}
 							comment("second")
+						} else if matches!(challenge_mode, 24 | 25) && path.starts_with("/svc/shreddit/community-more-posts/") {
+							format!("{}{}", post("rust", "x0c", 2, false, false), post("rust", "x0d", 1, false, false))
 						} else if challenge_mode == 16 && path.starts_with("/svc/shreddit/community-more-posts/") {
 							post("rust", "x0c", 2, false, false)
 						} else if challenge_mode == 15 && path.starts_with("/svc/shreddit/comments/") {
@@ -346,6 +361,31 @@ impl Fixture {
 								""
 							};
 							format!("<main><shreddit-feed>{cards}{next}</shreddit-feed></main>")
+						};
+						let body = if matches!(challenge_mode, 24 | 25) {
+							let body = body.replace("opaque+cursor", if challenge_mode == 25 { "fresh+cursor" } else { "opaque+cursor" });
+							if !path.contains("/comments/") && !path.starts_with("/svc/") {
+								format!(
+									"{body}<faceplate-partial src=\"/svc/shreddit/community-more-posts/hot/?after=t3_x0b&amp;name=rust&amp;navigationSessionId={}\"></faceplate-partial>",
+									if challenge_mode == 25 {
+										"12345678-1234-4234-8234-123456789abc"
+									} else {
+										"00000000-0000-4000-8000-000000000001"
+									}
+								)
+							} else {
+								body
+							}
+						} else if matches!(challenge_mode, 26 | 27) {
+							let body = body.replace("<div slot=\"text-body\"><p>Readable body</p></div>", "<shreddit-post-text-body slot=\"text-body\"><a slot=\"text-body\" href=\"/r/rust/comments/x0a/title/\"><p>Readable <strong>body</strong></p></a></shreddit-post-text-body>")
+								.replace("</shreddit-post>", "<shreddit-player src=\"https://v.redd.it/clip/HLSPlaylist.m3u8\" preview=\"https://v.redd.it/clip/CMAF_96.mp4\"></shreddit-player></shreddit-post>");
+							if challenge_mode == 27 {
+								body.replace(" preview=\"https://v.redd.it/clip/CMAF_96.mp4\"", "")
+							} else {
+								body
+							}
+						} else {
+							body
 						};
 						let response = HyperResponse::builder()
 							.status(status)
@@ -874,7 +914,7 @@ fn test_reddit_web_transport_cached_root_discards_cursor_of_exhausted_tor_identi
 
 #[test]
 #[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
-fn test_reddit_web_transport_tor_renewal_is_bounded_and_does_not_replay_old_cursor() {
+fn test_reddit_web_transport_tor_renewal_resumes_without_replaying_old_cursor() {
 	tokio::runtime::Runtime::new().unwrap().block_on(async {
 		let old = Fixture::new().await;
 		let fresh = Fixture::new().await;
@@ -883,8 +923,9 @@ fn test_reddit_web_transport_tor_renewal_is_bounded_and_does_not_replay_old_curs
 		let page = read("/r/rust/hot.json?limit=1", false).await.unwrap();
 		let cursor = page["data"]["after"].as_str().unwrap();
 		old.mode.store(1, Ordering::SeqCst);
-		assert_eq!(read(&format!("/r/rust/hot.json?limit=1&after={cursor}"), false).await, Err(WebError::Cursor));
-		assert_eq!(fresh.wires.lock().unwrap().len(), 0, "old continuations cannot be transferred to the new jar");
+		let resumed = read(&format!("/r/rust/hot.json?limit=1&after={cursor}"), false).await.unwrap();
+		assert_eq!(resumed["data"]["children"][0]["data"]["name"], "t3_x0b");
+		assert_eq!(fresh.wires.lock().unwrap().len(), 1, "resume must re-discover the public anchor through the new jar");
 		fresh.mode.store(1, Ordering::SeqCst);
 		let another = Fixture::new().await;
 		another.mode.store(1, Ordering::SeqCst);
@@ -895,6 +936,126 @@ fn test_reddit_web_transport_tor_renewal_is_bounded_and_does_not_replay_old_curs
 		budget.wires.store(MAX_WIRES, Ordering::SeqCst);
 		let next = budget.new_attempt();
 		assert_eq!(next.wires.load(Ordering::SeqCst), MAX_WIRES, "renewal must retain the full read's request and byte bounds");
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_renewal_rediscovers_feed_and_comment_continuations() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		for thread in [false, true] {
+			let old = Fixture::new().await;
+			old.mode.store(24, Ordering::SeqCst);
+			let fresh = Fixture::new().await;
+			fresh.mode.store(25, Ordering::SeqCst);
+			*MOCK.lock().unwrap() = Some((old.transport.clone(), old.origin.clone()));
+			*RENEW_MOCK.lock().unwrap() = Some((fresh.transport.clone(), fresh.origin.clone()));
+			let path = if thread {
+				"/r/rust/comments/abc/title.json?sort=new"
+			} else {
+				"/r/rust/hot.json?limit=2"
+			};
+			let first = read(path, false).await.unwrap();
+			let cursor = if thread { first[1]["data"]["after"].as_str() } else { first["data"]["after"].as_str() }.unwrap();
+			old.mode.store(1, Ordering::SeqCst);
+			let next = read(&format!("{path}&after={cursor}"), false).await.unwrap();
+			if thread {
+				assert_eq!(next[1]["data"]["children"][0]["data"]["name"], "t1_second");
+				assert!(next[1]["data"]["after"].is_null());
+			} else {
+				assert_eq!(next["data"]["children"][0]["data"]["name"], "t3_x0c");
+				assert_eq!(next["data"]["children"][1]["data"]["name"], "t3_x0d");
+			}
+			assert_eq!(fresh.wires.lock().unwrap().len(), 2, "fresh root plus freshly discovered continuation");
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_subscription_anchors_survive_repeated_session_recovery() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		let names = (0..14).map(|i| format!("s{i}")).collect::<Vec<_>>().join("%2B");
+		let base = format!("/r/{names}/hot.json?limit=1");
+		let mut path = base.clone();
+		let mut seen = HashSet::new();
+		for index in 0..28 {
+			let mut spec = Spec::parse(&path, false).unwrap();
+			spec.recover = spec.cursor.is_some();
+			let page = read_on_lane(fixture.context(), spec).await.unwrap();
+			assert!(seen.insert(page["data"]["children"][0]["data"]["name"].as_str().unwrap().to_string()));
+			match page["data"]["after"].as_str() {
+				Some(cursor) => path = format!("{base}&after={cursor}"),
+				None => assert_eq!(index, 27),
+			}
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_expired_home_navigation_recovers_and_media_renders() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(26, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let mut app = crate::server::Server::new();
+		app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
+		let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		let cookie = "subscriptions=rust; front_page=default; layout=card; theme=black; post_sort=hot";
+		let request = hyper::Request::builder()
+			.uri(format!("http://{address}/?after=redlib-web%3A{}&t=all", "0".repeat(32)))
+			.header("cookie", cookie)
+			.body(Body::empty())
+			.unwrap();
+		let response = http.request(request).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::FOUND);
+		assert_eq!(response.headers()["location"], "/?t=all");
+		assert!(fixture.wires.lock().unwrap().is_empty(), "expired tokens should recover before any upstream request");
+		let request = hyper::Request::builder()
+			.uri(format!("http://{address}/?t=all"))
+			.header("cookie", cookie)
+			.body(Body::empty())
+			.unwrap();
+		let response = http.request(request).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::OK);
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let page = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+		let video = scraper::Selector::parse("video.post_media_video").unwrap();
+		assert_eq!(page.select(&video).count(), 2);
+		assert!(page
+			.select(&video)
+			.all(|el| el.value().attr("src").is_some_and(|src| src.starts_with("/vid/clip/cmaf/96.mp4"))));
+		let text = scraper::Selector::parse(".md").unwrap();
+		assert!(page.select(&text).any(|el| el.text().collect::<String>().contains("Readable body")));
+		assert!(
+			!page.select(&text).next().unwrap().inner_html().contains("href="),
+			"preview text must not inherit link accent styling"
+		);
+		std::fs::write("/tmp/redlib-browsing-rendered.html", &body).unwrap();
+		fixture.mode.store(27, Ordering::SeqCst);
+		let request = hyper::Request::builder()
+			.uri(format!("http://{address}/?t=week"))
+			.header("cookie", cookie)
+			.body(Body::empty())
+			.unwrap();
+		let response = http.request(request).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::OK);
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let page = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+		let source = scraper::Selector::parse("video source").unwrap();
+		assert_eq!(page.select(&source).count(), 2);
+		assert!(page.select(&source).all(|el| el.value().attr("type") == Some("application/vnd.apple.mpegurl")));
+		assert!(page
+			.select(&source)
+			.all(|el| el.value().attr("src").is_some_and(|src| src.starts_with("/hls/clip/HLSPlaylist.m3u8"))));
+		std::fs::write("/tmp/redlib-browsing-hls-rendered.html", &body).unwrap();
+		server.abort();
 	});
 }
 
@@ -1055,6 +1216,7 @@ fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 		done: false,
 		served: 1,
 		form: None,
+		resume: None,
 	};
 	let cursor = encode_cursor(&spec.scope, vec![source], RedditLane::Direct, None).unwrap().unwrap();
 	let path = format!("/r/rust/hot.json?limit=1&after={cursor}");
@@ -1085,6 +1247,7 @@ fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 			done: false,
 			served: 0,
 			form: None,
+			resume: None,
 		}],
 		RedditLane::Direct,
 		None,

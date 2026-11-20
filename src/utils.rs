@@ -454,6 +454,10 @@ pub struct Post {
 	pub ws_url: String,
 }
 
+pub fn has_hls_only_video(posts: &[Post]) -> bool {
+	posts.iter().any(|post| post.media.url.starts_with("/hls/") && !post.media.alt_url.is_empty())
+}
+
 impl Post {
 	/// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
 	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
@@ -1544,6 +1548,32 @@ pub fn redirect(path: &str) -> Response<Body> {
 
 /// Renders a generic error landing page.
 pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, String> {
+	let navigation_expired = msg == "Page navigation expired. Open the first page again.";
+	if navigation_expired
+		&& matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
+		&& url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()).any(|(key, _)| matches!(key.as_ref(), "after" | "before"))
+	{
+		let mut path = format!("/{}", req.uri().path().trim_start_matches('/'));
+		let query = url::form_urlencoded::Serializer::new(String::new())
+			.extend_pairs(url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()).filter(|(key, _)| !matches!(key.as_ref(), "after" | "before")))
+			.finish();
+		if !query.is_empty() {
+			path.push('?');
+			path.push_str(&query);
+		}
+		log::info!("Restarting Reddit navigation after an unavailable continuation");
+		return Response::builder()
+			.status(302)
+			.header("Location", path)
+			.header("Cache-Control", "no-store")
+			.body(Body::empty())
+			.map_err(|_| "Could not restart page navigation".into());
+	}
+	let msg = if navigation_expired {
+		"Reddit is temporarily unable to load this page. Retry in 30 seconds"
+	} else {
+		msg
+	};
 	let temporary = temporary_error_retry_after(msg);
 	if let Some(retry_after) = temporary.filter(|_| req.method() == hyper::Method::GET) {
 		log::info!("Waiting for Reddit page recovery: {}", msg.split('|').next().unwrap_or_default());
@@ -1745,6 +1775,33 @@ mod tests {
 		deflate_compress, deflate_decompress, format_num, format_url, is_reddit_image_domain, render_bullet_lists, rewrite_emotes, rewrite_urls, temporary_error_retry_after,
 		url_path_basename, GalleryMedia, Media, Post, Preferences,
 	};
+
+	#[tokio::test]
+	async fn temporary_errors_navigation_restarts_locally_without_losing_preferences() {
+		let msg = "Page navigation expired. Open the first page again.";
+		for method in [hyper::Method::GET, hyper::Method::HEAD] {
+			for (uri, expected) in [
+				("/?sort=new&after=redlib-web%3Aexpired&t=week&before=old", "/?sort=new&t=week"),
+				("/r/rust/top?after=old&t=all", "/r/rust/top?t=all"),
+				("//evil.test/r/rust?after=old", "/evil.test/r/rust"),
+			] {
+				let request = hyper::Request::builder().method(method.clone()).uri(uri).body(hyper::Body::empty()).unwrap();
+				let response = super::error(request, msg).await.unwrap();
+				assert_eq!(response.status(), hyper::StatusCode::FOUND);
+				assert_eq!(response.headers()["location"], expected);
+				assert_eq!(response.headers()["cache-control"], "no-store");
+				assert!(hyper::body::to_bytes(response.into_body()).await.unwrap().is_empty());
+			}
+		}
+		let request = hyper::Request::builder().method("POST").uri("/?after=old").body(hyper::Body::empty()).unwrap();
+		assert!(!super::error(request, msg).await.unwrap().headers().contains_key("location"));
+		let request = hyper::Request::builder().uri("/").body(hyper::Body::empty()).unwrap();
+		let response = super::error(request, msg).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE, "a failed first page must not redirect to itself");
+		assert!(!response.headers().contains_key("location"));
+		let request = hyper::Request::builder().uri("/r/private?after=old").body(hyper::Body::empty()).unwrap();
+		assert!(!super::error(request, "r/private is a private community").await.unwrap().headers().contains_key("location"));
+	}
 
 	#[test]
 	fn temporary_errors_use_service_unavailable_retry_metadata() {

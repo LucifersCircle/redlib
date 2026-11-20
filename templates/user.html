@@ -81,7 +81,7 @@ body %}
                     <p class="comment_body">{{ post.body|safe }}</p>
                 </details>
             </div>
-            {% endif %} {% endfor %} {% if prefs.use_hls == "on" %}
+            {% endif %} {% endfor %} {% if prefs.use_hls == "on" || crate::utils::has_hls_only_video(posts) %}
             <script src="/hls.min.js"></script>
             <script src="/playHLSVideo.js"></script>
             {% endif %}

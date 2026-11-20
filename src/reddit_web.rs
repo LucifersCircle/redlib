@@ -75,6 +75,7 @@ struct Spec {
 	scope: String,
 	context: u16,
 	cursor: Option<Cursor>,
+	recover: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +86,8 @@ struct Source {
 	served: u64,
 	#[serde(default)]
 	form: Option<Form>,
+	#[serde(default)]
+	resume: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +143,7 @@ impl Spec {
 			scope: String::new(),
 			context: get("context").and_then(|v| v.parse::<u16>().ok()).filter(|v| *v <= 9999).unwrap_or(0),
 			cursor: None,
+			recover: false,
 		};
 		let segments: Vec<_> = base.trim_start_matches('/').split('/').collect();
 		if segments.contains(&"comments") {
@@ -238,6 +242,13 @@ impl Spec {
 				return Err(WebError::Cursor);
 			}
 			for (i, source) in cursor.sources.iter().enumerate() {
+				if source
+					.resume
+					.as_ref()
+					.is_some_and(|value| !value.strip_prefix(if spec.post.is_some() { "t1_" } else { "t3_" }).is_some_and(valid_id))
+				{
+					return Err(WebError::Cursor);
+				}
 				if let Some(page) = &source.page {
 					spec.validate_page(page, spec.communities.get(i).map(String::as_str))?;
 				}
@@ -811,15 +822,42 @@ async fn feed_source(ctx: Context, spec: Spec, name: String, source: Source) -> 
 	if source.done {
 		return Ok((vec![], source, None));
 	}
-	let page = source.page.clone().unwrap_or_else(|| spec.initial(Some(&name)));
+	let mut source = source;
+	// Continuations belong to their anonymous jar. On renewal, locate the
+	// stable public anchor using only links supplied to the replacement jar.
+	if spec.recover {
+		source.page = None;
+		source.last = source.resume.clone().or(source.last);
+		source.form = None;
+	}
+	let mut page = source.page.clone().unwrap_or_else(|| spec.initial(Some(&name)));
 	let mut document = document(&ctx, &spec, &page, Some(&name), true).await?;
 	if let Some(last) = &source.last {
-		let index = document
-			.posts
-			.iter()
-			.position(|p| p["data"]["name"].as_str() == Some(last))
-			.ok_or(WebError::Temporary("resume_anchor_missing"))?;
-		document.posts.drain(..=index);
+		let last = last.clone();
+		let mut found = false;
+		for page_index in 0..8 {
+			if let Some(index) = document.posts.iter().position(|p| p["data"]["name"].as_str() == Some(&last)) {
+				document.posts.drain(..=index);
+				found = true;
+				break;
+			}
+			if page_index == 7 {
+				return Err(WebError::Cursor);
+			}
+			let next = document.next.as_deref().ok_or(WebError::Cursor)?;
+			page = spec.validate_page(next, Some(&name))?;
+			document = self::document(&ctx, &spec, &page, Some(&name), true).await?;
+		}
+		if !found {
+			return Err(WebError::Cursor);
+		}
+		if document.posts.is_empty() {
+			if let Some(next) = document.next.as_deref() {
+				page = spec.validate_page(next, Some(&name))?;
+				document = self::document(&ctx, &spec, &page, Some(&name), true).await?;
+				source.last = None;
+			}
+		}
 	}
 	let own_first = spec.communities.len() == 1 && !matches!(name.as_str(), "popular" | "all") && spec.cursor.is_none();
 	if !own_first {
@@ -843,7 +881,41 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 		let community = spec.communities.first().map(String::as_str);
 		let initial = spec.initial(community);
 		let page = spec.cursor.as_ref().and_then(|c| c.sources[0].page.as_deref()).unwrap_or(&initial);
-		let mut doc = if spec.cursor.is_some() {
+		let mut doc = if spec.recover {
+			let resume = spec.cursor.as_ref().and_then(|c| c.sources[0].resume.as_deref()).ok_or(WebError::Cursor)?;
+			let mut doc = document(&ctx, &spec, &initial, community, true).await?;
+			let mut found = false;
+			for _ in 0..8 {
+				if let Some(at) = doc.comments.iter().position(|c| c["data"]["name"].as_str() == Some(resume)) {
+					doc.comments.drain(..=at);
+					found = true;
+					if !doc.comments.is_empty() {
+						break;
+					}
+				}
+				let root = format!("t3_{}", spec.post.as_deref().unwrap());
+				let more = doc.more.iter().find(|m| m.parent == root);
+				let form = more.map(|m| Form {
+					cursor: m.cursor.clone(),
+					parent: m.parent.clone(),
+				});
+				let page = more.map(|m| m.path.as_str()).or(doc.next.as_deref()).ok_or(WebError::Cursor)?;
+				let page = spec.validate_page(page, community)?;
+				let body = ctx.fetch(&spec, &page, community, form.as_ref()).await?;
+				let names = community.map_or(vec![], |name| vec![name.to_string()]);
+				let extra = html::parse(&body, spec.post.as_deref(), &names, ctx.quarantine).map_err(|error| ctx.note(error))?;
+				doc.comments = extra.comments;
+				doc.more = extra.more;
+				doc.next = extra.next;
+				if found && !doc.comments.is_empty() {
+					break;
+				}
+			}
+			if !found || doc.comments.is_empty() {
+				return Err(WebError::Cursor);
+			}
+			doc
+		} else if spec.cursor.is_some() {
 			let form = spec.cursor.as_ref().and_then(|c| c.sources[0].form.as_ref());
 			let mut original = document(&ctx, &spec, &initial, community, false).await?;
 			let body = ctx.fetch(&spec, page, community, form).await?;
@@ -883,6 +955,13 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				.ok_or(WebError::Temporary("focused_comment_missing"))?;
 			doc.comments = vec![found.0];
 		}
+		let resume = doc
+			.comments
+			.iter()
+			.rev()
+			.find(|c| c["kind"] == "t1")
+			.and_then(|c| c["data"]["name"].as_str())
+			.map(str::to_string);
 		let more = doc
 			.more
 			.drain(..)
@@ -904,6 +983,7 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				done: next.is_none(),
 				served: 0,
 				form,
+				resume,
 			}],
 			ctx.lane,
 			Some(ctx.session.clone()),
@@ -917,7 +997,8 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				last: None,
 				done: false,
 				served: 0,
-				form: None
+				form: None,
+				resume: None
 			};
 			spec.communities.len()
 		]
@@ -937,7 +1018,8 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				last: None,
 				done: true,
 				served: 0,
-				form: None
+				form: None,
+				resume: None
 			},
 			None
 		);
@@ -988,6 +1070,7 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 		positions[i] += 1;
 		let id = post["data"]["name"].as_str().ok_or(WebError::Temporary("post_id"))?.to_string();
 		sides[i].1.last = Some(id.clone());
+		sides[i].1.resume = Some(id.clone());
 		if seen.insert(id) {
 			sides[i].1.served = sides[i].1.served.saturating_add(1);
 			posts.push(post);
@@ -1041,16 +1124,18 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 	let mut first = ctx.budget.finish(first);
 	if primary == RedditLane::Tor && matches!(first, Err(WebError::RateLimited(_))) {
 		let session = renew_tor_transport(&ctx.session, quarantine)?;
-		if spec.cursor.is_some() {
-			// A server-issued continuation belongs to its old cookie jar. Renew
-			// new reads, but never replay that continuation under a new identity.
-			return Err(WebError::Cursor);
-		}
 		ctx = context(primary, session, Arc::new(ctx.budget.new_attempt()));
-		first = tokio::time::timeout(Duration::from_secs(30), read_on_lane(ctx.clone(), spec.clone()))
+		let mut retry = spec.clone();
+		retry.recover = retry.cursor.is_some();
+		first = tokio::time::timeout(Duration::from_secs(30), read_on_lane(ctx.clone(), retry))
 			.await
 			.unwrap_or(Err(WebError::Temporary("timeout")));
 		first = ctx.budget.finish(first);
+		if spec.cursor.is_some() && matches!(first, Err(WebError::Temporary("wire_bound" | "body_bound" | "timeout"))) {
+			// A deep bookmark may exceed this read's recovery budget. Restart
+			// once without it instead of retrying the same expensive scan.
+			first = Err(WebError::Cursor);
+		}
 	}
 	if let Err(error) = &first {
 		info!(
