@@ -7,6 +7,7 @@ struct Fixture {
 	server: tokio::task::JoinHandle<Result<(), hyper::Error>>,
 	calls: Arc<AtomicUsize>,
 	auth: Arc<AtomicUsize>,
+	reject: Arc<AtomicBool>,
 	seen: Arc<Notify>,
 	release: Arc<Notify>,
 }
@@ -21,20 +22,30 @@ impl Fixture {
 		use std::convert::Infallible;
 		let calls = Arc::new(AtomicUsize::new(0));
 		let auth = Arc::new(AtomicUsize::new(0));
+		let reject = Arc::new(AtomicBool::new(false));
 		let seen = Arc::new(Notify::new());
 		let release = Arc::new(Notify::new());
-		let shared = (calls.clone(), auth.clone(), seen.clone(), release.clone());
+		let shared = (calls.clone(), auth.clone(), reject.clone(), seen.clone(), release.clone());
 		let service = make_service_fn(move |_| {
 			let shared = shared.clone();
 			async move {
 				Ok::<_, Infallible>(service_fn(move |request: HyperRequest<Body>| {
-					let (calls, auth, seen, release) = shared.clone();
+					let (calls, auth, reject, seen, release) = shared.clone();
 					async move {
 						if request.uri().path().starts_with("/auth/") {
 							auth.fetch_add(1, Ordering::SeqCst);
 							return Ok::<_, Infallible>(HyperResponse::new(Body::from(r#"{"access_token":"unexpected-refresh","expires_in":3600}"#)));
 						}
 						let number = calls.fetch_add(1, Ordering::SeqCst);
+						if reject.load(Ordering::SeqCst) {
+							return Ok(
+								HyperResponse::builder()
+									.status(404)
+									.header("content-type", "application/json")
+									.body(Body::from(r#"{"error":404}"#))
+									.unwrap(),
+							);
+						}
 						let payload: Value = serde_json::from_slice(&hyper::body::to_bytes(request.into_body()).await.unwrap()).unwrap();
 						if hold_first && number == 0 {
 							seen.notify_one();
@@ -69,6 +80,7 @@ impl Fixture {
 			server: tokio::spawn(server),
 			calls,
 			auth,
+			reject,
 			seen,
 			release,
 		}
@@ -325,5 +337,162 @@ fn test_quota_discovery_standby_busy_slots_recover_on_tor_without_recursive_stan
 		assert_eq!(DIRECT_STANDBY_CAPACITY.available_permits(), 2);
 		assert_eq!(tor.auth.load(Ordering::SeqCst), 0);
 		assert_eq!(direct.auth.load(Ordering::SeqCst), 0);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_discovery_standby_late_ready_direct_recovers_already_selected_tor_follower() {
+	use std::future::Future;
+	tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+		let tor = Fixture::new(true).await;
+		let direct = Fixture::new(false).await;
+		tor.install(RedditLane::Tor);
+		direct.install(RedditLane::Direct);
+		let path = "/comments/abc.json";
+		let endpoint = api_endpoint_index(path);
+		upstream_guard(RedditLane::Direct).transport_health_mut(endpoint).blocked_until = Some(Instant::now() + Duration::from_secs(60));
+		let owner = tokio::spawn(json_uncached_on_lane(path.into(), false, RedditLane::Tor));
+		tokio::time::timeout(Duration::from_secs(2), tor.seen.notified()).await.unwrap();
+		let owner_id = upstream_guard(RedditLane::Tor).graphql_quota.discovery_owner.unwrap();
+		assert_eq!(preferred_api_lane(Instant::now(), path), RedditLane::Tor);
+		let mut follower = Box::pin(json_uncached_routed(path.into(), false));
+		// Poll into Tor's admission wait before making Direct ready. This proves
+		// recovery after routing, rather than the initial ready-standby shortcut.
+		assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(follower.as_mut().poll(cx))).await.is_pending());
+		assert_eq!(direct.calls.load(Ordering::SeqCst), 0);
+		upstream_guard(RedditLane::Direct).transport_health_mut(endpoint).blocked_until = None;
+		let result = tokio::time::timeout(Duration::from_millis(3250), &mut follower).await;
+		assert!(result.is_ok(), "an already-selected Tor discovery follower must recheck the newly ready Direct lane");
+		assert!(result.unwrap().is_ok());
+		assert_eq!(tor.calls.load(Ordering::SeqCst), 1);
+		assert_eq!(direct.calls.load(Ordering::SeqCst), 2);
+		assert_eq!(upstream_guard(RedditLane::Tor).graphql_quota.discovery_owner, Some(owner_id));
+		assert_eq!(upstream_guard(RedditLane::Tor).graphql_quota.outstanding, 1);
+		tor.release.notify_one();
+		assert!(owner.await.unwrap().0.is_ok());
+		assert_eq!(upstream_guard(RedditLane::Tor).graphql_quota.discovery_owner, None);
+		assert_eq!(api_concurrency(RedditLane::Tor).available_permits(), max_concurrent_api_requests());
+		assert_eq!(DIRECT_STANDBY_CAPACITY.available_permits(), 2);
+		assert_eq!(tor.auth.load(Ordering::SeqCst), 0);
+		assert_eq!(direct.auth.load(Ordering::SeqCst), 0);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_discovery_standby_recheck_requires_exact_denial_probe_and_current_guards() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let tor = Fixture::new(false).await;
+		let direct = Fixture::new(false).await;
+		let path = "/comments/abc.json";
+		let endpoint = api_endpoint_index(path);
+		for change in 0..14 {
+			tor.install(RedditLane::Tor);
+			direct.install(RedditLane::Direct);
+			let owner = upstream_guard(RedditLane::Tor).try_admit_endpoint(Instant::now(), 0, endpoint).unwrap();
+			let denied = begin_upstream_attempt_once(RedditLane::Tor, false, endpoint)
+				.err()
+				.expect("held discovery must deny a follower");
+			assert_eq!(denied.admission.unwrap().source, "quota_discovery");
+			let ticket = denied.discovery_wait.unwrap();
+			assert!(matches!(denied.recovery_reason(RedditLane::Tor), LaneRecoveryReason::QuotaDiscoveryPending { ticket: actual, .. } if actual == ticket));
+			assert_eq!(ticket.owner, owner.request_id);
+			assert!(discovery_standby_ready(path, ticket));
+			assert!(!discovery_standby_ready("/api/site_admin.json", ticket), "another quota budget cannot reuse this denial");
+			let mut busy_slots = None;
+			match change {
+				0 => upstream_guard(RedditLane::Tor).graphql_quota.discovery_owner = None,
+				1 => upstream_guard(RedditLane::Tor).graphql_quota.discovery_owner = Some(ticket.owner + 1),
+				2 => upstream_guard(RedditLane::Tor).graphql_quota.epoch += 1,
+				3 => upstream_guard(RedditLane::Tor).install_oauth_generation(1, true),
+				4 => upstream_guard(RedditLane::Tor).graphql_rate_limit_blocked_until = Some(Instant::now() + Duration::from_secs(60)),
+				5 => {
+					upstream_guard(RedditLane::Tor).graphql_quota.window = QuotaWindow::Known {
+						available: 0,
+						reset_at: Instant::now() + Duration::from_secs(60),
+					}
+				}
+				6 => upstream_guard(RedditLane::Tor).rejected_oauth_generation = Some(0),
+				7 => upstream_guard(RedditLane::Tor).transport_health_mut(endpoint).blocked_until = Some(Instant::now() + Duration::from_secs(60)),
+				8 => set_owned_discovery(RedditLane::Direct, QuotaBudget::Graphql),
+				9 => upstream_guard(RedditLane::Direct).graphql_rate_limit_blocked_until = Some(Instant::now() + Duration::from_secs(60)),
+				10 => upstream_guard(RedditLane::Direct).transport_health_mut(endpoint).blocked_until = Some(Instant::now() + Duration::from_secs(60)),
+				11 => upstream_guard(RedditLane::Direct).rejected_oauth_generation = Some(0),
+				12 => busy_slots = Some(DIRECT_STANDBY_CAPACITY.acquire_many(2).await.unwrap()),
+				_ => upstream_guard(RedditLane::Tor).graphql_quota.window = QuotaWindow::Unreported,
+			}
+			assert!(
+				!discovery_standby_ready(path, ticket),
+				"changed owner, identity, epoch, quota, session or capacity must keep the original Tor engine"
+			);
+			drop(busy_slots);
+			drop(owner);
+		}
+		assert_eq!(tor.calls.load(Ordering::SeqCst), 0);
+		assert_eq!(direct.calls.load(Ordering::SeqCst), 0);
+		assert_eq!(tor.auth.load(Ordering::SeqCst), 0);
+		assert_eq!(direct.auth.load(Ordering::SeqCst), 0);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_quota_discovery_standby_recheck_defaults_and_used_standby_continue_tor() {
+	tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+		// Each follower remains blocked beyond the local two-second retry budget.
+		// A disabled/noneligible handoff must continue recovering on Tor, not
+		// expose the intermediate discovery error or try standby recursively.
+		for scenario in 0..5 {
+			let tor = Fixture::new(true).await;
+			let direct = Fixture::new(false).await;
+			tor.install(RedditLane::Tor);
+			direct.install(RedditLane::Direct);
+			let path = "/comments/abc.json";
+			let endpoint = api_endpoint_index(path);
+			let owner = tokio::spawn(json_uncached_on_lane(path.into(), false, RedditLane::Tor));
+			tokio::time::timeout(Duration::from_secs(2), tor.seen.notified()).await.unwrap();
+			let mut busy_slots = None;
+			match scenario {
+				1 => direct.reject.store(true, Ordering::SeqCst),
+				2 => set_owned_discovery(RedditLane::Direct, QuotaBudget::Graphql),
+				3 => upstream_guard(RedditLane::Direct).transport_health_mut(endpoint).blocked_until = Some(Instant::now() + Duration::from_secs(60)),
+				4 => busy_slots = Some(DIRECT_STANDBY_CAPACITY.acquire_many(2).await.unwrap()),
+				_ => {}
+			}
+			let mut follower = tokio::spawn(async move {
+				match scenario {
+					0 => json_uncached_on_lane(path.into(), false, RedditLane::Tor).await.0,
+					1 => direct_then_tor_request(path.into(), false).await,
+					_ => json_uncached_routed(path.into(), false).await,
+				}
+			});
+			assert!(
+				tokio::time::timeout(Duration::from_millis(2100), &mut follower).await.is_err(),
+				"noneligible/default/final Tor recovery must remain pending instead of returning the local discovery error"
+			);
+			let expected_direct = usize::from(scenario == 1);
+			assert_eq!(direct.calls.load(Ordering::SeqCst), expected_direct);
+			if scenario == 1 {
+				let direct_state = lane_routing_state(RedditLane::Direct, Instant::now(), path);
+				assert_eq!(direct_state.availability, LaneAvailability::Ready);
+				assert!(!direct_state.discovery_pending, "only the disabled final-Tor handoff prevents another ready-Direct attempt");
+			}
+			assert_eq!(tor.calls.load(Ordering::SeqCst), 1);
+			tor.release.notify_one();
+			assert!(owner.await.unwrap().0.is_ok());
+			assert!(tokio::time::timeout(Duration::from_secs(2), follower).await.unwrap().unwrap().is_ok());
+			assert_eq!(tor.calls.load(Ordering::SeqCst), 4);
+			assert_eq!(
+				direct.calls.load(Ordering::SeqCst),
+				expected_direct,
+				"no new standby call after fallback has already been used"
+			);
+			drop(busy_slots);
+			assert_eq!(api_concurrency(RedditLane::Tor).available_permits(), max_concurrent_api_requests());
+			assert_eq!(DIRECT_STANDBY_CAPACITY.available_permits(), 2);
+			assert_eq!(tor.auth.load(Ordering::SeqCst), 0);
+			assert_eq!(direct.auth.load(Ordering::SeqCst), 0);
+		}
 	});
 }
