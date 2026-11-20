@@ -336,6 +336,9 @@ impl PageRequest {
 						.filter(|id| id.starts_with("t3_"))
 						.map(str::to_string)
 						.collect();
+					if ids.is_empty() && edges.iter().any(|edge| edge["node"]["adPayload"].is_null()) {
+						return Err(invalid("missing_feed_post_ids"));
+					}
 					("PostsByIds", POSTS, ids, "postsInfoByIds")
 				}
 				Step::CommentIds(index) => {

@@ -43,7 +43,15 @@ impl GraphqlError {
 	pub(crate) fn resource(message: &str) -> Self {
 		Self {
 			kind: ErrorKind::Resource,
-			reason: "resource",
+			reason: match message {
+				"private" => "private",
+				"banned" => "banned",
+				"quarantined" => "quarantined",
+				"gated" => "gated",
+				"Post not found" => "post_not_found",
+				"User not found" => "user_not_found",
+				_ => "resource",
+			},
 			message: message.into(),
 		}
 	}
@@ -133,10 +141,8 @@ impl CommentsRequest {
 		if let Some(error) = response_error(value) {
 			return Err(error);
 		}
-		let post = value["data"]["postsInfoByIds"]
-			.as_array()
-			.and_then(|posts| posts.iter().find(|p| p["id"] == self.post_id))
-			.ok_or_else(|| GraphqlError::resource("Post not found"))?;
+		let posts = value["data"]["postsInfoByIds"].as_array().ok_or_else(|| GraphqlError::invalid("missing_post_metadata"))?;
+		let post = posts.iter().find(|p| p["id"] == self.post_id).ok_or_else(|| GraphqlError::resource("Post not found"))?;
 		if post["subreddit"]["isQuarantined"] == true && !quarantine {
 			return Err(GraphqlError::resource("quarantined"));
 		}
@@ -643,6 +649,62 @@ mod tests {
 		let text = crate::utils::parse_post(&convert(text)).await;
 		assert!(!text.body.contains("<img src=x"));
 		assert!(text.body.contains("<pre><code>code"));
+	}
+
+	#[test]
+	fn test_graphql_comments_resource_diagnostics_use_only_fixed_classifications() {
+		for (message, reason) in [
+			("private", "private"),
+			("banned", "banned"),
+			("quarantined", "quarantined"),
+			("gated", "gated"),
+			("Post not found", "post_not_found"),
+			("User not found", "user_not_found"),
+			("arbitrary upstream detail", "resource"),
+		] {
+			let error = GraphqlError::resource(message);
+			assert_eq!(error.kind, ErrorKind::Resource);
+			assert_eq!(error.message, message);
+			assert_eq!(error.reason, reason);
+		}
+	}
+
+	#[test]
+	fn test_graphql_comments_missing_post_metadata_is_transient_not_resource() {
+		let request = CommentsRequest::from_path("/comments/abc.json").unwrap();
+		for value in [
+			json!({}),
+			json!({"data":null}),
+			json!({"data":{}}),
+			json!({"data":{"postsInfoByIds":null}}),
+			json!({"data":{"postsInfoByIds":{"id":"t3_abc"}}}),
+			json!({"data":{"postsInfoByIds":"unexpected"}}),
+		] {
+			let error = request.post(&value, false).unwrap_err();
+			assert_eq!(error.kind, ErrorKind::Invalid, "missing response shape does not prove a missing post: {value}");
+			assert_eq!(error.reason, "missing_post_metadata");
+			assert!(error.message.starts_with("Reddit is temporarily unable to load comments"));
+		}
+		for (value, message) in [
+			(json!({"data":{"postsInfoByIds":[]}}), "Post not found"),
+			(json!({"data":{"postsInfoByIds":[{"id":"t3_other"}]}}), "Post not found"),
+			(
+				json!({"data":{"postsInfoByIds":[{"id":"t3_abc","__typename":"SubredditPost","subreddit":{"type":"PRIVATE"}}]}}),
+				"private",
+			),
+			(
+				json!({"data":{"postsInfoByIds":[{"id":"t3_abc","__typename":"SubredditPost","subreddit":{"isQuarantined":true}}]}}),
+				"quarantined",
+			),
+			(json!({"data":{"postsInfoByIds":[{"id":"t3_abc","__typename":"DeletedPost"}]}}), "gated"),
+			(json!({"errors":[{"extensions":{"code":"NOT_FOUND"}}]}), "Post not found"),
+		] {
+			let error = request.post(&value, false).unwrap_err();
+			assert_eq!(error.kind, ErrorKind::Resource);
+			assert_eq!(error.message, message);
+		}
+		let valid = json!({"data":{"postsInfoByIds":[{"id":"t3_abc","__typename":"SubredditPost","subreddit":{"type":"PUBLIC"}}]}});
+		assert_eq!(request.post(&valid, false).unwrap()["data"]["id"], "abc");
 	}
 
 	#[test]
