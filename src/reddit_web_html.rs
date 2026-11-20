@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 #[derive(Debug)]
 pub(super) struct Document {
 	pub posts: Vec<Value>,
+	pub pins: Vec<(String, String)>,
 	pub comments: Vec<Value>,
 	pub next: Option<String>,
 	pub fragments: Vec<String>,
@@ -29,14 +30,20 @@ pub(super) struct More {
 }
 
 static POSTS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-post, #siteTable .thing[data-fullname^='t3_']"));
+static HIGHLIGHTS: LazyLock<Selector> = LazyLock::new(|| selector("community-highlight-carousel community-highlight-card[highlighted]"));
 static COMMENTS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-comment[thingid], .comment[data-fullname^='t1_']"));
 static BODY: LazyLock<Selector> = LazyLock::new(|| selector("[slot='text-body'], .usertext-body .md"));
 static COMMENT_BODY: LazyLock<Selector> = LazyLock::new(|| selector("[slot='comment'], .usertext-body .md"));
 static REMOVED_COMMENT: LazyLock<Selector> = LazyLock::new(|| selector("div.md > div.scalable-text > p.text-neutral-content-weak"));
 static TITLE: LazyLock<Selector> = LazyLock::new(|| selector("a.title, [slot='title']"));
-static IMAGES: LazyLock<Selector> = LazyLock::new(|| selector("img[src]"));
+static IMAGES: LazyLock<Selector> = LazyLock::new(|| selector("img[src], img[data-lazy-src], img[data-src], img[srcset], img[data-lazy-srcset]"));
+static GALLERIES: LazyLock<Selector> = LazyLock::new(|| selector("gallery-carousel"));
+static SLIDES: LazyLock<Selector> = LazyLock::new(|| selector("li[slot^='page-']"));
+static CAPTIONS: LazyLock<Selector> = LazyLock::new(|| selector("figcaption"));
+static LINKS: LazyLock<Selector> = LazyLock::new(|| selector("a[href]"));
 static PLAYERS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-player, video"));
 static FLAIR: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-post-flair, .linkflairlabel, [slot='post-flair']"));
+static STYLED: LazyLock<Selector> = LazyLock::new(|| selector("[style]"));
 static FRAGMENTS: LazyLock<Selector> = LazyLock::new(|| selector("faceplate-partial[src], shreddit-async-loader[src]"));
 static FORM_CURSOR: LazyLock<Selector> = LazyLock::new(|| selector("input[name='cursor']"));
 static MORE_COUNT: LazyLock<Selector> = LazyLock::new(|| selector("faceplate-number[number]"));
@@ -293,11 +300,165 @@ fn image_url(value: &str) -> Option<String> {
 		return None;
 	}
 	let rewritten = crate::utils::format_url(&value);
-	["/img/", "/preview/", "/thumb/", "/emote/"]
+	["/img/", "/preview/", "/thumb/", "/emote/", "/emoji/"]
 		.iter()
 		.any(|prefix| rewritten.starts_with(prefix))
 		.then_some(value)
 }
+
+#[derive(Clone)]
+struct WebImage {
+	url: String,
+	width: i64,
+	height: i64,
+}
+impl WebImage {
+	fn preview(&self) -> Value {
+		json!({"url":self.url,"width":self.width,"height":self.height})
+	}
+	fn gallery(&self) -> Value {
+		json!({"u":self.url,"x":self.width,"y":self.height})
+	}
+}
+fn image_dimension(value: &str) -> Option<i64> {
+	value.parse::<i64>().ok().filter(|n| (1..=32768).contains(n))
+}
+fn image_sources(image: ElementRef<'_>) -> Vec<WebImage> {
+	let base = ["src", "data-lazy-src", "data-src"].iter().find_map(|name| attr(image, &[name]).and_then(image_url));
+	let base = base.as_deref().and_then(|url| url::Url::parse(url).ok());
+	let base_dimension = |key| {
+		base
+			.as_ref()
+			.and_then(|url| url.query_pairs().find(|(name, _)| name == key))
+			.and_then(|(_, value)| image_dimension(&value))
+	};
+	let width = attr(image, &["width"]).and_then(image_dimension).or_else(|| base_dimension("width")).unwrap_or(0);
+	let height = attr(image, &["height"]).and_then(image_dimension).or_else(|| base_dimension("height")).unwrap_or(0);
+	let candidate = |raw: &str, descriptor: Option<i64>| {
+		let url = image_url(raw)?;
+		let parsed = url::Url::parse(&url).ok()?;
+		let parameter = |key| parsed.query_pairs().find(|(name, _)| name == key).and_then(|(_, value)| image_dimension(&value));
+		let w = parameter("width").or(descriptor).unwrap_or(width);
+		let h = parameter("height").unwrap_or_else(|| if width > 0 && height > 0 && w > 0 { (height * w / width).max(1) } else { height });
+		Some(WebImage { url, width: w, height: h })
+	};
+	let mut sources = ["src", "data-lazy-src", "data-src"]
+		.iter()
+		.find_map(|name| attr(image, &[name]).and_then(|raw| candidate(raw, None)))
+		.into_iter()
+		.collect::<Vec<_>>();
+	if let Some(srcset) = attr(image, &["srcset", "data-lazy-srcset"]).filter(|raw| raw.len() <= 16384) {
+		for source in srcset.split(',').take(32) {
+			let parts = source.split_whitespace().collect::<Vec<_>>();
+			let [url, descriptor] = parts.as_slice() else { continue };
+			let width = descriptor.strip_suffix('w').and_then(image_dimension).or_else(|| {
+				let density = descriptor.strip_suffix('x')?.parse::<f64>().ok().filter(|n| n.is_finite() && (0.1..=8.0).contains(n))?;
+				let scaled = (width as f64 * density).round() as i64;
+				(1..=32768).contains(&scaled).then_some(scaled)
+			});
+			let Some(width) = width else {
+				continue;
+			};
+			if let Some(source) = candidate(url, Some(width)) {
+				if !sources.iter().any(|old| old.url == source.url) {
+					sources.push(source);
+				}
+			}
+		}
+	}
+	sources
+}
+fn post_media_image(image: ElementRef<'_>, post: ElementRef<'_>) -> bool {
+	owned_by(image, post, post_element)
+		&& !inside_content(image)
+		&& !auxiliary(image)
+		&& image.value().attr("role") != Some("presentation")
+		&& !class(image, "post-background-image-filter")
+		&& !image.ancestors().filter_map(ElementRef::wrap).any(|ancestor| {
+			ancestor.value().attr("avatar").is_some()
+				|| (gallery_element(ancestor) && attr(ancestor, &["post-id"]).is_some_and(|owner| attr(post, &["id", "data-fullname"]) != Some(owner)))
+				|| matches!(
+					ancestor.value().attr("slot"),
+					Some("credit-bar" | "authorName" | "authorIcon" | "post-flair" | "commentAvatar")
+				)
+		})
+}
+fn gallery_element(element: ElementRef<'_>) -> bool {
+	element.value().name() == "gallery-carousel"
+}
+fn slide_element(element: ElementRef<'_>) -> bool {
+	element.value().name() == "li" && element.value().attr("slot").is_some_and(|slot| slot.starts_with("page-"))
+}
+
+// Read the gallery's visible pages, not the duplicate background and lightbox
+// images. Original URLs and signed preview variants come only from this post's
+// own HTML; never invent a media URL or fetch metadata through the API.
+fn gallery_data(post: ElementRef<'_>, id: &str) -> Result<Option<(Value, Value)>, WebError> {
+	let Some(carousel) = post.select(&GALLERIES).find(|gallery| {
+		owned_by(*gallery, post, post_element) && !inside_content(*gallery) && !auxiliary(*gallery) && attr(*gallery, &["post-id"]).is_none_or(|owner| owner == format!("t3_{id}"))
+	}) else {
+		return Ok(None);
+	};
+	let mut slides = carousel.select(&SLIDES).filter(|slide| owned_by(*slide, carousel, gallery_element)).collect::<Vec<_>>();
+	if slides.len() > 100 {
+		return Err(WebError::Temporary("gallery_bound"));
+	}
+	slides.sort_by_key(|slide| {
+		attr(*slide, &["slot"])
+			.and_then(|slot| slot.strip_prefix("page-"))
+			.and_then(|value| value.parse::<u16>().ok())
+			.unwrap_or(u16::MAX)
+	});
+	let mut pages = HashSet::new();
+	if slides.iter().any(|slide| {
+		!attr(*slide, &["slot"])
+			.and_then(|slot| slot.strip_prefix("page-"))
+			.and_then(|value| value.parse::<u16>().ok())
+			.is_some_and(|page| page > 0 && pages.insert(page))
+	}) {
+		return Err(WebError::Temporary("gallery_order"));
+	}
+	let mut items = Vec::new();
+	let mut metadata = serde_json::Map::new();
+	for slide in slides {
+		let owned = |image: ElementRef<'_>| post_media_image(image, post) && owned_by(image, slide, slide_element);
+		let images = slide.select(&IMAGES).filter(|image| owned(*image)).collect::<Vec<_>>();
+		let preview = images
+			.iter()
+			.copied()
+			.find(|image| class(*image, "non-lightboxed-content"))
+			.or_else(|| images.first().copied());
+		let mut previews = preview.map(image_sources).unwrap_or_default();
+		previews.sort_by_key(|image| image.width);
+		let original = images.iter().copied().filter(|image| !class(*image, "non-lightboxed-content")).find_map(|image| {
+			image_sources(image)
+				.into_iter()
+				.find(|source| url::Url::parse(&source.url).is_ok_and(|url| url.host_str() == Some("i.redd.it")))
+		});
+		let Some(mut original) = original.or_else(|| previews.last().cloned()) else { continue };
+		if original.width == 0 || original.height == 0 {
+			if let Some(image) = preview {
+				original.width = attr(image, &["width"]).and_then(image_dimension).unwrap_or(original.width);
+				original.height = attr(image, &["height"]).and_then(image_dimension).unwrap_or(original.height);
+			}
+		}
+		let media_id = format!("web{}", items.len());
+		let caption = slide.select(&CAPTIONS).find(|caption| owned_by(*caption, slide, slide_element));
+		let outbound = caption.and_then(|caption| caption.select(&LINKS).find_map(|link| attr(link, &["href"]).and_then(safe_link)));
+		items.push(json!({"media_id":media_id,"caption":caption.map(text).unwrap_or_default(),"outbound_url":outbound.unwrap_or_default()}));
+		let animated = url::Url::parse(&original.url).is_ok_and(|url| url.path().ends_with(".gif"));
+		let mut source = original.gallery();
+		if animated {
+			source["gif"] = json!(original.url);
+		}
+		metadata.insert(
+			media_id,
+			json!({"status":"valid","e":if animated {"AnimatedImage"} else {"Image"},"s":source,"p":previews.iter().map(WebImage::gallery).collect::<Vec<_>>()}),
+		);
+	}
+	Ok((!items.is_empty()).then(|| (json!({"items":items}), Value::Object(metadata))))
+}
+
 fn video_source(value: &str, hls: bool) -> Option<String> {
 	let value = safe_link(value)?;
 	let url = url::Url::parse(&value).ok()?;
@@ -331,6 +492,61 @@ fn timestamp(value: Option<&str>) -> f64 {
 }
 fn number(element: ElementRef<'_>, names: &[&str]) -> i64 {
 	attr(element, names).and_then(|value| value.parse().ok()).unwrap_or_default()
+}
+fn post_flair(data: &mut Value, flair: ElementRef<'_>) {
+	fn parts(element: ElementRef<'_>, depth: usize, result: &mut Vec<Value>) {
+		if depth > 16 || result.len() >= 64 {
+			return;
+		}
+		for child in element.children() {
+			if result.len() >= 64 {
+				break;
+			}
+			if let Some(text) = child.value().as_text().filter(|text| !text.trim().is_empty()) {
+				result.push(json!({"e":"text","t":text.to_string()}));
+			} else if let Some(child) = ElementRef::wrap(child) {
+				if matches!(child.value().name(), "script" | "style" | "template" | "svg") {
+					continue;
+				}
+				if child.value().name() == "img" {
+					if let Some(url) = attr(child, &["src"])
+						.and_then(image_url)
+						.filter(|url| !url.chars().any(|c| matches!(c, '\'' | '"' | '(' | ')' | ';')))
+					{
+						result.push(json!({"e":"emoji","u":url,"a":attr(child,&["alt"]).unwrap_or_default()}));
+					}
+				} else {
+					parts(child, depth + 1, result);
+				}
+			}
+		}
+	}
+	let mut rich = Vec::new();
+	parts(flair, 0, &mut rich);
+	data["link_flair_type"] = json!("richtext");
+	data["link_flair_richtext"] = json!(rich);
+	data["link_flair_text_color"] = json!("inherit");
+	for node in std::iter::once(flair).chain(flair.select(&STYLED)) {
+		for declaration in attr(node, &["style"]).unwrap_or_default().split(';') {
+			let Some((name, value)) = declaration.split_once(':') else { continue };
+			let value = value.trim();
+			let Some(hex) = value
+				.strip_prefix('#')
+				.filter(|hex| matches!(hex.len(), 3 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+			else {
+				continue;
+			};
+			if name.trim().eq_ignore_ascii_case("background-color") {
+				data["link_flair_background_color"] = json!(value);
+				if data["link_flair_text_color"] == "inherit" {
+					data["link_flair_text_color"] = json!("light");
+				}
+			}
+			if name.trim().eq_ignore_ascii_case("color") {
+				data["link_flair_text_color"] = json!(if matches!(hex, "000" | "000000") { "dark" } else { "light" });
+			}
+		}
+	}
 }
 fn text(element: ElementRef<'_>) -> String {
 	element.text().collect::<String>().trim().to_string()
@@ -513,7 +729,7 @@ fn parse_post(element: ElementRef<'_>, communities: &[String], quarantine: bool)
 	let external = attr(element, &["content-href", "data-url"]).and_then(safe_link).unwrap_or_else(|| permalink.clone());
 	let self_post = attr(element, &["post-type"]).is_some_and(|kind| matches!(kind, "text" | "self"))
 		|| reddit_path(&external).is_some_and(|path| path.split('?').next() == Some(permalink.as_str()));
-	let flair = element.select(&FLAIR).find(|flair| owned_by(*flair, element, post_element)).map(text).unwrap_or_default();
+	let flair = element.select(&FLAIR).find(|flair| owned_by(*flair, element, post_element));
 	let comment_count = attr(element, &["comment-count", "data-comments-count"]).and_then(|value| value.parse::<u64>().ok());
 	let mut data = json!({
 		"id":id,"name":format!("t3_{id}"),"title":title,"permalink":permalink,"subreddit":sub,
@@ -526,21 +742,49 @@ fn parse_post(element: ElementRef<'_>, communities: &[String], quarantine: bool)
 		"spoiler":flag(element,&["spoiler","is-spoiler"])||class(element,"spoiler"),
 		"stickied":flag(element,&["stickied","is-stickied","pinned","is-pinned"])||class(element,"stickied"),
 		"locked":flag(element,&["locked","is-locked"]),"archived":flag(element,&["archived","is-archived"]),
-		"link_flair_text":flair,"all_awardings":[],"thumbnail":"","post_hint":"","is_video":false,
+		"link_flair_text":flair.map(text).unwrap_or_default(),"all_awardings":[],"thumbnail":"","post_hint":"","is_video":false,
 		"removed_by_category":if flag(element,&["removed","is-removed"]){"moderator"}else{""}
 	});
-	if let Some(image) = element
-		.select(&IMAGES)
-		.find(|image| owned_by(*image, element, post_element) && !inside_content(*image))
-		.and_then(|image| image_url(attr(image, &["src"])?).map(|url| (url, number(image, &["width"]).max(0), number(image, &["height"]).max(0))))
+	if let Some(flair) = flair {
+		post_flair(&mut data, flair);
+	}
+	if let Some(ratio) = attr(element, &["upvote-ratio"])
+		.and_then(|ratio| ratio.parse::<f64>().ok())
+		.filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio))
 	{
-		data["thumbnail"] = json!(image.0);
-		data["preview"] = json!({"images":[{"source":{"url":image.0,"width":image.1,"height":image.2},"resolutions":[],"variants":{}}]});
+		data["upvote_ratio"] = json!(ratio);
+	}
+	let mut images = element.select(&IMAGES).filter(|image| post_media_image(*image, element)).collect::<Vec<_>>();
+	images.sort_by_key(|image| {
+		!image
+			.ancestors()
+			.filter_map(ElementRef::wrap)
+			.any(|parent| parent.value().attr("slot") == Some("thumbnail") || class(parent, "thumbnail"))
+	});
+	if let Some(mut sources) = images.into_iter().find_map(|image| {
+		let sources = image_sources(image);
+		(!sources.is_empty()).then_some(sources)
+	}) {
+		let thumbnail = &sources[0];
+		data["thumbnail"] = json!(thumbnail.url);
+		data["thumbnail_width"] = json!(thumbnail.width);
+		data["thumbnail_height"] = json!(thumbnail.height);
+		sources.sort_by_key(|image| image.width);
+		data["preview"] = json!({"images":[{"source":sources.last().unwrap().preview(),"resolutions":sources.iter().map(WebImage::preview).collect::<Vec<_>>(),"variants":{}}]});
+	}
+	if let Some((gallery, metadata)) = gallery_data(element, id)? {
+		data["is_gallery"] = json!(true);
+		data["is_self"] = json!(false);
+		data["gallery_data"] = gallery;
+		data["media_metadata"] = metadata;
 	}
 	if image_url(&external).is_some() && !self_post {
 		data["post_hint"] = json!("image")
 	}
-	if let Some(player) = element.select(&PLAYERS).find(|player| owned_by(*player, element, post_element) && !inside_content(*player)) {
+	if let Some(player) = element
+		.select(&PLAYERS)
+		.find(|player| owned_by(*player, element, post_element) && !inside_content(*player) && !player.ancestors().filter_map(ElementRef::wrap).any(gallery_element))
+	{
 		let packaged = attr(player, &["packaged-media-json"])
 			.filter(|raw| raw.len() <= 256 * 1024)
 			.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
@@ -854,7 +1098,30 @@ fn parse_mode(html: &str, expected_post: Option<&str>, communities: &[String], q
 			expected_post.is_none() && matches!(parts.as_slice(),["r",sub,..] if allowed_community(sub,communities))
 		})
 		.or_else(|| expected_post.is_none().then(|| fragments.first().cloned()).flatten());
-	if posts.is_empty() && comments.is_empty() && fragments.is_empty() && more.is_empty() {
+	let mut pins = Vec::new();
+	if expected_post.is_none() && communities.len() == 1 {
+		for card in document.select(&HIGHLIGHTS).filter(|card| !inside_ugc(*card) && !auxiliary(*card)) {
+			let Some(id) = attr(card, &["id"]).and_then(|id| id.strip_prefix("highlight_card_")).filter(|id| fullname(id, "t3_")) else {
+				continue;
+			};
+			let Some(path) = card
+				.ancestors()
+				.filter_map(ElementRef::wrap)
+				.find(|node| node.value().name() == "a")
+				.and_then(|link| attr(link, &["href"]))
+			else {
+				continue;
+			};
+			let Some((path, name)) = permalink(path, &id[3..]) else { continue };
+			if allowed_community(&name, communities) && !pins.iter().any(|(old, _)| old == id) {
+				if pins.len() == 6 {
+					return Err(WebError::Temporary("pin_bound"));
+				}
+				pins.push((id.to_string(), path));
+			}
+		}
+	}
+	if posts.is_empty() && pins.is_empty() && comments.is_empty() && fragments.is_empty() && more.is_empty() {
 		let raw_posts = document.select(&POSTS).count();
 		let raw_comments = document.select(&COMMENTS).count();
 		let raw_partials = document.select(&FRAGMENTS).count();
@@ -884,6 +1151,7 @@ fn parse_mode(html: &str, expected_post: Option<&str>, communities: &[String], q
 	}
 	Ok(Document {
 		posts,
+		pins,
 		comments,
 		next,
 		fragments,
@@ -921,6 +1189,27 @@ fn append_more_stub(comments: &mut [Value], parent: &str, stub: Value, depth: us
 mod tests {
 	use super::*;
 
+	#[tokio::test]
+	async fn test_reddit_web_html_gallery_and_article_metadata_reaches_existing_views() {
+		let doc = parse(include_str!("../tests/fixtures/reddit_web_media.html"), None, &names(), false).unwrap();
+		let gallery = crate::utils::parse_post(&doc.posts[0]).await;
+		assert_eq!(gallery.post_type, "gallery");
+		assert_eq!(gallery.gallery.len(), 2, "one item per page, without backgrounds, avatars or lightbox duplicates");
+		assert_eq!(gallery.gallery[0].url, "/img/one.jpeg");
+		assert_eq!(gallery.gallery[1].url, "/img/two.png");
+		assert!(gallery.gallery[0].preview_url.contains("width=640"));
+		assert_eq!(gallery.gallery[0].caption, "First & best Source");
+		assert_eq!(gallery.gallery[0].outbound_url, "https://example.com/source");
+		assert_eq!((gallery.gallery[1].width, gallery.gallery[1].height), (800, 1200));
+		let article = crate::utils::parse_post(&doc.posts[1]).await;
+		assert_eq!(article.post_type, "link");
+		assert_eq!(article.media.url, "https://example.com/news");
+		assert!(article.thumbnail.url.starts_with("/preview/external-pre/"));
+		assert_eq!((article.thumbnail.width, article.thumbnail.height), (140, 93));
+		assert_eq!(article.flair.flair_parts[0].value, "News");
+		assert_eq!(article.flair.foreground_color, "inherit");
+	}
+
 	const POST: &str = r#"<shreddit-post id="t3_abc" permalink="/r/rust/comments/abc/title/" content-href="https://www.reddit.com/r/rust/comments/abc/title/" post-title="A &amp; B" author="op" subreddit-name="rust" score="42" comment-count="2" created-timestamp="2026-11-18T07:43:02+0000" is-stickied nsfw="false" spoiler><div slot="text-body"><p>Own <strong>body</strong>.</p></div></shreddit-post>"#;
 	const COMMENTS_HTML: &str = r#"<shreddit-comment thingid="t1_one" author="alice" score="5" created="2026-11-18T08:00:00+0000"><div id="t1_one-comment-rtjson-content" slot="comment"><p>Parent</p></div><shreddit-comment thingid="t1_two" author="bob" score="3" depth="1"><div id="t1_two-comment-rtjson-content" slot="comment"><p>Child</p></div></shreddit-comment></shreddit-comment>"#;
 	fn names() -> Vec<String> {
@@ -928,6 +1217,77 @@ mod tests {
 	}
 	fn page() -> String {
 		format!("<html><body>{POST}{COMMENTS_HTML}</body></html>")
+	}
+
+	#[tokio::test]
+	async fn test_reddit_web_html_gallery_scope_variants_and_preview_sizing() {
+		let fixture = include_str!("../tests/fixtures/reddit_web_media.html");
+		for page in [
+			fixture
+				.replace("<gallery-carousel", "<div slot=\"text-body\"><gallery-carousel")
+				.replace("</gallery-carousel>", "</gallery-carousel></div>"),
+			fixture.replace("post-id=\"t3_abc\"", "post-id=\"t3_wrong\""),
+		] {
+			let doc = parse(&page, None, &names(), false).unwrap();
+			assert!(doc.posts[0]["data"]["is_gallery"].is_null(), "a gallery must belong to its own post media");
+		}
+		let gif = fixture.replace("https://i.redd.it/two.png", "https://i.redd.it/two.gif");
+		let doc = parse(&gif, None, &names(), false).unwrap();
+		let post = crate::utils::parse_post(&doc.posts[0]).await;
+		assert!(post.gallery[1].is_animated);
+		assert_eq!(post.gallery[1].gif_url, "/img/two.gif");
+		let invalid = fixture.replace("https://i.redd.it/one.jpeg", "https://evil.test/one.jpeg");
+		let doc = parse(&invalid, None, &names(), false).unwrap();
+		let post = crate::utils::parse_post(&doc.posts[0]).await;
+		assert!(
+			post.gallery[0].url.starts_with("/preview/"),
+			"use a supplied proxyable preview if the original is unavailable"
+		);
+		assert!(!post.gallery.iter().any(|image| image.url.contains("evil.test")));
+		assert!(parse(&fixture.replace("slot=\"page-2\"", "slot=\"page-1\""), None, &names(), false).is_err());
+		let richer = fixture.replace("alt=\"An article\"", "width=\"1200\" height=\"800\" srcset=\"https://external-preview.redd.it/article.jpeg?width=640&amp;s=fixture 640w, https://external-preview.redd.it/article.jpeg?width=1080&amp;s=fixture 1080w\"");
+		let doc = parse(&richer, None, &names(), false).unwrap();
+		let article = crate::utils::parse_post(&doc.posts[1]).await;
+		assert_eq!((article.thumbnail.width, article.thumbnail.height), (1080, 720));
+		assert!(article.thumbnail.url.contains("width=1080"));
+		let bad = fixture.replace("https://external-preview.redd.it/article.jpeg", "https://external-preview.redd.it.evil.test/article.jpeg");
+		let doc = parse(&bad, None, &names(), false).unwrap();
+		assert!(crate::utils::parse_post(&doc.posts[1]).await.thumbnail.url.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_reddit_web_html_parity_flair_labels_emoji_colors_and_real_vote_ratio() {
+		let html=POST.replace("score=\"42\"","score=\"42\" upvote-ratio=\"0.78\"").replace("</shreddit-post>","<shreddit-post-flair slot=\"post-flair\"><span style=\"background-color: #F4A221; color: #000000\">Rust <img src=\"https://emoji.redditmedia.com/abc/t5_rust/rust\" alt=\":rust:\"></span></shreddit-post-flair></shreddit-post>");
+		let doc = parse(&format!("<shreddit-feed>{html}</shreddit-feed>"), None, &names(), false).unwrap();
+		let post = crate::utils::parse_post(&doc.posts[0]).await;
+		assert_eq!(post.upvote_ratio, 78);
+		assert_eq!(post.flair.flair_parts.len(), 2);
+		assert_eq!(post.flair.flair_parts[0].value, "Rust ");
+		assert!(post.flair.flair_parts[1].value.starts_with("/emoji/"));
+		assert_eq!(post.flair.background_color, "#F4A221");
+		assert_eq!(post.flair.foreground_color, "black");
+		let invalid = html
+			.replace("https://emoji.redditmedia.com/abc/t5_rust/rust", "https://evil.test/icon.png")
+			.replace("background-color: #F4A221", "background-color: url(https://evil.test/pixel)");
+		let doc = parse(&format!("<shreddit-feed>{invalid}</shreddit-feed>"), None, &names(), false).unwrap();
+		let post = crate::utils::parse_post(&doc.posts[0]).await;
+		assert_eq!(post.flair.flair_parts.len(), 1);
+		assert!(post.flair.background_color.is_empty());
+	}
+
+	#[test]
+	fn test_reddit_web_html_parity_highlight_cards_require_own_public_post_links() {
+		let card = r#"<a href="/r/rust/comments/pin/title/"><community-highlight-card highlighted id="highlight_card_t3_pin"></community-highlight-card></a>"#;
+		let root = format!("<community-highlight-carousel>{card}</community-highlight-carousel><shreddit-feed>{POST}</shreddit-feed>");
+		assert_eq!(parse(&root, None, &names(), false).unwrap().pins, [("t3_pin".into(), "/r/rust/comments/pin/title/".into())]);
+		for bad in [
+			root.replace("/r/rust/comments/pin/", "/r/elsewhere/comments/pin/"),
+			root.replace("highlight_card_t3_pin", "highlight_card_t3_wrong"),
+			root.replace("href=\"/r/", "href=\"https://evil.test/r/"),
+			format!("<aside>{root}</aside><shreddit-feed>{POST}</shreddit-feed>"),
+		] {
+			assert!(parse(&bad, None, &names(), false).unwrap().pins.is_empty());
+		}
 	}
 
 	#[test]

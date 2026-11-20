@@ -34,7 +34,6 @@ impl WebError {
 			Self::Resource("banned") => "This subreddit is banned".into(),
 			Self::Resource("quarantined") => "quarantined".into(),
 			Self::Resource("gated") => "gated".into(),
-			Self::Resource("login_required") => "Reddit requires a signed-in account to view this page".into(),
 			Self::Resource(_) => "Post not found".into(),
 			Self::Unsupported => "The anonymous web reader currently supports public feeds and post pages".into(),
 			Self::Cursor => "Page navigation expired. Open the first page again.".into(),
@@ -75,6 +74,7 @@ struct Spec {
 	scope: String,
 	context: u16,
 	cursor: Option<Cursor>,
+	cursor_key: Option<String>,
 	recover: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,6 +88,8 @@ struct Source {
 	form: Option<Form>,
 	#[serde(default)]
 	resume: Option<String>,
+	#[serde(default)]
+	pinned: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +100,8 @@ struct Form {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
+	#[serde(default)]
+	previous: Option<String>,
 	scope: String,
 	sources: Vec<Source>,
 	tor: bool,
@@ -128,7 +132,7 @@ impl Spec {
 		if get("geo_filter").is_some_and(|value| !value.is_empty() && value != "GLOBAL") {
 			return Err(WebError::Unsupported);
 		}
-		if pairs.iter().filter(|(k, v)| matches!(k.as_ref(), "after" | "before") && !v.is_empty()).count() > 1 || get("before").is_some_and(|v| !v.is_empty()) {
+		if pairs.iter().filter(|(k, v)| matches!(k.as_ref(), "after" | "before") && !v.is_empty()).count() > 1 {
 			return Err(WebError::Cursor);
 		}
 		let mut spec = Self {
@@ -143,6 +147,7 @@ impl Spec {
 			scope: String::new(),
 			context: get("context").and_then(|v| v.parse::<u16>().ok()).filter(|v| *v <= 9999).unwrap_or(0),
 			cursor: None,
+			cursor_key: None,
 			recover: false,
 		};
 		let segments: Vec<_> = base.trim_start_matches('/').split('/').collect();
@@ -201,7 +206,7 @@ impl Spec {
 					}
 				})
 				.collect();
-			if spec.communities.is_empty() || spec.communities.len() > 32 || !spec.communities.iter().all(|s| valid_name(s)) {
+			if spec.communities.is_empty() || spec.communities.len() > 64 || !spec.communities.iter().all(|s| valid_name(s)) {
 				return Err(WebError::Unsupported);
 			}
 			spec.communities.sort_by_key(|name| name.to_ascii_lowercase());
@@ -222,15 +227,23 @@ impl Spec {
 			spec.context,
 			quarantine
 		);
-		if let Some(raw) = get("after").filter(|v| !v.is_empty()) {
+		if let Some(raw) = get("after").filter(|v| !v.is_empty()).or_else(|| get("before").filter(|v| !v.is_empty())) {
 			if raw.len() > 8192 {
 				return Err(WebError::Cursor);
 			}
-			let token = raw.strip_prefix(PREFIX).ok_or(WebError::Cursor)?;
+			let mut token = raw.strip_prefix(PREFIX).ok_or(WebError::Cursor)?.to_string();
 			if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
 				return Err(WebError::Cursor);
 			}
-			let cursor = cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).cloned().ok_or(WebError::Cursor)?;
+			let mut cursor = cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), &token).cloned().ok_or(WebError::Cursor)?;
+			if get("before").is_some_and(|value| !value.is_empty()) {
+				if spec.post.is_some() || cursor.scope != spec.scope {
+					return Err(WebError::Cursor);
+				}
+				let Some(previous) = cursor.previous.clone() else { return Ok(spec) };
+				token = previous;
+				cursor = cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), &token).cloned().ok_or(WebError::Cursor)?;
+			}
 			let count = if spec.post.is_some() { 1 } else { spec.communities.len() };
 			if cursor.scope != spec.scope
 				|| cursor.sources.len() != count
@@ -242,6 +255,9 @@ impl Spec {
 				return Err(WebError::Cursor);
 			}
 			for (i, source) in cursor.sources.iter().enumerate() {
+				if source.pinned.len() > 6 || source.pinned.iter().any(|id| !id.strip_prefix("t3_").is_some_and(valid_id)) {
+					return Err(WebError::Cursor);
+				}
 				if source
 					.resume
 					.as_ref()
@@ -266,6 +282,7 @@ impl Spec {
 					return Err(WebError::Cursor);
 				}
 			}
+			spec.cursor_key = Some(token);
 			spec.cursor = Some(cursor);
 		}
 		Ok(spec)
@@ -659,7 +676,7 @@ impl Context {
 					.join(next)
 					.is_ok_and(|url| url.origin() == base.origin() && url.path().trim_end_matches('/') == "/login")
 				{
-					return Err(self.note(WebError::Resource("login_required")));
+					return Err(WebError::Temporary("login_redirect"));
 				}
 				page = spec.validate_page(next, community).map_err(|_| WebError::Temporary("redirect_scope"))?;
 				continue;
@@ -775,7 +792,7 @@ async fn document(ctx: &Context, spec: &Spec, page: &str, community: Option<&str
 			}
 		}
 	}
-	if parsed.posts.is_empty() {
+	if parsed.posts.is_empty() && parsed.pins.is_empty() {
 		return Err(WebError::Temporary("missing_post"));
 	}
 	if expand && spec.post.is_some() && parsed.comments.is_empty() {
@@ -797,7 +814,7 @@ async fn document(ctx: &Context, spec: &Spec, page: &str, community: Option<&str
 	}
 	Ok(parsed)
 }
-fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane, session: Option<Arc<Transport>>) -> Result<Option<String>, WebError> {
+fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane, session: Option<Arc<Transport>>, previous: Option<String>) -> Result<Option<String>, WebError> {
 	if sources.iter().all(|s| s.done) {
 		return Ok(None);
 	}
@@ -806,6 +823,7 @@ fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane, session: O
 		&mut *CURSORS.lock().unwrap(),
 		token.clone(),
 		Cursor {
+			previous,
 			scope: scope.into(),
 			sources,
 			tor: lane == RedditLane::Tor,
@@ -816,6 +834,41 @@ fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane, session: O
 }
 fn listing(posts: Vec<Value>, after: Option<String>) -> Value {
 	json!({"kind":"Listing","data":{"children":posts,"after":after,"before":null}})
+}
+
+#[derive(Clone)]
+struct PinSession(Arc<Transport>);
+impl PartialEq for PinSession {
+	fn eq(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.0, &other.0)
+	}
+}
+impl Eq for PinSession {}
+impl std::hash::Hash for PinSession {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		std::hash::Hash::hash(&(Arc::as_ptr(&self.0) as usize), state);
+	}
+}
+// A pin's public metadata can be reused between feed pages, but never across
+// anonymous jars. The key retains the transport so an address cannot be reused
+// for a new identity while the bounded cache still contains an entry.
+#[cached(
+	size = 64,
+	time = 30,
+	result = true,
+	key = "(PinSession,String,String,bool)",
+	convert = r#"{(PinSession(context.session.clone()),id.clone(),path.clone(),context.quarantine)}"#
+)]
+async fn pin_metadata(context: Context, id: String, path: String) -> Result<Value, WebError> {
+	let request = Spec::parse(&format!("{}.json", path.trim_end_matches('/')), context.quarantine)?;
+	let community = request.communities.first().map(String::as_str);
+	let body = context.fetch(&request, &request.initial(community), community, None).await?;
+	Ok(
+		html::parse_metadata(&body, &id[3..], &request.communities, context.quarantine)
+			.map_err(|error| context.note(error))?
+			.posts
+			.remove(0),
+	)
 }
 
 async fn feed_source(ctx: Context, spec: Spec, name: String, source: Source) -> Result<(Vec<Value>, Source, Option<String>), WebError> {
@@ -832,6 +885,34 @@ async fn feed_source(ctx: Context, spec: Spec, name: String, source: Source) -> 
 	}
 	let mut page = source.page.clone().unwrap_or_else(|| spec.initial(Some(&name)));
 	let mut document = document(&ctx, &spec, &page, Some(&name), true).await?;
+	if !document.pins.is_empty() {
+		source.pinned = document.pins.iter().map(|(id, _)| id.clone()).collect();
+		let mut pins = tokio::task::JoinSet::new();
+		for (index, (id, path)) in document.pins.iter().cloned().enumerate() {
+			if document.posts.iter().any(|post| post["data"]["name"] == id) {
+				continue;
+			}
+			let context = ctx.clone();
+			pins.spawn(async move { Ok::<_, WebError>((index, pin_metadata(context, id, path).await?)) });
+		}
+		let mut ordered = vec![];
+		while let Some(result) = pins.join_next().await {
+			ordered.push(result.map_err(|_| WebError::Temporary("parser"))??);
+		}
+		ordered.sort_by_key(|(index, _)| *index);
+		for (_, mut post) in ordered.into_iter().rev() {
+			post["data"]["stickied"] = json!(true);
+			document.posts.insert(0, post);
+		}
+	}
+	for post in &mut document.posts {
+		if post["data"]["name"].as_str().is_some_and(|id| source.pinned.iter().any(|pin| pin == id)) {
+			post["data"]["stickied"] = json!(true);
+		}
+	}
+	document
+		.posts
+		.sort_by_key(|post| source.pinned.iter().position(|id| post["data"]["name"] == *id).unwrap_or(usize::MAX));
 	if let Some(last) = &source.last {
 		let last = last.clone();
 		let mut found = false;
@@ -857,6 +938,13 @@ async fn feed_source(ctx: Context, spec: Spec, name: String, source: Source) -> 
 				document = self::document(&ctx, &spec, &page, Some(&name), true).await?;
 				source.last = None;
 			}
+		}
+	}
+	// Anchor recovery may have replaced the initial document with a later
+	// fragment. Apply the known pin identities to that fragment too.
+	for post in &mut document.posts {
+		if post["data"]["name"].as_str().is_some_and(|id| source.pinned.iter().any(|pin| pin == id)) {
+			post["data"]["stickied"] = json!(true);
 		}
 	}
 	let own_first = spec.communities.len() == 1 && !matches!(name.as_str(), "popular" | "all") && spec.cursor.is_none();
@@ -984,9 +1072,11 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				served: 0,
 				form,
 				resume,
+				pinned: vec![],
 			}],
 			ctx.lane,
 			Some(ctx.session.clone()),
+			None,
 		)?;
 		return Ok(json!([listing(doc.posts, None), listing(doc.comments, after)]));
 	}
@@ -998,7 +1088,8 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				done: false,
 				served: 0,
 				form: None,
-				resume: None
+				resume: None,
+				pinned: vec![]
 			};
 			spec.communities.len()
 		]
@@ -1019,7 +1110,8 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				done: true,
 				served: 0,
 				form: None,
-				resume: None
+				resume: None,
+				pinned: vec![]
 			},
 			None
 		);
@@ -1056,7 +1148,38 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 			_ => created,
 		}
 	};
+	let mut pages = vec![0; sides.len()];
 	while posts.len() < spec.limit {
+		// A web document is often only a three-card bootstrap. Refill each
+		// exhausted source before choosing its next head so page size, global
+		// sort order and subscription turns survive fragment boundaries.
+		let mut refills = tokio::task::JoinSet::new();
+		for i in 0..sides.len() {
+			if positions[i] != sides[i].0.len() || sides[i].1.done {
+				continue;
+			}
+			if pages[i] == 8 {
+				return Err(WebError::Temporary("feed_page_bound"));
+			}
+			let Some(next) = sides[i].2.take() else {
+				sides[i].1.done = true;
+				continue;
+			};
+			sides[i].1.page = Some(next);
+			sides[i].1.last = None;
+			pages[i] += 1;
+			let context = ctx.clone();
+			let mut request = spec.clone();
+			request.recover = false;
+			let name = spec.communities[i].clone();
+			let source = sides[i].1.clone();
+			refills.spawn(async move { (i, feed_source(context, request, name, source).await) });
+		}
+		while let Some(result) = refills.join_next().await {
+			let (index, result) = result.map_err(|_| WebError::Temporary("parser"))?;
+			sides[index] = result?;
+			positions[index] = 0;
+		}
 		let next = (0..sides.len()).filter(|i| positions[*i] < sides[*i].0.len()).max_by(|a, b| {
 			(if balanced {
 				sides[*b].1.served.cmp(&sides[*a].1.served)
@@ -1065,7 +1188,12 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 			})
 			.then_with(|| rank(&sides[*a].0[positions[*a]]).total_cmp(&rank(&sides[*b].0[positions[*b]])))
 		});
-		let Some(i) = next else { break };
+		let Some(i) = next else {
+			if sides.iter().any(|side| !side.1.done && side.2.is_some()) {
+				continue;
+			}
+			break;
+		};
 		let post = sides[i].0[positions[i]].clone();
 		positions[i] += 1;
 		let id = post["data"]["name"].as_str().ok_or(WebError::Temporary("post_id"))?.to_string();
@@ -1083,10 +1211,13 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 			side.1.done = side.1.page.is_none();
 		}
 	}
-	if posts.is_empty() {
-		return Err(WebError::Temporary("missing_feed"));
-	}
-	let after = encode_cursor(&spec.scope, sides.into_iter().map(|s| s.1).collect(), ctx.lane, Some(ctx.session.clone()))?;
+	let after = encode_cursor(
+		&spec.scope,
+		sides.into_iter().map(|s| s.1).collect(),
+		ctx.lane,
+		Some(ctx.session.clone()),
+		spec.cursor_key.clone(),
+	)?;
 	Ok(listing(posts, after))
 }
 async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
@@ -1115,12 +1246,9 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 		.map(Ok)
 		.unwrap_or_else(|| active_transport(primary, quarantine))?;
 	let mut ctx = context(primary, session, Arc::new(Budget::new()));
-	let first = tokio::time::timeout(
-		Duration::from_secs(if primary == RedditLane::Tor && spec.communities.len() <= 1 { 8 } else { 30 }),
-		read_on_lane(ctx.clone(), spec.clone()),
-	)
-	.await
-	.unwrap_or(Err(WebError::Temporary("timeout")));
+	let first = tokio::time::timeout(Duration::from_secs(30), read_on_lane(ctx.clone(), spec.clone()))
+		.await
+		.unwrap_or(Err(WebError::Temporary("timeout")));
 	let mut first = ctx.budget.finish(first);
 	if primary == RedditLane::Tor && matches!(first, Err(WebError::RateLimited(_))) {
 		let session = renew_tor_transport(&ctx.session, quarantine)?;
@@ -1167,20 +1295,50 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 	}
 	first
 }
-#[cached(size = 256, time = 30, result = true)]
-async fn cached_read(path: String, quarantine: bool) -> Result<Value, String> {
+pub(super) fn listing_navigation(path: &str, quarantine: bool) -> (String, bool) {
+	Spec::parse(path, quarantine)
+		.map(|spec| (spec.cursor_key.map(|key| format!("{PREFIX}{key}")).unwrap_or_default(), spec.cursor.is_none()))
+		.unwrap_or((String::new(), false))
+}
+
+static READ_CACHE: LazyLock<AsyncMutex<cached::SizedCache<JsonRequestKey, (Instant, Value)>>> = LazyLock::new(|| AsyncMutex::new(cached::SizedCache::with_size(512)));
+
+async fn cached_read(path: String, quarantine: bool) -> Result<(Value, bool), String> {
+	let key = (path.clone(), quarantine);
+	let cached = cached::Cached::cache_get(&mut *READ_CACHE.lock().await, &key).cloned();
+	let lifetime = Duration::from_secs(if is_comments_path(&path) { 180 } else { 60 });
+	if let Some((at, value)) = &cached {
+		if at.elapsed() < lifetime {
+			return Ok((value.clone(), false));
+		}
+	}
 	let result = tokio::time::timeout(Duration::from_secs(60), read(&path, quarantine))
 		.await
 		.unwrap_or(Err(WebError::Temporary("timeout")));
-	if let Err(error) = &result {
-		info!("Anonymous Reddit web read failed: reason={}", error.label());
+	match result {
+		Ok(value) => {
+			cached::Cached::cache_set(&mut *READ_CACHE.lock().await, key, (Instant::now(), value.clone()));
+			Ok((value, false))
+		}
+		Err(error) => {
+			info!("Anonymous Reddit web read failed: reason={}", error.label());
+			if matches!(error, WebError::Temporary(_) | WebError::RateLimited(_)) {
+				if let Some((_, value)) = cached {
+					info!("Serving last successful anonymous Reddit page during temporary upstream failure");
+					return Ok((value, true));
+				}
+			} else {
+				cached::Cached::cache_remove(&mut *READ_CACHE.lock().await, &key);
+			}
+			Err(error.message())
+		}
 	}
-	result.map_err(|error| error.message())
 }
+
 pub(super) async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	Spec::parse(&path, quarantine).map_err(|error| error.message())?;
 	coalesce_json_request(&FLIGHTS, (path.clone(), quarantine), move || async move {
-		let value = cached_read(path.clone(), quarantine).await?;
+		let (value, fallback) = cached_read(path.clone(), quarantine).await?;
 		let after = value["data"]["after"].as_str().or_else(|| value[1]["data"]["after"].as_str());
 		let stale = after.and_then(|after| after.strip_prefix(PREFIX)).is_some_and(|token| {
 			cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).is_none_or(|cursor| {
@@ -1191,9 +1349,11 @@ pub(super) async fn json(path: String, quarantine: bool) -> Result<Value, String
 						.is_some_and(|session| session.health.lock().unwrap().until.is_some_and(|until| until > Instant::now()))
 			})
 		});
-		if stale {
-			cached::Cached::cache_remove(&mut *CACHED_READ.lock().await, &(path.clone(), quarantine));
-			cached_read(path, quarantine).await
+		if stale && !fallback {
+			if let Some((at, _)) = cached::Cached::cache_get_mut(&mut *READ_CACHE.lock().await, &(path.clone(), quarantine)) {
+				*at = Instant::now() - Duration::from_secs(181);
+			}
+			cached_read(path, quarantine).await.map(|(value, _)| value)
 		} else {
 			Ok(value)
 		}

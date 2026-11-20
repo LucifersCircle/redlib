@@ -1,0 +1,31 @@
+<!-- Reduced public Reddit DOM contracts: gallery-carousel pages and a slim article thumbnail. No session tokens. -->
+<shreddit-feed>
+<shreddit-post id="t3_abc" permalink="/r/rust/comments/abc/title/" content-href="https://www.reddit.com/gallery/abc" post-type="gallery" post-title="A gallery" author="alice" subreddit-name="rust" score="12" comment-count="0">
+  <span slot="credit-bar"><span avatar><img src="https://i.redd.it/avatar.png" width="32" height="32" alt="Author avatar"></span></span>
+  <gallery-carousel post-id="t3_abc" permalink="/r/rust/comments/abc/title/">
+    <ul>
+      <li slot="page-1">
+        <img role="presentation" class="post-background-image-filter" src="https://preview.redd.it/background.png?width=640" width="1200" height="800">
+        <figure>
+          <img class="non-lightboxed-content media-lightbox-img" src="https://preview.redd.it/one.jpeg?width=640&amp;s=fixture" srcset="https://preview.redd.it/one.jpeg?width=320&amp;s=fixture 320w, https://preview.redd.it/one.jpeg?width=640&amp;s=fixture 640w, https://preview.redd.it/one.jpeg?width=1080&amp;s=fixture 1080w" width="1200" height="800">
+          <image-observer placement="gallery_post"><div class="lightboxed-content hidden"><img class="media-lightbox-img" src="https://i.redd.it/one.jpeg"></div></image-observer>
+          <figcaption>First &amp; best <a href="https://example.com/source">Source</a></figcaption>
+        </figure>
+      </li>
+      <li slot="page-2">
+        <figure>
+          <img class="non-lightboxed-content media-lightbox-img" data-lazy-src="https://preview.redd.it/two.png?width=640&amp;s=fixture" width="800" height="1200">
+          <image-observer placement="gallery_post"><div class="lightboxed-content hidden"><img class="media-lightbox-img" src="https://i.redd.it/two.png"></div></image-observer>
+        </figure>
+      </li>
+    </ul>
+  </gallery-carousel>
+</shreddit-post>
+<shreddit-post id="t3_article" permalink="/r/rust/comments/article/title/" content-href="https://example.com/news" post-type="link" post-title="An article" author="bob" subreddit-name="rust" score="8" comment-count="0">
+  <span slot="credit-bar"><span avatar><img src="https://www.redditstatic.com/avatars/defaults/v2/avatar_default_1.png" alt="Author avatar"></span></span>
+  <shreddit-post-flair slot="post-flair"><span>News</span></shreddit-post-flair>
+  <div slot="thumbnail" data-testid="post-thumbnail">
+    <a href="https://example.com/news"><img src="https://external-preview.redd.it/article.jpeg?width=140&amp;height=93&amp;auto=webp&amp;s=fixture" alt="An article" loading="lazy"></a>
+  </div>
+</shreddit-post>
+</shreddit-feed>

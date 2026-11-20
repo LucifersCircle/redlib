@@ -536,6 +536,8 @@ impl Post {
 					background_color: val(post, "link_flair_background_color"),
 					foreground_color: if val(post, "link_flair_text_color") == "dark" {
 						"black".to_string()
+					} else if val(post, "link_flair_text_color") == "inherit" {
+						"inherit".to_string()
 					} else {
 						"white".to_string()
 					},
@@ -1012,6 +1014,8 @@ pub async fn parse_post(post: &Value) -> Post {
 			background_color: val(post, "link_flair_background_color"),
 			foreground_color: if val(post, "link_flair_text_color") == "dark" {
 				"black".to_string()
+			} else if val(post, "link_flair_text_color") == "inherit" {
+				"inherit".to_string()
 			} else {
 				"white".to_string()
 			},
