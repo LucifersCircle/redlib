@@ -30,6 +30,9 @@ use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, Method, Proxy, Response as WreqResponse};
 use wreq_util::{Emulation, Platform, Profile};
 
+#[path = "reddit_web.rs"]
+mod web;
+
 #[cfg(test)]
 #[path = "client_tor_graphql_quota_tests.rs"]
 mod tor_graphql_quota_tests;
@@ -3044,6 +3047,10 @@ pub(crate) fn random_oauth_profile_except(current: OauthTransportProfile) -> Oau
 }
 
 pub fn start_oauth() {
+	if web::enabled() {
+		info!("Anonymous Reddit web reader selected; API OAuth startup skipped");
+		return;
+	}
 	if DIRECT_OAUTH_WARMUP_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		return;
 	}
@@ -3070,6 +3077,9 @@ pub fn start_oauth() {
 }
 
 pub fn start_tor_fallback() {
+	if web::enabled() {
+		return;
+	}
 	let config = match TOR_FALLBACK_CONFIG.as_ref() {
 		Ok(Some(config)) => config,
 		Ok(None) => {
@@ -3165,6 +3175,9 @@ fn build_emulated_client_with_profile(
 /// 429, or if we were unable to decode the value in the `Location` header.
 #[cached(size = 1024, time = 600, result = true)]
 pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, String> {
+	if web::enabled() {
+		return Err("Open the full Reddit page link to read this page.".into());
+	}
 	with_tor_first_page_budget(&path, canonical_path_routed(path.clone(), tries)).await
 }
 
@@ -3896,6 +3909,12 @@ fn comments_logical_path(path: &str) -> String {
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	let path = normalize_reddit_api_path(&path);
 	record_logical_json(&path);
+	if web::enabled() {
+		return web::json(path, quarantine).await;
+	}
+	if web::contains_cursor(&path) {
+		return Err("Page navigation expired. Open the first page again.".into());
+	}
 	let diagnose_all = all_first_page_diagnostic_path(&path);
 	let result = json_coalesced(path, quarantine).await;
 	if diagnose_all {
