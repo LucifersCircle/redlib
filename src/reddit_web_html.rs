@@ -821,7 +821,7 @@ fn append_more_stub(comments: &mut [Value], parent: &str, stub: Value, depth: us
 			comment["data"]["replies"]["data"]["children"].as_array_mut().unwrap().push(stub);
 			return true;
 		}
-		if let Some(children) = comment["data"]["replies"]["data"]["children"].as_array_mut() {
+		if let Some(children) = comment.pointer_mut("/data/replies/data/children").and_then(Value::as_array_mut) {
 			if append_more_stub(children, parent, stub.clone(), depth + 1) {
 				return true;
 			}
@@ -1001,6 +1001,15 @@ mod tests {
 		for bad in [more.replace("t3_abc", "t3_wrong"), more.replace("opaque+token", &"x".repeat(4097))] {
 			assert!(parse(&bad, Some("abc"), &names(), false).is_err());
 		}
+	}
+
+	#[test]
+	fn test_reddit_web_html_more_comment_after_leaf_sibling_does_not_panic() {
+		let comments = r#"<shreddit-comment thingid="t1_leaf" author="alice"><div slot="comment"><p>A leaf</p></div></shreddit-comment><shreddit-comment thingid="t1_target" author="bob"><div slot="comment"><p>A parent</p></div><faceplate-partial src="/svc/shreddit/more-comments/rust/t3_abc?commentParentPositions=1" method="post"><input name="cursor" value="fixture"><faceplate-number number="3"></faceplate-number></faceplate-partial></shreddit-comment>"#;
+		let doc = parse(&format!("{POST}{comments}"), Some("abc"), &names(), false).unwrap();
+		assert_eq!(doc.comments[0]["data"]["replies"], "");
+		assert_eq!(doc.comments[1]["data"]["replies"]["data"]["children"][0]["kind"], "more");
+		assert_eq!(doc.more[0].parent, "t1_target");
 	}
 
 	#[test]

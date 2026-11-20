@@ -34,6 +34,7 @@ impl WebError {
 			Self::Resource("banned") => "This subreddit is banned".into(),
 			Self::Resource("quarantined") => "quarantined".into(),
 			Self::Resource("gated") => "gated".into(),
+			Self::Resource("login_required") => "Reddit requires a signed-in account to view this page".into(),
 			Self::Resource(_) => "Post not found".into(),
 			Self::Unsupported => "The anonymous web reader currently supports public feeds and post pages".into(),
 			Self::Cursor => "Page navigation expired. Open the first page again.".into(),
@@ -67,6 +68,8 @@ struct Spec {
 	sort: String,
 	range: String,
 	post: Option<String>,
+	post_slug: String,
+	post_community: Option<String>,
 	focus: Option<String>,
 	limit: usize,
 	scope: String,
@@ -95,6 +98,8 @@ struct Cursor {
 	scope: String,
 	sources: Vec<Source>,
 	tor: bool,
+	#[serde(skip)]
+	session: Option<Arc<Transport>>,
 }
 static CURSORS: LazyLock<Mutex<cached::TimedSizedCache<String, Cursor>>> =
 	LazyLock::new(|| Mutex::new(cached::TimedSizedCache::with_size_and_lifespan(512, Duration::from_secs(3600))));
@@ -128,6 +133,8 @@ impl Spec {
 			sort: "hot".into(),
 			range: get("t").unwrap_or("all").into(),
 			post: None,
+			post_slug: "_".into(),
+			post_community: None,
 			focus: None,
 			limit: get("limit").and_then(|v| v.parse().ok()).unwrap_or(25).clamp(1, 100),
 			scope: String::new(),
@@ -145,11 +152,18 @@ impl Spec {
 				return Err(WebError::Unsupported);
 			}
 			spec.post = Some(id.into());
+			if let Some(slug) = segments.get(at + 2).filter(|slug| !slug.is_empty()) {
+				if slug.len() > 1800 || matches!(*slug, "." | "..") || !slug.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.~-%".contains(&b)) {
+					return Err(WebError::Unsupported);
+				}
+				spec.post_slug = (*slug).into();
+			}
 			if at == 2 {
 				if !valid_name(segments[1]) {
 					return Err(WebError::Unsupported);
 				}
 				spec.communities.push(segments[1].to_ascii_lowercase());
+				spec.post_community = Some(segments[1].into());
 			}
 			if let Some(focus) = segments.get(at + 3).copied().or_else(|| get("comment")) {
 				if !valid_id(focus) {
@@ -236,9 +250,10 @@ impl Spec {
 	}
 	fn initial(&self, community: Option<&str>) -> String {
 		if let Some(post) = &self.post {
-			let prefix = community.map_or(String::new(), |s| format!("/r/{s}"));
-			let focus = self.focus.as_ref().map_or(String::new(), |s| format!("_/{s}/"));
-			format!("{prefix}/comments/{post}/{focus}?sort={}&context={}", self.sort, self.context)
+			let prefix = self.post_community.as_deref().or(community).map_or(String::new(), |s| format!("/r/{s}"));
+			let focus = self.focus.as_ref().map_or_else(|| format!("{}/", self.post_slug), |s| format!("{}/{s}/", self.post_slug));
+			let sort = if self.sort == "confidence" { "best" } else { &self.sort };
+			format!("{prefix}/comments/{post}/{focus}?sort={sort}&context={}", self.context)
 		} else {
 			format!("/r/{}/{}/?t={}&limit={}", community.unwrap_or("popular"), self.sort, self.range, self.limit)
 		}
@@ -310,6 +325,9 @@ impl Spec {
 						| "distance"
 						| "f"
 						| "adDistance"
+						| "ad_posts_served"
+						| "navigationSessionId"
+						| "feedLength"
 						| "ad_id"
 						| "loadAfter"
 						| "sr_detail"
@@ -323,10 +341,8 @@ impl Spec {
 				) {
 				return Err(WebError::Cursor);
 			}
-			if (key == "sort" && !value.eq_ignore_ascii_case(&self.sort) && !(self.sort == "hot" && value.eq_ignore_ascii_case("best")))
-				|| (key == "t" && value != self.range)
-				|| key == "before"
-			{
+			let same_sort = value.eq_ignore_ascii_case(&self.sort) || (matches!(self.sort.as_str(), "hot" | "confidence") && value.eq_ignore_ascii_case("best"));
+			if (key == "sort" && !same_sort) || (key == "t" && !value.eq_ignore_ascii_case(&self.range)) || key == "before" {
 				return Err(WebError::Cursor);
 			}
 			if matches!(key.as_ref(), "top-level") && !matches!(value.as_ref(), "true" | "false" | "1" | "0") {
@@ -339,6 +355,12 @@ impl Spec {
 				return Err(WebError::Cursor);
 			}
 			if key == "commentParentPositions" && !value.bytes().all(|b| b.is_ascii_digit() || b"[], ".contains(&b)) {
+				return Err(WebError::Cursor);
+			}
+			if matches!(key.as_ref(), "ad_posts_served" | "feedLength") && !value.parse::<u32>().is_ok_and(|n| n <= 1_000_000) {
+				return Err(WebError::Cursor);
+			}
+			if key == "navigationSessionId" && uuid::Uuid::parse_str(&value).is_err() {
 				return Err(WebError::Cursor);
 			}
 		}
@@ -374,8 +396,50 @@ struct Transport {
 	client: Arc<WreqClient>,
 	health: Mutex<Health>,
 }
-static TRANSPORTS: LazyLock<[Result<Transport, String>; 4]> =
-	LazyLock::new(|| std::array::from_fn(|i| build_transport(if i < 2 { RedditLane::Direct } else { RedditLane::Tor })));
+impl std::fmt::Debug for Transport {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Transport").finish_non_exhaustive()
+	}
+}
+static TRANSPORTS: LazyLock<[Result<Arc<Transport>, String>; 4]> =
+	LazyLock::new(|| std::array::from_fn(|i| build_transport(if i < 2 { RedditLane::Direct } else { RedditLane::Tor }).map(Arc::new)));
+static TOR_SESSIONS: LazyLock<[Mutex<Result<Arc<Transport>, String>>; 2]> = LazyLock::new(|| std::array::from_fn(|i| Mutex::new(TRANSPORTS[2 + i].clone())));
+
+fn active_transport(lane: RedditLane, quarantine: bool) -> Result<Arc<Transport>, WebError> {
+	#[cfg(test)]
+	if let Some((transport, _)) = MOCK.lock().unwrap().as_ref() {
+		return Ok(transport.clone());
+	}
+	let result = if lane == RedditLane::Tor {
+		TOR_SESSIONS[usize::from(quarantine)].lock().unwrap().clone()
+	} else {
+		TRANSPORTS[usize::from(quarantine)].clone()
+	};
+	result.map_err(|_| WebError::Temporary("transport"))
+}
+
+fn renew_tor_transport(previous: &Arc<Transport>, quarantine: bool) -> Result<Arc<Transport>, WebError> {
+	#[cfg(test)]
+	{
+		let mut mock = MOCK.lock().unwrap();
+		if let Some((current, _)) = mock.as_ref() {
+			if Arc::ptr_eq(current, previous) {
+				if let Some(next) = RENEW_MOCK.lock().unwrap().clone() {
+					*mock = Some(next);
+					TEST_RENEWALS.fetch_add(1, Ordering::SeqCst);
+				}
+			}
+			return Ok(mock.as_ref().unwrap().0.clone());
+		}
+	}
+	let mut slot = TOR_SESSIONS[usize::from(quarantine)].lock().unwrap();
+	if slot.as_ref().is_ok_and(|current| Arc::ptr_eq(current, previous)) {
+		let next = Arc::new(build_transport(RedditLane::Tor).map_err(|_| WebError::Temporary("transport"))?);
+		*slot = Ok(next);
+		info!("Renewed anonymous Reddit web identity after quota exhaustion: lane=tor");
+	}
+	slot.clone().map_err(|_| WebError::Temporary("transport"))
+}
 fn build_transport(lane: RedditLane) -> Result<Transport, String> {
 	let emulation = Emulation::builder().profile(Profile::Chrome145).platform(Platform::Windows).headers(true).build();
 	let mut builder = WreqClient::builder()
@@ -395,8 +459,8 @@ fn build_transport(lane: RedditLane) -> Result<Transport, String> {
 	})
 }
 struct Budget {
-	wires: AtomicUsize,
-	bytes: AtomicUsize,
+	wires: Arc<AtomicUsize>,
+	bytes: Arc<AtomicUsize>,
 	terminal: Mutex<Option<WebError>>,
 	quota: Mutex<Option<Duration>>,
 }
@@ -414,8 +478,16 @@ impl Budget {
 	}
 	fn new() -> Self {
 		Self {
-			wires: AtomicUsize::new(0),
-			bytes: AtomicUsize::new(0),
+			wires: Arc::new(AtomicUsize::new(0)),
+			bytes: Arc::new(AtomicUsize::new(0)),
+			terminal: Mutex::new(None),
+			quota: Mutex::new(None),
+		}
+	}
+	fn new_attempt(&self) -> Self {
+		Self {
+			wires: self.wires.clone(),
+			bytes: self.bytes.clone(),
 			terminal: Mutex::new(None),
 			quota: Mutex::new(None),
 		}
@@ -423,13 +495,16 @@ impl Budget {
 }
 #[cfg(test)]
 static MOCK: LazyLock<Mutex<Option<(Arc<Transport>, String)>>> = LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static RENEW_MOCK: LazyLock<Mutex<Option<(Arc<Transport>, String)>>> = LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static TEST_RENEWALS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone)]
 struct Context {
 	lane: RedditLane,
 	quarantine: bool,
 	budget: Arc<Budget>,
-	#[cfg(test)]
-	fixture: Option<Arc<Transport>>,
+	session: Arc<Transport>,
 	#[cfg(test)]
 	origin: Option<String>,
 }
@@ -444,13 +519,7 @@ impl Context {
 		error
 	}
 	fn transport(&self) -> Result<&Transport, WebError> {
-		#[cfg(test)]
-		if let Some(t) = &self.fixture {
-			return Ok(t);
-		}
-		TRANSPORTS[if self.lane == RedditLane::Direct { 0 } else { 2 } + usize::from(self.quarantine)]
-			.as_ref()
-			.map_err(|_| WebError::Temporary("transport"))
+		Ok(&self.session)
 	}
 	async fn fetch(&self, spec: &Spec, page: &str, community: Option<&str>, form: Option<&Form>) -> Result<String, WebError> {
 		let mut page = spec.validate_page(page, community)?;
@@ -542,6 +611,13 @@ impl Context {
 				}
 				redirects += 1;
 				let next = headers.get(wreq_header::LOCATION).and_then(|v| v.to_str().ok()).ok_or(WebError::Temporary("redirect"))?;
+				let base = url::Url::parse(spec.origin()).unwrap();
+				if base
+					.join(next)
+					.is_ok_and(|url| url.origin() == base.origin() && url.path().trim_end_matches('/') == "/login")
+				{
+					return Err(self.note(WebError::Resource("login_required")));
+				}
 				page = spec.validate_page(next, community).map_err(|_| WebError::Temporary("redirect_scope"))?;
 				continue;
 			}
@@ -571,6 +647,17 @@ impl Context {
 				bytes.extend_from_slice(&chunk);
 			}
 			let text = String::from_utf8(bytes).map_err(|_| WebError::Temporary("encoding"))?;
+			#[cfg(test)]
+			if let Some(dir) = env::var_os("REDLIB_LIVE_CAPTURE_DIR") {
+				let dir = std::path::PathBuf::from(dir);
+				let _ = std::fs::create_dir_all(&dir);
+				let at = self.budget.wires.load(Ordering::SeqCst);
+				let _ = std::fs::write(dir.join(format!("response-{at}.html")), &text);
+				let _ = std::fs::write(
+					dir.join(format!("response-{at}.shape")),
+					format!("status={status} path={} post={:?}", page.split('?').next().unwrap_or_default(), spec.post),
+				);
+			}
 			if form.is_none() && ((200..300).contains(&status) || status == 403) {
 				if let Some(check) = html::script_check(&text, &spec.communities).map_err(|error| self.note(error))? {
 					if answered_script {
@@ -654,7 +741,7 @@ async fn document(ctx: &Context, spec: &Spec, page: &str, community: Option<&str
 	}
 	Ok(parsed)
 }
-fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane) -> Result<Option<String>, WebError> {
+fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane, session: Option<Arc<Transport>>) -> Result<Option<String>, WebError> {
 	if sources.iter().all(|s| s.done) {
 		return Ok(None);
 	}
@@ -666,6 +753,7 @@ fn encode_cursor(scope: &str, sources: Vec<Source>, lane: RedditLane) -> Result<
 			scope: scope.into(),
 			sources,
 			tor: lane == RedditLane::Tor,
+			session,
 		},
 	);
 	Ok(Some(format!("{PREFIX}{token}")))
@@ -773,6 +861,7 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 				form,
 			}],
 			ctx.lane,
+			Some(ctx.session.clone()),
 		)?;
 		return Ok(json!([listing(doc.posts, None), listing(doc.comments, after)]));
 	}
@@ -869,7 +958,7 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 	if posts.is_empty() {
 		return Err(WebError::Temporary("missing_feed"));
 	}
-	let after = encode_cursor(&spec.scope, sides.into_iter().map(|s| s.1).collect(), ctx.lane)?;
+	let after = encode_cursor(&spec.scope, sides.into_iter().map(|s| s.1).collect(), ctx.lane, Some(ctx.session.clone()))?;
 	Ok(listing(posts, after))
 }
 async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
@@ -879,27 +968,45 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 		.cursor
 		.as_ref()
 		.map_or_else(configured_primary_lane, |c| if c.tor { RedditLane::Tor } else { RedditLane::Direct });
-	let budget = Arc::new(Budget::new());
-	let context = |lane| {
+	let context = |lane, session: Arc<Transport>, budget: Arc<Budget>| {
 		#[cfg(test)]
 		let mock = MOCK.lock().unwrap().clone();
 		Context {
 			lane,
 			quarantine,
-			budget: budget.clone(),
+			budget,
+			session,
 			#[cfg(test)]
-			fixture: mock.as_ref().map(|m| m.0.clone()),
-			#[cfg(test)]
-			origin: mock.map(|m| m.1),
+			origin: mock.and_then(|m| (!m.1.is_empty()).then_some(m.1)),
 		}
 	};
+	let session = spec
+		.cursor
+		.as_ref()
+		.and_then(|c| c.session.clone())
+		.map(Ok)
+		.unwrap_or_else(|| active_transport(primary, quarantine))?;
+	let mut ctx = context(primary, session, Arc::new(Budget::new()));
 	let first = tokio::time::timeout(
 		Duration::from_secs(if primary == RedditLane::Tor { 8 } else { 30 }),
-		read_on_lane(context(primary), spec.clone()),
+		read_on_lane(ctx.clone(), spec.clone()),
 	)
 	.await
 	.unwrap_or(Err(WebError::Temporary("timeout")));
-	let first = budget.finish(first);
+	let mut first = ctx.budget.finish(first);
+	if primary == RedditLane::Tor && matches!(first, Err(WebError::RateLimited(_))) {
+		let session = renew_tor_transport(&ctx.session, quarantine)?;
+		if spec.cursor.is_some() {
+			// A server-issued continuation belongs to its old cookie jar. Renew
+			// new reads, but never replay that continuation under a new identity.
+			return Err(WebError::Cursor);
+		}
+		ctx = context(primary, session, Arc::new(ctx.budget.new_attempt()));
+		first = tokio::time::timeout(Duration::from_secs(30), read_on_lane(ctx.clone(), spec.clone()))
+			.await
+			.unwrap_or(Err(WebError::Temporary("timeout")));
+		first = ctx.budget.finish(first);
+	}
 	if let Err(error) = &first {
 		info!(
 			"Anonymous Reddit web attempt failed: lane={} frontend={} reason={}",
@@ -912,10 +1019,11 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 		let alternate = if primary == RedditLane::Tor { RedditLane::Direct } else { RedditLane::Tor };
 		if alternate == RedditLane::Direct || TOR_FALLBACK_CONFIG.as_ref().is_ok_and(Option::is_some) {
 			let Ok(_standby) = STANDBY.try_acquire() else { return first };
-			let result = tokio::time::timeout(Duration::from_secs(30), read_on_lane(context(alternate), spec))
+			let session = active_transport(alternate, quarantine)?;
+			let result = tokio::time::timeout(Duration::from_secs(30), read_on_lane(context(alternate, session, ctx.budget.clone()), spec))
 				.await
 				.unwrap_or(Err(WebError::Temporary("timeout")));
-			let result = budget.finish(result);
+			let result = ctx.budget.finish(result);
 			if let Err(error) = &result {
 				info!(
 					"Anonymous Reddit web attempt failed: lane={} frontend={} reason={}",
@@ -944,9 +1052,15 @@ pub(super) async fn json(path: String, quarantine: bool) -> Result<Value, String
 	coalesce_json_request(&FLIGHTS, (path.clone(), quarantine), move || async move {
 		let value = cached_read(path.clone(), quarantine).await?;
 		let after = value["data"]["after"].as_str().or_else(|| value[1]["data"]["after"].as_str());
-		let stale = after
-			.and_then(|after| after.strip_prefix(PREFIX))
-			.is_some_and(|token| cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).is_none());
+		let stale = after.and_then(|after| after.strip_prefix(PREFIX)).is_some_and(|token| {
+			cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).is_none_or(|cursor| {
+				cursor.tor
+					&& cursor
+						.session
+						.as_ref()
+						.is_some_and(|session| session.health.lock().unwrap().until.is_some_and(|until| until > Instant::now()))
+			})
+		});
 		if stale {
 			cached::Cached::cache_remove(&mut *CACHED_READ.lock().await, &(path.clone(), quarantine));
 			cached_read(path, quarantine).await
