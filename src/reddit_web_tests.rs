@@ -376,6 +376,13 @@ impl Fixture {
 							} else {
 								body
 							}
+						} else if matches!(challenge_mode, 28 | 29) {
+							let fixture = include_str!("../tests/fixtures/reddit_web_media.html");
+							if challenge_mode == 29 {
+								fixture.replace("?width=140&amp;height=93&amp;auto=webp&amp;s=fixture", "?s=fixture")
+							} else {
+								fixture.to_string()
+							}
 						} else if matches!(challenge_mode, 26 | 27) {
 							let body = body.replace("<div slot=\"text-body\"><p>Readable body</p></div>", "<shreddit-post-text-body slot=\"text-body\"><a slot=\"text-body\" href=\"/r/rust/comments/x0a/title/\"><p>Readable <strong>body</strong></p></a></shreddit-post-text-body>")
 								.replace("</shreddit-post>", "<shreddit-player src=\"https://v.redd.it/clip/HLSPlaylist.m3u8\" preview=\"https://v.redd.it/clip/CMAF_96.mp4\"></shreddit-player></shreddit-post>");
@@ -1082,6 +1089,65 @@ fn test_reddit_web_transport_recorded_feed_continuation_shape_loads_next_without
 				.validate_page(&format!("/svc/shreddit/community-more-posts/hot/?name=rust&{query}"), Some("rust"))
 				.is_err());
 		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_gallery_and_article_render_feed_and_post() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(28, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let mut app = crate::server::Server::new();
+		app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
+		app.at("/r/:sub/comments/:id/:title").get(|r| Box::pin(crate::post::item(r)));
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		for (path, mode, file) in [
+			("/", "feed", "/tmp/redlib-gallery-feed.html"),
+			("/r/rust/comments/abc/title", "detail", "/tmp/redlib-gallery-detail.html"),
+			("/?t=week", "feed", "/tmp/redlib-gallery-feed-unknown.html"),
+		] {
+			fixture.mode.store(if path.contains("week") { 29 } else { 28 }, Ordering::SeqCst);
+			let request = hyper::Request::builder()
+				.uri(format!("http://{address}{path}"))
+				.header("cookie", "subscriptions=rust; front_page=default; layout=card; theme=black; post_sort=hot")
+				.body(Body::empty())
+				.unwrap();
+			let response = http.request(request).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::OK);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let page = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+			let gallery = scraper::Selector::parse(&format!("[data-gallery-mode='{mode}']")).unwrap();
+			assert_eq!(page.select(&gallery).count(), 1);
+			let slide = scraper::Selector::parse("[data-gallery-slide]").unwrap();
+			assert_eq!(page.select(&slide).count(), 2);
+			let originals = scraper::Selector::parse("a[data-gallery-original]").unwrap();
+			assert_eq!(
+				page.select(&originals).map(|a| a.value().attr("href").unwrap()).collect::<Vec<_>>(),
+				["/img/one.jpeg", "/img/two.png"]
+			);
+			let lazy = scraper::Selector::parse("[data-gallery-slide] img[data-src]").unwrap();
+			assert_eq!(page.select(&lazy).count(), 1, "later gallery items must stay lazy");
+			if mode == "feed" {
+				let thumb = scraper::Selector::parse(".external_thumbnail img").unwrap();
+				let image = page.select(&thumb).next().unwrap();
+				assert!(image.value().attr("src").unwrap().starts_with("/preview/external-pre/"));
+				assert!(!std::str::from_utf8(&body).unwrap().contains("max-width:0px"));
+			}
+			std::fs::write(file, &body).unwrap();
+		}
+		assert!(fixture
+			.wires
+			.lock()
+			.unwrap()
+			.iter()
+			.all(|(path, _, headers, _)| path.starts_with("/r/rust/") && !headers.contains_key("authorization")));
+		server.abort();
 	});
 }
 
