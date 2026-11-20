@@ -162,7 +162,18 @@ test('loading pages reload fragment URLs in a real browser', { timeout: 120000 }
                 await page.send('Page.enable');
                 if (!javaScript) await page.send('Emulation.setScriptExecutionDisabled', { value: true });
                 await page.send('Page.navigate', { url: `${origin}${url}${fragment}` });
-                await waitUntil(() => page.evaluate('document.title === "Recovered"'), 'Waiting page did not send another GET after its refresh timer');
+                await waitUntil(async () => {
+                    try {
+                        return await page.evaluate('document.title === "Recovered"');
+                    } catch (error) {
+                        // A native refresh can replace the execution context
+                        // while this poll is in flight. Keep polling for the
+                        // recovered document; a closed page still times out.
+                        if (error.message === '{"code":-32000,"message":"Inspected target navigated or closed"}' ||
+                            error.message === '{"code":-32000,"message":"Execution context was destroyed."}') return false;
+                        throw error;
+                    }
+                }, 'Waiting page did not send another GET after its refresh timer');
                 assert.equal(await page.evaluate('location.origin + location.pathname + location.search'), `${origin}${url}`);
                 assert.equal(await page.evaluate('location.hash'), '', 'Native refresh must remove the fragment to make a network navigation');
                 assert.equal(scenario.requests.length, 3, 'Temporary responses must retry until the page recovers');

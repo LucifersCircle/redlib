@@ -419,17 +419,46 @@ impl Spec {
 		answer.set_query(current.query());
 		Ok(format!("{}{}", answer.path(), answer.query().map_or(String::new(), |q| format!("?{q}"))))
 	}
-	fn canonical_case_page(&self, page: &str, target: &str, community: Option<&str>) -> Result<Option<String>, WebError> {
+	fn canonical_page(&self, page: &str, target: &str, community: Option<&str>) -> Result<Option<String>, WebError> {
 		let checked = self.validate_page(target, community).map_err(|_| WebError::Temporary("canonical_scope"))?;
 		let base = url::Url::parse(self.origin()).unwrap();
 		let current = base.join(page).map_err(|_| WebError::Temporary("canonical_scope"))?;
 		let mut next = base.join(&checked).map_err(|_| WebError::Temporary("canonical_scope"))?;
-		if !current.path().eq_ignore_ascii_case(next.path())
-			|| next.query_pairs().any(|(key, value)| {
-				!current
-					.query_pairs()
-					.any(|(k, v)| key == k && (value == v || (matches!(key.as_ref(), "sort" | "t") && value.eq_ignore_ascii_case(&v))))
-			}) {
+		if next.query_pairs().any(|(key, value)| {
+			!current
+				.query_pairs()
+				.any(|(k, v)| key == k && (value == v || (matches!(key.as_ref(), "sort" | "t") && value.eq_ignore_ascii_case(&v))))
+		}) {
+			return Err(WebError::Temporary("canonical_scope"));
+		}
+		if let Some(post) = &self.post {
+			// Reddit's empty app shell also corrects stale or missing title
+			// slugs. The post ID is the identity; its title is not. A focused
+			// comment must survive the canonical updater's unfocused permalink.
+			let current_parts = current.path().trim_matches('/').split('/').collect::<Vec<_>>();
+			let current_at = current_parts.iter().position(|part| *part == "comments").ok_or(WebError::Temporary("canonical_scope"))?;
+			if !(current_at == 0 || (current_at == 2 && current_parts[0] == "r")) || current_parts.get(current_at + 1) != Some(&post.as_str()) {
+				return Err(WebError::Temporary("canonical_scope"));
+			}
+			let parts = next.path().trim_matches('/').split('/').collect::<Vec<_>>();
+			let at = parts.iter().position(|part| *part == "comments").ok_or(WebError::Temporary("canonical_scope"))?;
+			if !(at == 0 || (at == 2 && parts[0] == "r"))
+				|| parts.get(at + 1) != Some(&post.as_str())
+				|| parts.get(at + 3).is_some_and(|focus| Some(*focus) != self.focus.as_deref())
+			{
+				return Err(WebError::Temporary("canonical_scope"));
+			}
+			let slug = parts.get(at + 2).copied().unwrap_or("_");
+			if slug.len() > 1800 || matches!(slug, "." | "..") || !slug.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.~-%".contains(&b)) {
+				return Err(WebError::Temporary("canonical_scope"));
+			}
+			let prefix = parts[..at + 2].join("/");
+			let path = self
+				.focus
+				.as_ref()
+				.map_or_else(|| format!("/{prefix}/{slug}/"), |focus| format!("/{prefix}/{slug}/{focus}/"));
+			next.set_path(&path);
+		} else if !current.path().trim_end_matches('/').eq_ignore_ascii_case(next.path().trim_end_matches('/')) {
 			return Err(WebError::Temporary("canonical_scope"));
 		}
 		if current.path() == next.path() {
@@ -437,6 +466,11 @@ impl Spec {
 		}
 		next.set_query(current.query());
 		Ok(Some(format!("{}{}", next.path(), next.query().map_or(String::new(), |q| format!("?{q}")))))
+	}
+	fn cache_key(&self, quarantine: bool) -> JsonRequestKey {
+		// UI/tracking parameters and parameter order do not create different
+		// upstream reads. The effective cursor identifies Previous and Next.
+		(format!("{}|{}", self.scope, self.cursor_key.as_deref().unwrap_or_default()), quarantine)
 	}
 }
 
@@ -519,10 +553,24 @@ fn build_transport(lane: RedditLane) -> Result<Transport, String> {
 struct Budget {
 	wires: Arc<AtomicUsize>,
 	bytes: Arc<AtomicUsize>,
+	wire_limit: usize,
+	byte_limit: usize,
 	terminal: Mutex<Option<WebError>>,
 	quota: Mutex<Option<Duration>>,
 }
 impl Budget {
+	fn reserve_wire(&self) -> Result<usize, WebError> {
+		let mut sent = self.wires.load(Ordering::SeqCst);
+		loop {
+			if sent >= self.wire_limit {
+				return Err(WebError::Temporary("wire_bound"));
+			}
+			match self.wires.compare_exchange_weak(sent, sent + 1, Ordering::SeqCst, Ordering::SeqCst) {
+				Ok(_) => return Ok(sent),
+				Err(current) => sent = current,
+			}
+		}
+	}
 	fn finish(&self, result: Result<Value, WebError>) -> Result<Value, WebError> {
 		if let Some(error) = self.terminal.lock().unwrap().clone() {
 			return Err(error);
@@ -538,14 +586,30 @@ impl Budget {
 		Self {
 			wires: Arc::new(AtomicUsize::new(0)),
 			bytes: Arc::new(AtomicUsize::new(0)),
+			wire_limit: MAX_WIRES,
+			byte_limit: MAX_TOTAL,
 			terminal: Mutex::new(None),
 			quota: Mutex::new(None),
 		}
+	}
+	fn for_spec(spec: &Spec) -> Self {
+		let sources = if spec.post.is_some() { 1 } else { spec.communities.len() };
+		let mut budget = Self::new();
+		if sources > 1 {
+			// A supported subscription page needs a bootstrap and potentially
+			// pin metadata for each community. Reserve bounded room for a
+			// replacement attempt too, instead of exhausting a single-feed cap.
+			budget.wire_limit = (sources * 6).clamp(128, 384);
+			budget.byte_limit = (sources * 6 * 1024 * 1024).clamp(MAX_TOTAL, 256 * 1024 * 1024);
+		}
+		budget
 	}
 	fn new_attempt(&self) -> Self {
 		Self {
 			wires: self.wires.clone(),
 			bytes: self.bytes.clone(),
+			wire_limit: self.wire_limit,
+			byte_limit: self.byte_limit,
 			terminal: Mutex::new(None),
 			quota: Mutex::new(None),
 		}
@@ -618,10 +682,7 @@ impl Context {
 			if form.is_some() && !page.starts_with("/svc/shreddit/more-comments/") {
 				return Err(WebError::Cursor);
 			}
-			let wire = self.budget.wires.fetch_add(1, Ordering::SeqCst);
-			if wire >= MAX_WIRES {
-				return Err(WebError::Temporary("wire_bound"));
-			}
+			let _wire = self.budget.reserve_wire()?;
 			#[cfg(not(test))]
 			let origin = spec.origin();
 			#[cfg(test)]
@@ -701,7 +762,9 @@ impl Context {
 			let mut stream = response.bytes_stream();
 			while let Some(chunk) = stream.next().await {
 				let chunk = chunk.map_err(|_| WebError::Temporary("body"))?;
-				if bytes.len().saturating_add(chunk.len()) > MAX_HTML || self.budget.bytes.fetch_add(chunk.len(), Ordering::SeqCst).saturating_add(chunk.len()) > MAX_TOTAL {
+				if bytes.len().saturating_add(chunk.len()) > MAX_HTML
+					|| self.budget.bytes.fetch_add(chunk.len(), Ordering::SeqCst).saturating_add(chunk.len()) > self.budget.byte_limit
+				{
 					return Err(WebError::Temporary("body_bound"));
 				}
 				bytes.extend_from_slice(&chunk);
@@ -711,7 +774,7 @@ impl Context {
 			if let Some(dir) = env::var_os("REDLIB_LIVE_CAPTURE_DIR") {
 				let dir = std::path::PathBuf::from(dir);
 				let _ = std::fs::create_dir_all(&dir);
-				let at = wire + 1;
+				let at = _wire + 1;
 				let _ = std::fs::write(dir.join(format!("response-{at}.html")), &text);
 				let _ = std::fs::write(
 					dir.join(format!("response-{at}.shape")),
@@ -732,13 +795,13 @@ impl Context {
 			}
 			if form.is_none() && (200..300).contains(&status) {
 				if let Some(target) = html::canonical_shell_target(&text, &spec.communities).map_err(|error| self.note(error))? {
-					if let Some(next) = spec.canonical_case_page(&page, &target, community)? {
+					if let Some(next) = spec.canonical_page(&page, &target, community)? {
 						if followed_canonical {
 							return Err(WebError::Temporary("canonical_loop"));
 						}
 						followed_canonical = true;
 						page = next;
-						info!("Following canonical Reddit web casing: lane={} frontend={}", self.lane.label(), spec.origin());
+						info!("Following canonical Reddit web permalink: lane={} frontend={}", self.lane.label(), spec.origin());
 						continue;
 					}
 				}
@@ -849,6 +912,49 @@ impl std::hash::Hash for PinSession {
 		std::hash::Hash::hash(&(Arc::as_ptr(&self.0) as usize), state);
 	}
 }
+type PinKey = (PinSession, String, String, bool);
+type PinResult = Result<Value, WebError>;
+static PIN_FLIGHTS: LazyLock<AsyncMutex<HashMap<PinKey, watch::Receiver<Option<PinResult>>>>> = LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+
+async fn pin_metadata(context: Context, id: String, path: String) -> PinResult {
+	let key = (PinSession(context.session.clone()), id.clone(), path.clone(), context.quarantine);
+	let mut receiver = {
+		let mut flights = PIN_FLIGHTS.lock().await;
+		if let Some(receiver) = flights.get(&key) {
+			receiver.clone()
+		} else {
+			// Cover the parser's six-pin bound across 64 communities, while
+			// retaining a hard ceiling on queued metadata work.
+			if flights.len() >= 512 {
+				return Err(WebError::Temporary("capacity"));
+			}
+			let (sender, receiver) = watch::channel(None);
+			flights.insert(key.clone(), receiver.clone());
+			let request = context.clone();
+			tokio::spawn(async move {
+				let result = std::panic::AssertUnwindSafe(async move {
+					tokio::time::timeout(Duration::from_secs(30), pin_metadata_cached(request, id, path))
+						.await
+						.unwrap_or(Err(WebError::Temporary("timeout")))
+				})
+				.catch_unwind()
+				.await
+				.unwrap_or(Err(WebError::Temporary("parser")));
+				PIN_FLIGHTS.lock().await.remove(&key);
+				sender.send_replace(Some(result));
+			});
+			receiver
+		}
+	};
+	loop {
+		if let Some(result) = receiver.borrow_and_update().clone() {
+			return result.map_err(|error| context.note(error));
+		}
+		if receiver.changed().await.is_err() {
+			return Err(WebError::Temporary("parser"));
+		}
+	}
+}
 // A pin's public metadata can be reused between feed pages, but never across
 // anonymous jars. The key retains the transport so an address cannot be reused
 // for a new identity while the bounded cache still contains an entry.
@@ -859,7 +965,7 @@ impl std::hash::Hash for PinSession {
 	key = "(PinSession,String,String,bool)",
 	convert = r#"{(PinSession(context.session.clone()),id.clone(),path.clone(),context.quarantine)}"#
 )]
-async fn pin_metadata(context: Context, id: String, path: String) -> Result<Value, WebError> {
+async fn pin_metadata_cached(context: Context, id: String, path: String) -> Result<Value, WebError> {
 	let request = Spec::parse(&format!("{}.json", path.trim_end_matches('/')), context.quarantine)?;
 	let community = request.communities.first().map(String::as_str);
 	let body = context.fetch(&request, &request.initial(community), community, None).await?;
@@ -1223,6 +1329,8 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 	let spec = Spec::parse(path, quarantine)?;
 	let frontend = spec.origin();
+	let endpoint = if spec.post.is_some() { "comments" } else { "subreddit" };
+	let sources = spec.communities.len().max(1);
 	let primary = spec
 		.cursor
 		.as_ref()
@@ -1245,7 +1353,7 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 		.and_then(|c| c.session.clone())
 		.map(Ok)
 		.unwrap_or_else(|| active_transport(primary, quarantine))?;
-	let mut ctx = context(primary, session, Arc::new(Budget::new()));
+	let mut ctx = context(primary, session, Arc::new(Budget::for_spec(&spec)));
 	let first = tokio::time::timeout(Duration::from_secs(30), read_on_lane(ctx.clone(), spec.clone()))
 		.await
 		.unwrap_or(Err(WebError::Temporary("timeout")));
@@ -1267,13 +1375,23 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 	}
 	if let Err(error) = &first {
 		info!(
-			"Anonymous Reddit web attempt failed: lane={} frontend={} reason={}",
+			"Anonymous Reddit web attempt failed: lane={} frontend={} endpoint={} sources={} reason={} wires={}/{} bytes={}/{}",
 			primary.label(),
 			frontend,
-			error.label()
+			endpoint,
+			sources,
+			error.label(),
+			ctx.budget.wires.load(Ordering::SeqCst),
+			ctx.budget.wire_limit,
+			ctx.budget.bytes.load(Ordering::SeqCst),
+			ctx.budget.byte_limit
 		);
 	}
-	if spec.cursor.is_none() && first.as_ref().err().is_some_and(WebError::retry_lane) {
+	if spec.cursor.is_none()
+		&& first.as_ref().err().is_some_and(WebError::retry_lane)
+		&& ctx.budget.wires.load(Ordering::SeqCst) < ctx.budget.wire_limit
+		&& ctx.budget.bytes.load(Ordering::SeqCst) < ctx.budget.byte_limit
+	{
 		let alternate = if primary == RedditLane::Tor { RedditLane::Direct } else { RedditLane::Tor };
 		if alternate == RedditLane::Direct || TOR_FALLBACK_CONFIG.as_ref().is_ok_and(Option::is_some) {
 			let Ok(_standby) = STANDBY.try_acquire() else { return first };
@@ -1284,10 +1402,16 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 			let result = ctx.budget.finish(result);
 			if let Err(error) = &result {
 				info!(
-					"Anonymous Reddit web attempt failed: lane={} frontend={} reason={}",
+					"Anonymous Reddit web attempt failed: lane={} frontend={} endpoint={} sources={} reason={} wires={}/{} bytes={}/{}",
 					alternate.label(),
 					frontend,
-					error.label()
+					endpoint,
+					sources,
+					error.label(),
+					ctx.budget.wires.load(Ordering::SeqCst),
+					ctx.budget.wire_limit,
+					ctx.budget.bytes.load(Ordering::SeqCst),
+					ctx.budget.byte_limit
 				);
 			}
 			return result;
@@ -1304,7 +1428,7 @@ pub(super) fn listing_navigation(path: &str, quarantine: bool) -> (String, bool)
 static READ_CACHE: LazyLock<AsyncMutex<cached::SizedCache<JsonRequestKey, (Instant, Value)>>> = LazyLock::new(|| AsyncMutex::new(cached::SizedCache::with_size(512)));
 
 async fn cached_read(path: String, quarantine: bool) -> Result<(Value, bool), String> {
-	let key = (path.clone(), quarantine);
+	let key = Spec::parse(&path, quarantine).map_err(|error| error.message())?.cache_key(quarantine);
 	let cached = cached::Cached::cache_get(&mut *READ_CACHE.lock().await, &key).cloned();
 	let lifetime = Duration::from_secs(if is_comments_path(&path) { 180 } else { 60 });
 	if let Some((at, value)) = &cached {
@@ -1336,8 +1460,8 @@ async fn cached_read(path: String, quarantine: bool) -> Result<(Value, bool), St
 }
 
 pub(super) async fn json(path: String, quarantine: bool) -> Result<Value, String> {
-	Spec::parse(&path, quarantine).map_err(|error| error.message())?;
-	coalesce_json_request(&FLIGHTS, (path.clone(), quarantine), move || async move {
+	let key = Spec::parse(&path, quarantine).map_err(|error| error.message())?.cache_key(quarantine);
+	coalesce_json_request(&FLIGHTS, key.clone(), move || async move {
 		let (value, fallback) = cached_read(path.clone(), quarantine).await?;
 		let after = value["data"]["after"].as_str().or_else(|| value[1]["data"]["after"].as_str());
 		let stale = after.and_then(|after| after.strip_prefix(PREFIX)).is_some_and(|token| {
@@ -1350,7 +1474,7 @@ pub(super) async fn json(path: String, quarantine: bool) -> Result<Value, String
 			})
 		});
 		if stale && !fallback {
-			if let Some((at, _)) = cached::Cached::cache_get_mut(&mut *READ_CACHE.lock().await, &(path.clone(), quarantine)) {
+			if let Some((at, _)) = cached::Cached::cache_get_mut(&mut *READ_CACHE.lock().await, &key) {
 				*at = Instant::now() - Duration::from_secs(181);
 			}
 			cached_read(path, quarantine).await.map(|(value, _)| value)
