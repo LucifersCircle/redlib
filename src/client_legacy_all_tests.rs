@@ -1,4 +1,5 @@
 use super::*;
+use cached::Cached;
 use sealed_test::prelude::*;
 use std::sync::atomic::AtomicUsize;
 
@@ -6,6 +7,8 @@ use std::sync::atomic::AtomicUsize;
 enum GqlCase {
 	Missing,
 	Empty,
+	EmptyWithNext,
+	ZeroEmpty,
 	Edge,
 	Quota,
 	Zero,
@@ -130,6 +133,11 @@ impl Fixture {
 							match gql_case {
 								GqlCase::Missing => serde_json::json!({"data":{"allV3":{"elements":null}}}),
 								GqlCase::Empty => serde_json::json!({"data":{"allV3":{"elements":{"edges":[],"pageInfo":{"hasNextPage":false}}}}}),
+								GqlCase::EmptyWithNext => serde_json::json!({"data":{"allV3":{"elements":{"edges":[],"pageInfo":{"hasNextPage":true,"endCursor":"opaque-next"}}}}}),
+								GqlCase::ZeroEmpty => {
+									response = response.header("x-ratelimit-remaining", "0").header("x-ratelimit-reset", "60");
+									serde_json::json!({"data":{"allV3":{"elements":{"edges":[],"pageInfo":{"hasNextPage":false}}}}})
+								}
 								GqlCase::Edge => {
 									return Ok(
 										HyperResponse::builder()
@@ -314,7 +322,7 @@ fn test_legacy_all_tagged_next_previous_and_invalid_cursors_never_use_gql() {
 
 #[test]
 #[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
-fn test_legacy_all_failed_fallback_preserves_original_outcome_and_never_authenticates() {
+fn test_legacy_all_failed_fallback_preserves_errors_and_terminal_empty_is_temporary_without_auth() {
 	tokio::runtime::Runtime::new().unwrap().block_on(async {
 		for gql_case in [GqlCase::Missing, GqlCase::Empty] {
 			for legacy_case in [
@@ -337,7 +345,7 @@ fn test_legacy_all_failed_fallback_preserves_original_outcome_and_never_authenti
 				let result = json_uncached("/r/all/hot.json".into(), false).await;
 				match gql_case {
 					GqlCase::Missing => assert_eq!(result, Err("Reddit is temporarily unable to load this page. Retry in 30 seconds".into())),
-					GqlCase::Empty => assert_eq!(result.unwrap()["data"]["children"], serde_json::json!([])),
+					GqlCase::Empty => assert_eq!(result, Err(legacy_all_unavailable())),
 					_ => unreachable!(),
 				}
 				for _ in 0..5 {
@@ -638,5 +646,120 @@ fn test_legacy_all_raw_alias_follows_its_returned_next_and_previous_tags() {
 			assert!(json_uncached(invalid.into(), false).await.is_err());
 		}
 		assert_eq!(fixture.legacy.load(Ordering::SeqCst), 3);
+	});
+}
+
+fn terminal_empty_listing() -> Value {
+	serde_json::json!({"kind":"Listing","data":{"children":[],"after":null,"before":null}})
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_legacy_all_terminal_empty_cached_value_cannot_bypass_a_current_quota_pause() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		for expired in [false, true] {
+			let fixture = Fixture::new(GqlCase::Missing, LegacyCase::Listing).await;
+			fixture.install();
+			let path = format!("/r/all/hot.json?empty_cache_expired={expired}");
+			let key = (normalize_reddit_api_path(&path), false);
+			{
+				let mut cache = JSON_DYNAMIC_CACHED.lock().await;
+				cache.cache_set_lifespan(if expired { Duration::ZERO } else { Duration::from_secs(60) });
+				cache.cache_set(key.clone(), terminal_empty_listing());
+			}
+			{
+				let mut guard = upstream_guard(RedditLane::Tor);
+				guard.graphql_rate_limit_blocked_until = Some(Instant::now() + Duration::from_secs(60));
+				guard.graphql_quota.window = QuotaWindow::Known {
+					available: 0,
+					reset_at: Instant::now() + Duration::from_secs(60),
+				};
+			}
+			assert!(
+				tokio::time::timeout(Duration::from_secs(5), json(path, false)).await.unwrap().is_err(),
+				"an old terminal blank must not become fresh success during a quota pause"
+			);
+			assert_eq!(json_pause_cache_value(&*JSON_DYNAMIC_CACHED.lock().await, &key), None);
+			assert_eq!(fixture.gql.load(Ordering::SeqCst), 0);
+			assert_eq!(fixture.legacy.load(Ordering::SeqCst), 0);
+			assert_eq!(fixture.auth.load(Ordering::SeqCst), 0);
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_legacy_all_terminal_empty_refresh_preserves_expired_nonempty_last_good() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		for (index, gql_case) in [GqlCase::Empty, GqlCase::Missing].into_iter().enumerate() {
+			let fixture = Fixture::new(gql_case, LegacyCase::Invalid).await;
+			fixture.install();
+			let path = format!("/r/all/hot.json?last_good={index}");
+			let key = (normalize_reddit_api_path(&path), false);
+			let mut last_good = listing();
+			last_good["data"]["children"][0]["data"]["title"] = Value::String("Last good All page".into());
+			{
+				let mut cache = JSON_DYNAMIC_CACHED.lock().await;
+				cache.cache_set_lifespan(Duration::ZERO);
+				cache.cache_set(key.clone(), last_good.clone());
+			}
+			assert_eq!(
+				json(path.clone(), false).await.unwrap(),
+				last_good,
+				"new terminal-empty or failed refresh must preserve the expired nonempty fallback"
+			);
+			assert_eq!(json_pause_cache_value(&*JSON_DYNAMIC_CACHED.lock().await, &key), Some(last_good.clone()));
+			JSON_DYNAMIC_CACHED.lock().await.cache_set_lifespan(Duration::from_secs(60));
+			assert_eq!(json(path, false).await.unwrap(), last_good);
+			assert_eq!(fixture.gql.load(Ordering::SeqCst), 1);
+			assert_eq!(fixture.legacy.load(Ordering::SeqCst), 1);
+			assert_eq!(fixture.auth.load(Ordering::SeqCst), 0);
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_legacy_all_terminal_empty_is_not_recached_even_when_history_skips_recovery() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		for (index, gql_case) in [GqlCase::Empty, GqlCase::ZeroEmpty].into_iter().enumerate() {
+			let fixture = Fixture::new(gql_case, LegacyCase::Invalid).await;
+			fixture.install();
+			let path = format!("/r/all/hot.json?terminal_empty={index}");
+			let key = (normalize_reddit_api_path(&path), false);
+			assert!(json(path, false).await.is_err());
+			assert_eq!(json_pause_cache_value(&*JSON_DYNAMIC_CACHED.lock().await, &key), None);
+			assert_eq!(fixture.gql.load(Ordering::SeqCst), 1);
+			assert_eq!(fixture.legacy.load(Ordering::SeqCst), if index == 0 { 1 } else { 0 });
+			assert_eq!(fixture.auth.load(Ordering::SeqCst), 0);
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_legacy_all_terminal_empty_policy_preserves_cursor_progress_other_feeds_later_pages_and_quarantine_keys() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new(GqlCase::EmptyWithNext, LegacyCase::Listing).await;
+		fixture.install();
+		let path = "/r/all/hot.json?empty_with_next=1";
+		let first = json(path.into(), false).await.unwrap();
+		assert_eq!(first["data"]["children"], serde_json::json!([]));
+		assert_eq!(first["data"]["after"], "opaque-next");
+		assert_eq!(json(path.into(), false).await.unwrap(), first);
+		assert_eq!(fixture.gql.load(Ordering::SeqCst), 1);
+		assert_eq!(fixture.legacy.load(Ordering::SeqCst), 0);
+		for path in ["/r/fixture/hot.json?other_empty=1", "/r/all/hot.json?after=opaque-existing"] {
+			let key = (normalize_reddit_api_path(path), false);
+			JSON_DYNAMIC_CACHED.lock().await.cache_set(key, terminal_empty_listing());
+			assert_eq!(json(path.into(), false).await.unwrap(), terminal_empty_listing());
+		}
+		let path = "/r/all/hot.json?separate_quarantine=1";
+		let key = (normalize_reddit_api_path(path), true);
+		let retained = listing();
+		JSON_DYNAMIC_CACHED.lock().await.cache_set(key.clone(), retained.clone());
+		assert_eq!(json(path.into(), true).await.unwrap(), retained);
+		assert_eq!(json_pause_cache_value(&*JSON_DYNAMIC_CACHED.lock().await, &key), Some(retained));
+		assert_eq!(fixture.gql.load(Ordering::SeqCst), 1);
 	});
 }
