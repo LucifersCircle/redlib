@@ -162,6 +162,34 @@ impl Fixture {
 }
 
 #[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","api"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_default_keeps_tor_primary_without_backend_flag() {
+	std::env::remove_var("REDLIB_READ_BACKEND");
+	assert!(enabled(), "the web reader must be selected without another operator flag");
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		assert_eq!(configured_primary_lane(), RedditLane::Tor);
+		start_oauth();
+		start_tor_fallback();
+		assert!(oauth_client(RedditLane::Direct).is_none());
+		assert!(oauth_client(RedditLane::Tor).is_none());
+		let page = super::super::json("/r/rust/hot.json?limit=1".into(), false).await.unwrap();
+		let cursor = page["data"]["after"].as_str().unwrap().strip_prefix(PREFIX).unwrap();
+		assert!(
+			cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), cursor).unwrap().tor,
+			"navigation must retain the existing Tor primary"
+		);
+		let calls = fixture.wires.lock().unwrap().len();
+		assert_eq!(calls, 1);
+		std::env::set_var("REDLIB_READ_BACKEND", "api");
+		assert!(!enabled());
+		assert!(super::super::json("/r/rust/new.json?limit=1".into(), false).await.is_err());
+		assert_eq!(fixture.wires.lock().unwrap().len(), calls, "the explicit API override must not call the web backend");
+	});
+}
+
+#[test]
 #[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
 fn test_reddit_web_transport_uncached_reads_are_independent_of_api_and_keep_anonymous_session() {
 	tokio::runtime::Runtime::new().unwrap().block_on(async {
