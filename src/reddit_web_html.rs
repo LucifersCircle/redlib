@@ -42,6 +42,26 @@ static MORE_COUNT: LazyLock<Selector> = LazyLock::new(|| selector("faceplate-num
 static NEXT: LazyLock<Selector> = LazyLock::new(|| selector("a[rel='next'][href], .next-button a[href]"));
 static GATES: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-content-gate, shreddit-error-page, [data-testid='content-gate']"));
 static HEADINGS: LazyLock<Selector> = LazyLock::new(|| selector("h1, h2, title"));
+static APP: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-app"));
+static CANONICAL: LazyLock<Selector> = LazyLock::new(|| selector("#canonical-url-updater[value]"));
+
+pub(super) fn canonical_shell_target(html: &str, communities: &[String]) -> Result<Option<String>, WebError> {
+	if !html.contains("canonical-url-updater") {
+		return Ok(None);
+	}
+	let document = Html::parse_document(html);
+	restrictions(&document, communities)?;
+	if document.select(&APP).next().is_none() || document.select(&POSTS).next().is_some() || document.select(&COMMENTS).next().is_some() {
+		return Ok(None);
+	}
+	Ok(
+		document
+			.select(&CANONICAL)
+			.find(|element| !inside_ugc(*element) && !auxiliary(*element))
+			.and_then(|element| attr(element, &["value"]))
+			.map(str::to_owned),
+	)
+}
 static SCRIPTS: LazyLock<Selector> = LazyLock::new(|| selector("script"));
 static FORMS: LazyLock<Selector> = LazyLock::new(|| selector("form"));
 static INPUTS: LazyLock<Selector> = LazyLock::new(|| selector("input[name]"));
@@ -783,6 +803,21 @@ fn parse_mode(html: &str, expected_post: Option<&str>, communities: &[String], q
 		})
 		.or_else(|| expected_post.is_none().then(|| fragments.first().cloned()).flatten());
 	if posts.is_empty() && comments.is_empty() && fragments.is_empty() && more.is_empty() {
+		let raw_posts = document.select(&POSTS).count();
+		let raw_comments = document.select(&COMMENTS).count();
+		let raw_partials = document.select(&FRAGMENTS).count();
+		let app_shell = raw_posts == 0 && raw_comments == 0 && document.select(&APP).next().is_some();
+		log::info!(
+			"Anonymous Reddit HTML has no usable content: page_kind={} post_candidates={} comment_candidates={} partial_candidates={} app_shell={}",
+			if expected_post.is_some() { "thread" } else { "feed" },
+			raw_posts,
+			raw_comments,
+			raw_partials,
+			app_shell
+		);
+		if app_shell {
+			return Err(WebError::Temporary("empty_web_app_shell"));
+		}
 		return Err(WebError::Temporary("missing_web_content"));
 	}
 	if require_comments
@@ -1010,6 +1045,25 @@ mod tests {
 		assert_eq!(doc.comments[0]["data"]["replies"], "");
 		assert_eq!(doc.comments[1]["data"]["replies"]["data"]["children"][0]["kind"], "more");
 		assert_eq!(doc.more[0].parent, "t1_target");
+	}
+
+	#[test]
+	fn test_reddit_web_html_canonical_shell_target_requires_empty_app_and_primary_metadata() {
+		let canonical = r#"<div id="canonical-url-updater" value="https://www.reddit.com/r/Rust/hot/"></div>"#;
+		let shell = format!("<shreddit-app>{canonical}</shreddit-app>");
+		assert_eq!(canonical_shell_target(&shell, &names()).unwrap().as_deref(), Some("https://www.reddit.com/r/Rust/hot/"));
+		assert!(matches!(parse(&shell, None, &names(), false), Err(WebError::Temporary("empty_web_app_shell"))));
+		for page in [
+			format!("{shell}<shreddit-feed>{POST}</shreddit-feed>"),
+			format!("<shreddit-app><div slot=\"comment\">{canonical}</div></shreddit-app>"),
+			format!("<shreddit-app><aside>{canonical}</aside></shreddit-app>"),
+		] {
+			assert!(canonical_shell_target(&page, &names()).unwrap().is_none());
+		}
+		assert_eq!(
+			canonical_shell_target(&format!("{shell}<shreddit-content-gate reason=\"private\"></shreddit-content-gate>"), &names()).err(),
+			Some(WebError::Resource("private"))
+		);
 	}
 
 	#[test]

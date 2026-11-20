@@ -9,7 +9,9 @@ async fn live_anonymous_web_reader_capture() {
 	let _ = pretty_env_logger::try_init();
 	std::fs::create_dir_all("/tmp/redlib-live-capture").unwrap();
 	let feed = env::var("REDLIB_LIVE_FEED").unwrap_or_else(|_| "rust".into());
-	assert!(matches!(feed.as_str(), "rust" | "all" | "popular"));
+	let limit = env::var("REDLIB_LIVE_LIMIT").unwrap_or_else(|_| "25".into());
+	assert!(limit.parse::<u32>().is_ok_and(|n| (1..=100).contains(&n)));
+	assert!(matches!(feed.as_str(), "rust" | "all" | "popular" | "AskReddit" | "news" | "technology"));
 	let mut builder = WreqClient::builder()
 		.emulation(Emulation::builder().profile(Profile::Chrome145).platform(Platform::Windows).headers(true).build())
 		.redirect(Policy::none())
@@ -29,7 +31,7 @@ async fn live_anonymous_web_reader_capture() {
 		session: transport,
 		origin: None,
 	};
-	let spec = Spec::parse(&format!("/r/{feed}/hot.json?limit=1"), false).unwrap();
+	let spec = Spec::parse(&format!("/r/{feed}/hot.json?limit={limit}"), false).unwrap();
 	let response = tokio::time::timeout(Duration::from_secs(40), ctx.fetch(&spec, &spec.initial(Some(&feed)), Some(&feed), None))
 		.await
 		.unwrap();
@@ -59,7 +61,7 @@ async fn live_anonymous_web_reader_capture() {
 	assert!(!first["data"]["children"].as_array().unwrap().is_empty());
 	println!("Real feed pipeline: {} posts", first["data"]["children"].as_array().unwrap().len());
 	if let Some(after) = first["data"]["after"].as_str() {
-		let next = Spec::parse(&format!("/r/{feed}/hot.json?limit=1&after={after}"), false).unwrap();
+		let next = Spec::parse(&format!("/r/{feed}/hot.json?limit={limit}&after={after}"), false).unwrap();
 		let next = read_on_lane(ctx.clone(), next).await.expect("the real Next pipeline must succeed");
 		assert!(!next["data"]["children"].as_array().unwrap().is_empty());
 		println!("Real Next pipeline: {} posts", next["data"]["children"].as_array().unwrap().len());
@@ -72,11 +74,12 @@ async fn live_anonymous_web_reader_capture() {
 	// Exercise the real HTTP router, JSON conversion and Askama rendering too.
 	*MOCK.lock().unwrap() = Some((ctx.session.clone(), String::new()));
 	let mut app = crate::server::Server::new();
+	app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
 	app.at("/r/:sub/:sort").get(|r| Box::pin(crate::subreddit::community(r)));
 	app.at("/r/:sub/comments/:id/:title").get(|r| Box::pin(crate::post::item(r)));
 	let server = tokio::spawn(app.listen("127.0.0.1:18081"));
 	let http = hyper::Client::new();
-	for path in [format!("/r/{feed}/hot?limit=1"), permalink.to_string()] {
+	for path in ["/".to_string(), format!("/r/{feed}/hot?limit={limit}"), permalink.to_string()] {
 		let url = format!("http://127.0.0.1:18081{path}").parse().unwrap();
 		let response = http.get(url).await.unwrap();
 		let status = response.status();
@@ -89,6 +92,77 @@ async fn live_anonymous_web_reader_capture() {
 		assert!(page.select(&titles).next().is_some(), "HTTP 200 must contain rendered post content");
 		println!("Real rendered HTTP route: status=200 bytes={}", body.len());
 	}
+	server.abort();
+}
+
+#[tokio::test]
+#[ignore = "Manual real subscription homepage verification"]
+async fn live_subscription_homepage_capture() {
+	let _ = pretty_env_logger::try_init();
+	let names =
+		env::var("REDLIB_LIVE_SUBSCRIPTIONS").unwrap_or_else(|_| "rust+programming+technology+AskReddit+news+worldnews+science+aww+pics+funny+linux+apple+Android+Games".into());
+	assert!(names.split('+').count() <= 16 && names.split('+').all(valid_name));
+	let mut builder = WreqClient::builder()
+		.emulation(Emulation::builder().profile(Profile::Chrome145).platform(Platform::Windows).headers(true).build())
+		.redirect(Policy::none())
+		.cookie_provider(Arc::new(Jar::default()))
+		.tls_cert_store(wreq::tls::trust::CertStore::builder().set_default_paths().build().unwrap());
+	if let Ok(proxy) = env::var("HTTPS_PROXY").or_else(|_| env::var("https_proxy")) {
+		builder = builder.proxy(Proxy::all(proxy).unwrap());
+	}
+	let transport = Arc::new(Transport {
+		client: Arc::new(builder.build().unwrap()),
+		health: Mutex::new(Health::default()),
+	});
+	*MOCK.lock().unwrap() = Some((transport, String::new()));
+	let mut app = crate::server::Server::new();
+	app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
+	let server = tokio::spawn(app.listen("127.0.0.1:18082"));
+	let http = hyper::Client::new();
+	let request = hyper::Request::builder()
+		.uri("http://127.0.0.1:18082/")
+		.header("cookie", format!("subscriptions={names}; post_sort=hot; front_page=default"))
+		.body(Body::empty())
+		.unwrap();
+	let response = http.request(request).await.unwrap();
+	let status = response.status();
+	let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+	let dir = std::path::Path::new("/tmp/redlib-home-live");
+	std::fs::create_dir_all(dir).unwrap();
+	std::fs::write(dir.join("homepage.html"), &body).unwrap();
+	println!("Subscription homepage: communities={} status={} bytes={}", names.split('+').count(), status, body.len());
+	assert_eq!(status, hyper::StatusCode::OK);
+	let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+	let selector = scraper::Selector::parse(".post_title").unwrap();
+	assert!(doc.select(&selector).count() > 0);
+	let communities = scraper::Selector::parse(".post_subreddit").unwrap();
+	let shown: std::collections::HashSet<_> = doc
+		.select(&communities)
+		.filter_map(|el| el.value().attr("href"))
+		.filter_map(|href| href.strip_prefix("/r/"))
+		.map(str::to_ascii_lowercase)
+		.collect();
+	println!("Subscription homepage: represented_communities={}", shown.len());
+	for name in names.split('+') {
+		assert!(shown.contains(&name.to_ascii_lowercase()), "the first page must include {name}");
+	}
+	let next_selector = scraper::Selector::parse("a[accesskey='N']").unwrap();
+	let next = doc
+		.select(&next_selector)
+		.next()
+		.and_then(|el| el.value().attr("href"))
+		.expect("subscription homepage must issue Next");
+	let request = hyper::Request::builder()
+		.uri(format!("http://127.0.0.1:18082/{next}"))
+		.header("cookie", format!("subscriptions={names}; post_sort=hot; front_page=default"))
+		.body(Body::empty())
+		.unwrap();
+	let response = http.request(request).await.unwrap();
+	assert_eq!(response.status(), hyper::StatusCode::OK, "homepage Next must load with the same preferences");
+	let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+	let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+	assert!(doc.select(&selector).count() > 0);
+	println!("Subscription homepage Next: status=200 posts={}", doc.select(&selector).count());
 	server.abort();
 }
 
@@ -174,7 +248,31 @@ impl Fixture {
 						} else {
 							200
 						};
-						let body = if (8..=14).contains(&challenge_mode) && (!answered || matches!(challenge_mode, 9 | 11 | 12)) {
+						let name = path.split('/').nth(2).unwrap_or("rust");
+						let canonical_name = if name.eq_ignore_ascii_case("askreddit") {
+							"AskReddit"
+						} else if name.eq_ignore_ascii_case("android") {
+							"Android"
+						} else {
+							name
+						};
+						let body = if (19..=23).contains(&challenge_mode) && (name != canonical_name || challenge_mode != 19) {
+							let target = if challenge_mode == 20 {
+								"elsewhere"
+							} else if challenge_mode == 21 && name == canonical_name {
+								"askreddit"
+							} else {
+								canonical_name
+							};
+							let gate = if challenge_mode == 22 {
+								"<shreddit-content-gate reason=\"private\"></shreddit-content-gate>"
+							} else {
+								""
+							};
+							format!(r#"{gate}<shreddit-app><div id="canonical-url-updater" value="https://www.reddit.com/r/{target}/hot/"></div></shreddit-app>"#)
+						} else if challenge_mode == 19 {
+							format!("<shreddit-feed>{}</shreddit-feed>", post(name, &format!("p{}", name.to_ascii_lowercase()), 1, false, false))
+						} else if (8..=14).contains(&challenge_mode) && (!answered || matches!(challenge_mode, 9 | 11 | 12)) {
 							let action = if challenge_mode == 12 { "https://evil.test/r/rust/hot/" } else { &path };
 							let check = script_check(action);
 							if challenge_mode == 11 {
@@ -255,7 +353,7 @@ impl Fixture {
 							.header("set-cookie", "anon=fixture; Path=/; HttpOnly");
 						let response = if status == 429 {
 							response.header("retry-after", "60")
-						} else if challenge_mode == 14 {
+						} else if matches!(challenge_mode, 14 | 23) {
 							response.header("x-ratelimit-remaining", "0").header("x-ratelimit-reset", "60")
 						} else if challenge_mode == 18 {
 							response.header("location", "https://old.reddit.com/login/?reason=lor2&dest=%2Fr%2Fall%2Fhot%2F")
@@ -823,6 +921,120 @@ fn test_reddit_web_transport_recorded_feed_continuation_shape_loads_next_without
 				.validate_page(&format!("/svc/shreddit/community-more-posts/hot/?name=rust&{query}"), Some("rust"))
 				.is_err());
 		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_subscription_home_preserves_and_recovers_canonical_names() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(19, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let mut app = crate::server::Server::new();
+		app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		for names in ["AskReddit+Android+rust", "askreddit+android+rust"] {
+			let request = hyper::Request::builder()
+				.uri(format!("http://{address}/"))
+				.header("cookie", format!("subscriptions={names}; post_sort=hot; front_page=default"))
+				.body(Body::empty())
+				.unwrap();
+			let response = http.request(request).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::OK);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let body = std::str::from_utf8(&body).unwrap();
+			for id in ["paskreddit", "pandroid", "prust"] {
+				assert!(body.contains(&format!("id=\"{id}\"")), "homepage must retain every subscribed community");
+			}
+		}
+		let wires = fixture.wires.lock().unwrap();
+		assert_eq!(wires.iter().filter(|(path, _, _, _)| path == "/r/AskReddit/hot/").count(), 2);
+		assert!(wires.iter().any(|(path, _, _, _)| path == "/r/askreddit/hot/"));
+		server.abort();
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_subscription_home_next_empty_range_retains_cursor_scope() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(16, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let mut app = crate::server::Server::new();
+		app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		let make = |path: &str| {
+			hyper::Request::builder()
+				.uri(format!("http://{address}/{path}"))
+				.header("cookie", "subscriptions=rust; post_sort=hot; front_page=default")
+				.body(Body::empty())
+				.unwrap()
+		};
+		let first = http.request(make("")).await.unwrap();
+		assert_eq!(first.status(), hyper::StatusCode::OK);
+		let body = hyper::body::to_bytes(first.into_body()).await.unwrap();
+		let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+		let next = scraper::Selector::parse("a[accesskey='N']").unwrap();
+		let next = doc.select(&next).next().unwrap().value().attr("href").unwrap();
+		assert!(next.contains("t=&"));
+		let response = http.request(make(next)).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::OK);
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		assert!(std::str::from_utf8(&body).unwrap().contains("id=\"x0c\""));
+		server.abort();
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_canonical_case_recovery_is_scoped_bounded_and_respects_limits() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let spec = Spec::parse("/r/askreddit/hot.json", false).unwrap();
+		for (mode, expected, wires) in [
+			(20, WebError::Temporary("canonical_scope"), 1),
+			(21, WebError::Temporary("canonical_loop"), 2),
+			(22, WebError::Resource("private"), 1),
+			(23, WebError::RateLimited(Duration::from_secs(60)), 1),
+		] {
+			let fixture = Fixture::new().await;
+			fixture.mode.store(mode, Ordering::SeqCst);
+			let error = document(&fixture.context(), &spec, &spec.initial(Some("askreddit")), Some("askreddit"), true)
+				.await
+				.unwrap_err();
+			if mode == 23 {
+				assert!(matches!(error, WebError::RateLimited(delay) if delay <= Duration::from_secs(60) && delay > Duration::from_secs(59)));
+			} else {
+				assert_eq!(error, expected);
+			}
+			assert_eq!(fixture.wires.lock().unwrap().len(), wires);
+		}
+		for target in [
+			"https://evil.test/r/AskReddit/hot/",
+			"https://old.reddit.com/r/AskReddit/hot/",
+			"/r/elsewhere/hot/",
+			"/r/AskReddit/new/",
+			"/r/AskReddit/hot/?after=different",
+			"/r/AskReddit/hot/?next=evil",
+		] {
+			assert!(spec.canonical_case_page("/r/askreddit/hot/?t=all&limit=25", target, Some("askreddit")).is_err(), "{target}");
+		}
+		assert_eq!(
+			spec
+				.canonical_case_page("/r/askreddit/hot/?t=all&limit=25", "/r/AskReddit/hot/", Some("askreddit"))
+				.unwrap()
+				.unwrap(),
+			"/r/AskReddit/hot/?t=all&limit=25"
+		);
 	});
 }
 
