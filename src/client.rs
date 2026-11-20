@@ -46,6 +46,10 @@ mod discovery_standby_tests;
 #[path = "client_graphql_pages_tests.rs"]
 mod graphql_pages_tests;
 
+#[cfg(test)]
+#[path = "client_graphql_headers_tests.rs"]
+mod graphql_headers_tests;
+
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
 
 const REDDIT_SHORT_URL_BASE: &str = "https://redd.it";
@@ -3784,7 +3788,23 @@ fn request_once(
 		builder = builder.header(key, value);
 	}
 	if let Some(payload) = payload {
-		builder = builder.json(&payload);
+		// Match the persisted operation on every wire, including continuations.
+		// The response decoder accepts JSON, so do not negotiate multipart data.
+		let mut protocol_headers = wreq_header::HeaderMap::new();
+		protocol_headers.insert(
+			wreq_header::ACCEPT,
+			wreq_header::HeaderValue::from_static("application/graphql-response+json, application/json"),
+		);
+		for (name, value) in [
+			("x-apollo-operation-name", payload["operationName"].as_str()),
+			("x-apollo-operation-id", payload["extensions"]["persistedQuery"]["sha256Hash"].as_str()),
+		] {
+			let Some(value) = value.and_then(|value| wreq_header::HeaderValue::from_str(value).ok()) else {
+				return async { Err("Invalid internal GraphQL request metadata".into()) }.boxed();
+			};
+			protocol_headers.insert(wreq_header::HeaderName::from_static(name), value);
+		}
+		builder = builder.headers(protocol_headers).json(&payload);
 	}
 
 	async move {
