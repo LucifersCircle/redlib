@@ -3787,11 +3787,17 @@ fn comments_logical_path(path: &str) -> String {
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	let path = normalize_reddit_api_path(&path);
 	record_logical_json(&path);
-	json_coalesced(path, quarantine).await
+	let diagnose_all = all_first_page_diagnostic_path(&path);
+	let result = json_coalesced(path, quarantine).await;
+	if diagnose_all {
+		log_all_completion(&result);
+	}
+	result
 }
 
 async fn json_coalesced(path: String, quarantine: bool) -> Result<Value, String> {
 	let key = (path.clone(), quarantine);
+	discard_cached_terminal_empty_all(&key).await;
 	if let Some(value) = json_cached_during_pause(&key).await {
 		return Ok(value);
 	}
@@ -4158,9 +4164,47 @@ fn normalize_legacy_all_rest_cursors(path: &str) -> Result<String, String> {
 	Ok(path)
 }
 
+fn first_page_all_cache_path(path: &str) -> bool {
+	let base = path.split('?').next().unwrap_or_default();
+	let Some(subreddit) = base.strip_prefix("/r/").and_then(|path| path.split('/').next()) else {
+		return false;
+	};
+	if !subreddit.strip_suffix(".json").unwrap_or(subreddit).eq_ignore_ascii_case("all") {
+		return false;
+	}
+	matches!(legacy_all_plan(path), Ok(Some(LegacyAllPlan::FirstPage(_))))
+}
+fn terminal_empty_all_listing(value: &Value) -> bool {
+	let usable_cursor = |cursor: &Value| {
+		cursor
+			.as_str()
+			.is_some_and(|cursor| !cursor.is_empty() && cursor.len() <= 8192 && !cursor.chars().any(char::is_control))
+	};
+	value["kind"] == "Listing"
+		&& value["data"]["children"].as_array().is_some_and(Vec::is_empty)
+		&& !usable_cursor(&value["data"]["after"])
+		&& !usable_cursor(&value["data"]["before"])
+}
+async fn discard_cached_terminal_empty_all(key: &JsonRequestKey) {
+	if !first_page_all_cache_path(&key.0) {
+		return;
+	}
+	let mut cache = JSON_DYNAMIC_CACHED.lock().await;
+	let discard = {
+		let store = cache.get_store();
+		store
+			.key_order()
+			.zip(store.value_order())
+			.any(|(stored, (_, value))| stored == key && terminal_empty_all_listing(value))
+	};
+	if discard {
+		cached::Cached::cache_remove(&mut *cache, key);
+	}
+}
+
 fn legacy_all_candidate(result: &Result<Value, String>) -> bool {
 	match result {
-		Ok(value) => value["kind"] == "Listing" && value["data"]["children"].as_array().is_some_and(Vec::is_empty),
+		Ok(value) => terminal_empty_all_listing(value),
 		Err(message) => [
 			"Reddit is temporarily unable to load this page",
 			"Reddit is temporarily unable to load page",
@@ -4232,36 +4276,240 @@ fn legacy_all_current_quota_or_session_pause(lane: RedditLane) -> bool {
 				|| matches!(guard.quota_budget(*budget).window, QuotaWindow::Known { available: 0, reset_at } if reset_at > now)
 		})
 }
+#[derive(Clone, Copy)]
+enum AllReadPlan {
+	FirstPage,
+	Tagged,
+	RawAlias,
+}
+impl AllReadPlan {
+	fn label(self) -> &'static str {
+		match self {
+			Self::FirstPage => "first_page",
+			Self::Tagged => "tagged",
+			Self::RawAlias => "raw_alias",
+		}
+	}
+}
+#[derive(Clone, Copy)]
+enum AllReadReason {
+	HistoryDisqualified,
+	NormalNonempty,
+	EmptyWithCursor,
+	InvalidCursor,
+	LaneUnavailable,
+	QuotaOrSessionPause,
+	StandbyBusy,
+	Success,
+	Timeout,
+	Quota,
+	Resource,
+	Session,
+	Transport,
+	Capacity,
+	Unavailable,
+	Other,
+}
+impl AllReadReason {
+	fn label(self) -> &'static str {
+		match self {
+			Self::HistoryDisqualified => "history_disqualified",
+			Self::NormalNonempty => "normal_nonempty",
+			Self::EmptyWithCursor => "empty_with_cursor",
+			Self::InvalidCursor => "invalid_cursor",
+			Self::LaneUnavailable => "lane_unavailable",
+			Self::QuotaOrSessionPause => "quota_or_session_pause",
+			Self::StandbyBusy => "standby_busy",
+			Self::Success => "success",
+			Self::Timeout => "timeout",
+			Self::Quota => "quota",
+			Self::Resource => "resource",
+			Self::Session => "session",
+			Self::Transport => "transport",
+			Self::Capacity => "capacity",
+			Self::Unavailable => "unavailable",
+			Self::Other => "other",
+		}
+	}
+}
+fn all_read_result_reason(result: &Result<Value, String>) -> AllReadReason {
+	let Err(message) = result else {
+		return AllReadReason::Success;
+	};
+	if matches!(
+		message.as_str(),
+		"private" | "banned" | "quarantined" | "gated" | "suspended" | "Post not found" | "User not found"
+	) {
+		return AllReadReason::Resource;
+	}
+	if message.starts_with("This page link is invalid") {
+		return AllReadReason::InvalidCursor;
+	}
+	if message.contains("while waiting for transport capacity") {
+		return AllReadReason::Capacity;
+	}
+	if [
+		"Reddit rate limit exceeded",
+		"Reddit requests are temporarily paused until the current rate-limit window resets",
+		"Reddit requests are temporarily paused while discovering the anonymous session quota",
+	]
+	.iter()
+	.any(|prefix| message.starts_with(prefix))
+	{
+		return AllReadReason::Quota;
+	}
+	if ["OAuth", "Refreshing the anonymous Reddit session", "Reddit's anonymous"]
+		.iter()
+		.any(|prefix| message.starts_with(prefix))
+	{
+		return AllReadReason::Session;
+	}
+	if ["Reddit API request timed out", "Reddit direct standby timed out"]
+		.iter()
+		.any(|prefix| message.starts_with(prefix))
+	{
+		return AllReadReason::Timeout;
+	}
+	if [
+		"Couldn't send request to Reddit",
+		"Failed receiving body from Reddit",
+		"Reddit requests are temporarily paused after repeated upstream failures",
+		"Reddit requests are temporarily paused while the Tor onion API recovers",
+	]
+	.iter()
+	.any(|prefix| message.starts_with(prefix))
+	{
+		return AllReadReason::Transport;
+	}
+	if [
+		"Reddit is temporarily unable to load",
+		"Reddit is temporarily rejecting",
+		"Reddit error 403",
+		"Failed to parse page JSON data",
+	]
+	.iter()
+	.any(|prefix| message.starts_with(prefix))
+	{
+		return AllReadReason::Unavailable;
+	}
+	AllReadReason::Other
+}
+fn all_read_origin(lane: RedditLane) -> &'static str {
+	match lane {
+		RedditLane::Tor => "onion_rest",
+		RedditLane::Direct => "public_rest",
+	}
+}
+fn log_all_skip(plan: AllReadPlan, reason: AllReadReason) {
+	info!("Reddit All recovery: event=skip plan={} reason={}", plan.label(), reason.label());
+}
+fn all_first_page_diagnostic_path(path: &str) -> bool {
+	first_page_all_cache_path(path)
+		|| (is_legacy_all_rest_path(path)
+			&& url::form_urlencoded::parse(path.split_once('?').map_or("", |(_, query)| query).as_bytes())
+				.filter(|(key, _)| key == "after" || key == "before")
+				.all(|(_, value)| value.is_empty()))
+}
+fn log_all_completion(result: &Result<Value, String>) {
+	let (outcome, posts) = match result.as_ref().ok().and_then(|value| value["data"]["children"].as_array()) {
+		Some(children) if !children.is_empty() => ("nonempty", children.len()),
+		Some(_) if result.as_ref().is_ok_and(|value| !terminal_empty_all_listing(value)) => ("empty_with_cursor", 0),
+		_ => ("error", 0),
+	};
+	info!(
+		"Reddit All recovery: event=complete scope=first_page outcome={outcome} posts={posts} reason={}",
+		all_read_result_reason(result).label()
+	);
+}
+
 async fn legacy_all_read(logical_path: &str, rest_path: String, quarantine: bool, opportunistic: bool) -> Result<Value, String> {
-	let rest_path = normalize_legacy_all_rest_cursors(&rest_path)?;
+	let plan = if is_legacy_all_rest_path(logical_path) {
+		AllReadPlan::RawAlias
+	} else if opportunistic {
+		AllReadPlan::FirstPage
+	} else {
+		AllReadPlan::Tagged
+	};
+	let rest_path = normalize_legacy_all_rest_cursors(&rest_path).map_err(|message| {
+		log_all_skip(plan, AllReadReason::InvalidCursor);
+		message
+	})?;
 	let now = Instant::now();
 	let lane = preferred_api_lane(now, &rest_path);
-	if lane_availability(lane, now, &rest_path) != LaneAvailability::Ready
-		|| (opportunistic && (legacy_all_current_quota_or_session_pause(preferred_api_lane(now, logical_path)) || legacy_all_current_quota_or_session_pause(lane)))
-	{
+	let availability = lane_availability(lane, now, &rest_path);
+	if availability != LaneAvailability::Ready {
+		let reason = match availability {
+			LaneAvailability::UpstreamQuotaCooldown | LaneAvailability::LocalQuotaPause => AllReadReason::Quota,
+			_ => AllReadReason::LaneUnavailable,
+		};
+		info!(
+			"Reddit All recovery: event=skip plan={} lane={} origin={} reason={}",
+			plan.label(),
+			lane.label(),
+			all_read_origin(lane),
+			reason.label()
+		);
+		return Err(legacy_all_unavailable());
+	}
+	if opportunistic && (legacy_all_current_quota_or_session_pause(preferred_api_lane(now, logical_path)) || legacy_all_current_quota_or_session_pause(lane)) {
+		info!(
+			"Reddit All recovery: event=skip plan={} lane={} origin={} reason={}",
+			plan.label(),
+			lane.label(),
+			all_read_origin(lane),
+			AllReadReason::QuotaOrSessionPause.label()
+		);
 		return Err(legacy_all_unavailable());
 	}
 	let _standby = if lane == RedditLane::Direct && configured_primary_lane() == RedditLane::Tor {
-		Some(DIRECT_STANDBY_CAPACITY.try_acquire().map_err(|_| legacy_all_unavailable())?)
+		Some(DIRECT_STANDBY_CAPACITY.try_acquire().map_err(|_| {
+			log_all_skip(plan, AllReadReason::StandbyBusy);
+			legacy_all_unavailable()
+		})?)
 	} else {
 		None
 	};
+	info!(
+		"Reddit All recovery: event=attempt plan={} lane={} origin={}",
+		plan.label(),
+		lane.label(),
+		all_read_origin(lane)
+	);
+	let started = Instant::now();
 	let mut refresh = TorQuotaRefreshRetryState::default();
-	tokio::time::timeout(
+	let result = tokio::time::timeout(
 		LEGACY_ALL_TIMEOUT,
 		json_uncached_on_lane_with_options(rest_path, quarantine, lane, AdmissionRetryMode::Immediate, Some(LEGACY_ALL_TIMEOUT), None, &mut refresh),
 	)
-	.await
-	.map_err(|_| legacy_all_unavailable())?
-	.0
+	.await;
+	let (result, reason) = match result {
+		Ok((result, _, _)) => {
+			let reason = all_read_result_reason(&result);
+			(result, reason)
+		}
+		Err(_) => (Err(legacy_all_unavailable()), AllReadReason::Timeout),
+	};
+	info!(
+		"Reddit All recovery: event=result plan={} lane={} origin={} outcome={} elapsed_milliseconds={}",
+		plan.label(),
+		lane.label(),
+		all_read_origin(lane),
+		reason.label(),
+		started.elapsed().as_millis()
+	);
+	result
 }
 
 async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> {
-	with_tor_first_page_budget(&path, async {
+	let result = with_tor_first_page_budget(&path, async {
 		if is_legacy_all_rest_path(&path) {
 			return legacy_all_read(&path, path.clone(), quarantine, true).await;
 		}
-		match legacy_all_plan(&path)? {
+		let plan = legacy_all_plan(&path).map_err(|message| {
+			log_all_skip(AllReadPlan::FirstPage, AllReadReason::InvalidCursor);
+			message
+		})?;
+		match plan {
 			Some(LegacyAllPlan::Tagged(rest_path)) => legacy_all_read(&path, rest_path, quarantine, false).await,
 			Some(LegacyAllPlan::FirstPage(rest_path)) => {
 				let (result, disqualified) = LEGACY_ALL_DISQUALIFIED
@@ -4271,17 +4519,33 @@ async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> 
 						(result, disqualified)
 					})
 					.await;
-				if !disqualified && legacy_all_candidate(&result) {
+				if disqualified {
+					log_all_skip(AllReadPlan::FirstPage, AllReadReason::HistoryDisqualified);
+				} else if legacy_all_candidate(&result) {
 					if let Ok(value) = legacy_all_read(&path, rest_path, quarantine, true).await {
 						return Ok(value);
 					}
+				} else {
+					let reason = match &result {
+						Ok(value) if value["data"]["children"].as_array().is_some_and(Vec::is_empty) => AllReadReason::EmptyWithCursor,
+						Ok(_) => AllReadReason::NormalNonempty,
+						Err(_) => all_read_result_reason(&result),
+					};
+					log_all_skip(AllReadPlan::FirstPage, reason);
 				}
 				result
 			}
 			None => json_uncached_routed(path.clone(), quarantine).await,
 		}
 	})
-	.await
+	.await;
+	// Normalize before the result_fallback macro writes: an old nonempty
+	// success must survive a blank upstream result, just as on other failures.
+	if first_page_all_cache_path(&path) && result.as_ref().is_ok_and(terminal_empty_all_listing) {
+		Err(legacy_all_unavailable())
+	} else {
+		result
+	}
 }
 
 async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, String> {
