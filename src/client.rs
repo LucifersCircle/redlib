@@ -39,6 +39,10 @@ mod tor_graphql_quota_tests;
 mod legacy_all_tests;
 
 #[cfg(test)]
+#[path = "client_discovery_standby_tests.rs"]
+mod discovery_standby_tests;
+
+#[cfg(test)]
 #[path = "client_graphql_pages_tests.rs"]
 mod graphql_pages_tests;
 
@@ -2004,10 +2008,34 @@ fn configured_primary_lane() -> RedditLane {
 	}
 }
 
-fn lane_availability(lane: RedditLane, now: Instant, path: &str) -> LaneAvailability {
-	let Some(oauth) = oauth_client(lane) else { return LaneAvailability::Unavailable };
+#[derive(Debug, Clone, Copy)]
+struct LaneRoutingState {
+	availability: LaneAvailability,
+	discovery_pending: bool,
+}
+
+fn lane_routing_state(lane: RedditLane, now: Instant, path: &str) -> LaneRoutingState {
+	let Some(oauth) = oauth_client(lane) else {
+		return LaneRoutingState {
+			availability: LaneAvailability::Unavailable,
+			discovery_pending: false,
+		};
+	};
 	let guard = upstream_guard(lane);
-	guard.routing_availability(now, oauth.generation, api_endpoint_index(path))
+	let endpoint = api_endpoint_index(path);
+	let availability = guard.routing_availability(now, oauth.generation, endpoint);
+	let quota = guard.quota_budget(QuotaBudget::for_endpoint(endpoint));
+	LaneRoutingState {
+		availability,
+		discovery_pending: availability == LaneAvailability::Ready
+			&& quota.generation == oauth.generation
+			&& matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true })
+			&& quota.discovery_owner.is_some(),
+	}
+}
+
+fn lane_availability(lane: RedditLane, now: Instant, path: &str) -> LaneAvailability {
+	lane_routing_state(lane, now, path).availability
 }
 
 fn tor_fallback_ready(path: &str) -> bool {
@@ -2055,11 +2083,17 @@ fn select_api_lane(primary: RedditLane, direct: LaneAvailability, tor: LaneAvail
 }
 
 fn preferred_api_lane(now: Instant, path: &str) -> RedditLane {
-	select_api_lane(
-		configured_primary_lane(),
-		lane_availability(RedditLane::Direct, now, path),
-		lane_availability(RedditLane::Tor, now, path),
-	)
+	let primary = configured_primary_lane();
+	let direct = lane_routing_state(RedditLane::Direct, now, path);
+	let tor = lane_routing_state(RedditLane::Tor, now, path);
+	// A follower cannot send while Tor's discovery owner is still learning its
+	// allowance. Use the existing bounded standby only when Direct can send now.
+	// Other routing and the global meaning of Ready retain their prior behavior.
+	if primary == RedditLane::Tor && tor.discovery_pending && direct.availability == LaneAvailability::Ready && !direct.discovery_pending {
+		RedditLane::Direct
+	} else {
+		select_api_lane(primary, direct.availability, tor.availability)
+	}
 }
 
 fn direct_quota_spillover_valid(ticket: QuotaSpilloverTicket, now: Instant) -> bool {
