@@ -35,8 +35,8 @@ async fn live_anonymous_web_reader_capture() {
 	let response = tokio::time::timeout(Duration::from_secs(40), ctx.fetch(&spec, &spec.initial(Some(&feed)), Some(&feed), None))
 		.await
 		.unwrap();
-	if feed == "all" && matches!(response, Err(WebError::Resource("login_required"))) {
-		println!("Real All result: login required; no anonymous feed was loaded");
+	if feed == "all" && matches!(response, Err(WebError::Temporary("login_redirect"))) {
+		println!("Real All result: this anonymous connection was redirected to sign-in; no feed was loaded");
 		return;
 	}
 	let text = response.unwrap();
@@ -58,12 +58,17 @@ async fn live_anonymous_web_reader_capture() {
 	}
 	assert!(!doc.posts.is_empty(), "a shell is not a successful real feed load");
 	let first = read_on_lane(ctx.clone(), spec).await.expect("the full real feed pipeline must succeed");
-	assert!(!first["data"]["children"].as_array().unwrap().is_empty());
-	println!("Real feed pipeline: {} posts", first["data"]["children"].as_array().unwrap().len());
+	let posts = first["data"]["children"].as_array().unwrap();
+	assert_eq!(posts.len(), limit.parse::<usize>().unwrap(), "a full live feed must fill the requested page");
+	for (index, (id, _)) in doc.pins.iter().enumerate() {
+		assert_eq!(posts[index]["data"]["name"], *id, "native highlight pins stay first in their own subreddit");
+		assert_eq!(posts[index]["data"]["stickied"], true);
+	}
+	println!("Real feed pipeline: {} posts, {} native pins retained first", posts.len(), doc.pins.len());
 	if let Some(after) = first["data"]["after"].as_str() {
 		let next = Spec::parse(&format!("/r/{feed}/hot.json?limit={limit}&after={after}"), false).unwrap();
 		let next = read_on_lane(ctx.clone(), next).await.expect("the real Next pipeline must succeed");
-		assert!(!next["data"]["children"].as_array().unwrap().is_empty());
+		assert_eq!(next["data"]["children"].as_array().unwrap().len(), limit.parse::<usize>().unwrap());
 		println!("Real Next pipeline: {} posts", next["data"]["children"].as_array().unwrap().len());
 	}
 	let permalink = first["data"]["children"][0]["data"]["permalink"].as_str().unwrap();
@@ -79,18 +84,33 @@ async fn live_anonymous_web_reader_capture() {
 	app.at("/r/:sub/comments/:id/:title").get(|r| Box::pin(crate::post::item(r)));
 	let server = tokio::spawn(app.listen("127.0.0.1:18081"));
 	let http = hyper::Client::new();
-	for path in ["/".to_string(), format!("/r/{feed}/hot?limit={limit}"), permalink.to_string()] {
+	for (index, path) in ["/".to_string(), format!("/r/{feed}/hot?limit={limit}"), permalink.to_string()].into_iter().enumerate() {
 		let url = format!("http://127.0.0.1:18081{path}").parse().unwrap();
 		let response = http.get(url).await.unwrap();
 		let status = response.status();
 		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 		std::fs::write("/tmp/redlib-live-capture/rendered-response.html", &body).unwrap();
+		std::fs::write(format!("/tmp/redlib-live-capture/rendered-{index}.html"), &body).unwrap();
 		assert_eq!(status, hyper::StatusCode::OK, "rendered HTTP route {path}");
 		assert!(body.len() > 1000);
 		let page = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
 		let titles = scraper::Selector::parse(".post_title").unwrap();
-		assert!(page.select(&titles).next().is_some(), "HTTP 200 must contain rendered post content");
-		println!("Real rendered HTTP route: status=200 bytes={}", body.len());
+		let count = page.select(&titles).count();
+		assert_eq!(
+			count,
+			if index == 2 {
+				1
+			} else if index == 0 {
+				25
+			} else {
+				limit.parse::<usize>().unwrap()
+			}
+		);
+		if index == 1 {
+			let pins = scraper::Selector::parse(".post.stickied").unwrap();
+			assert!(page.select(&pins).count() >= doc.pins.len(), "rendered feed must retain native highlight pins");
+		}
+		println!("Real rendered HTTP route: status=200 posts={count} bytes={}", body.len());
 	}
 	server.abort();
 }
@@ -134,7 +154,8 @@ async fn live_subscription_homepage_capture() {
 	assert_eq!(status, hyper::StatusCode::OK);
 	let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
 	let selector = scraper::Selector::parse(".post_title").unwrap();
-	assert!(doc.select(&selector).count() > 0);
+	assert_eq!(doc.select(&selector).count(), 25);
+	println!("Subscription homepage: posts=25");
 	let communities = scraper::Selector::parse(".post_subreddit").unwrap();
 	let shown: std::collections::HashSet<_> = doc
 		.select(&communities)
@@ -161,7 +182,7 @@ async fn live_subscription_homepage_capture() {
 	assert_eq!(response.status(), hyper::StatusCode::OK, "homepage Next must load with the same preferences");
 	let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
 	let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
-	assert!(doc.select(&selector).count() > 0);
+	assert_eq!(doc.select(&selector).count(), 25);
 	println!("Subscription homepage Next: status=200 posts={}", doc.select(&selector).count());
 	server.abort();
 }
@@ -192,6 +213,62 @@ fn post(name: &str, id: &str, score: usize, pinned: bool, old: bool) -> String {
 fn comment(id: &str) -> String {
 	format!(r#"<shreddit-comment thingid="t1_{id}" author="bob" score="2"><div id="t1_{id}-comment-rtjson-content" slot="comment"><p>Comment {id}</p></div></shreddit-comment>"#)
 }
+
+static PAGED_FIXTURE_CREATED: LazyLock<u64> = LazyLock::new(|| SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+fn dated_post(name: &str, id: &str, score: usize, pinned: bool, created: u64) -> String {
+	let mut html = post(name, id, score, pinned, false);
+	let start = html.find("created-timestamp=\"").unwrap() + "created-timestamp=\"".len();
+	let end = start + html[start..].find('"').unwrap();
+	html.replace_range(start..end, &created.to_string());
+	html
+}
+fn paged_feed_fixture(path: &str, query: &HashMap<String, String>, mode: usize) -> String {
+	let name = if path.starts_with("/svc/") {
+		query.get("name").map(String::as_str).unwrap()
+	} else {
+		path.split('/').nth(2).unwrap()
+	};
+	if path.contains("/comments/") {
+		let id = path.split('/').nth(4).unwrap();
+		return dated_post(name, id, 500, true, if id.ends_with("old") { 1 } else { *PAGED_FIXTURE_CREATED });
+	}
+	let sort = path.trim_end_matches('/').split('/').next_back().unwrap();
+	if mode == 34 && path.starts_with("/svc/") {
+		return "<shreddit-content-gate reason=\"private\"></shreddit-content-gate>".into();
+	}
+	if mode == 32 {
+		return format!(
+			"<shreddit-feed>{}</shreddit-feed><faceplate-partial src=\"/svc/shreddit/community-more-posts/{sort}/?name={name}&amp;after=t3_{name}old\"></faceplate-partial>",
+			post(name, &format!("{name}old"), 10, true, true)
+		);
+	}
+	let start = query
+		.get("after")
+		.and_then(|id| id.rsplit_once('n'))
+		.and_then(|(_, index)| index.parse::<usize>().ok())
+		.map_or(0, |n| n + 1);
+	let end = (start + if start == 0 { 3 } else { 25 }).min(80);
+	let cards = (start..end)
+		.map(|n| dated_post(name, &format!("{name}n{n}"), 100 - n, false, PAGED_FIXTURE_CREATED.saturating_sub(n as u64)))
+		.collect::<String>();
+	let pins = if start == 0 {
+		format!(
+			r#"<community-highlight-carousel subreddit-name="{name}"><a href="/r/{name}/comments/{name}old/title/"><community-highlight-card highlighted id="highlight_card_t3_{name}old"></community-highlight-card></a><a href="/r/{name}/comments/{name}fresh/title/"><community-highlight-card highlighted id="highlight_card_t3_{name}fresh"></community-highlight-card></a></community-highlight-carousel>"#
+		)
+	} else {
+		String::new()
+	};
+	let next = if end < 80 {
+		format!(
+			"<faceplate-partial src=\"/svc/shreddit/community-more-posts/{sort}/?name={name}&amp;after=t3_{name}n{}\"></faceplate-partial>",
+			end - 1
+		)
+	} else {
+		String::new()
+	};
+	format!("{pins}<shreddit-feed>{cards}</shreddit-feed>{next}")
+}
+
 // Recorded script/form contract from 0xMassi/webclaw 3c2006a13e5f96ea2a6956f578b9afefb8f5d8b7.
 fn script_check(action: &str) -> String {
 	format!(
@@ -247,9 +324,13 @@ impl Fixture {
 							.lock()
 							.unwrap()
 							.push((path.clone(), method.clone(), headers, String::from_utf8(body.to_vec()).unwrap()));
-						let status = if mode.load(Ordering::SeqCst) == 1 || (challenge_mode == 10 && answered) || (challenge_mode == 17 && wires.lock().unwrap().len() == 1) {
+						let status = if mode.load(Ordering::SeqCst) == 1
+							|| (challenge_mode == 33 && query.contains_key("after"))
+							|| (challenge_mode == 10 && answered)
+							|| (challenge_mode == 17 && wires.lock().unwrap().len() == 1)
+						{
 							429
-						} else if challenge_mode == 18 {
+						} else if challenge_mode == 18 || (challenge_mode == 35 && wires.lock().unwrap().len() <= 2) {
 							302
 						} else if challenge_mode == 13 && !answered {
 							403
@@ -376,6 +457,10 @@ impl Fixture {
 							} else {
 								body
 							}
+						} else if challenge_mode == 35 {
+							post("rust", "abc", 20, false, false)
+						} else if matches!(challenge_mode, 30 | 32 | 33 | 34) {
+							paged_feed_fixture(&path, &query, challenge_mode)
 						} else if matches!(challenge_mode, 28 | 29) {
 							let fixture = include_str!("../tests/fixtures/reddit_web_media.html");
 							if challenge_mode == 29 {
@@ -402,7 +487,7 @@ impl Fixture {
 							response.header("retry-after", "60")
 						} else if matches!(challenge_mode, 14 | 23) {
 							response.header("x-ratelimit-remaining", "0").header("x-ratelimit-reset", "60")
-						} else if challenge_mode == 18 {
+						} else if challenge_mode == 18 || (challenge_mode == 35 && status == 302) {
 							response.header("location", "https://old.reddit.com/login/?reason=lor2&dest=%2Fr%2Fall%2Fhot%2F")
 						} else if status == 302 {
 							response.header("location", "/r/rust/hot/?rdt=12345")
@@ -734,14 +819,14 @@ fn test_reddit_web_script_check_rejects_other_forms_scripts_and_destinations() {
 
 #[test]
 #[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
-fn test_reddit_web_transport_all_login_redirect_is_terminal_without_retry_or_identity_rotation() {
+fn test_reddit_web_transport_login_redirect_stays_retryable_without_submitting_login_or_rotating_identity() {
 	tokio::runtime::Runtime::new().unwrap().block_on(async {
 		let fixture = Fixture::new().await;
 		fixture.mode.store(18, Ordering::SeqCst);
 		let spec = Spec::parse("/r/all/hot.json", false).unwrap();
 		let error = document(&fixture.context(), &spec, &spec.initial(Some("all")), Some("all"), true).await.unwrap_err();
-		assert_eq!(error, WebError::Resource("login_required"));
-		assert!(!error.retry_lane());
+		assert_eq!(error, WebError::Temporary("login_redirect"));
+		assert!(error.retry_lane());
 		assert_eq!(fixture.wires.lock().unwrap().len(), 1);
 	});
 }
@@ -1207,13 +1292,14 @@ fn test_reddit_web_subscription_home_next_empty_range_retains_cursor_scope() {
 				.body(Body::empty())
 				.unwrap()
 		};
-		let first = http.request(make("")).await.unwrap();
+		let first = http.request(make("?limit=2")).await.unwrap();
 		assert_eq!(first.status(), hyper::StatusCode::OK);
 		let body = hyper::body::to_bytes(first.into_body()).await.unwrap();
 		let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
 		let next = scraper::Selector::parse("a[accesskey='N']").unwrap();
 		let next = doc.select(&next).next().unwrap().value().attr("href").unwrap();
 		assert!(next.contains("t=&"));
+		assert!(next.contains("limit=2"));
 		let response = http.request(make(next)).await.unwrap();
 		assert_eq!(response.status(), hyper::StatusCode::OK);
 		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
@@ -1283,8 +1369,9 @@ fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 		served: 1,
 		form: None,
 		resume: None,
+		pinned: vec![],
 	};
-	let cursor = encode_cursor(&spec.scope, vec![source], RedditLane::Direct, None).unwrap().unwrap();
+	let cursor = encode_cursor(&spec.scope, vec![source], RedditLane::Direct, None, None).unwrap().unwrap();
 	let path = format!("/r/rust/hot.json?limit=1&after={cursor}");
 	assert!(Spec::parse(&path, false).is_ok());
 	assert!(matches!(Spec::parse(&path, true), Err(WebError::Cursor)));
@@ -1314,8 +1401,10 @@ fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 			served: 0,
 			form: None,
 			resume: None,
+			pinned: vec![],
 		}],
 		RedditLane::Direct,
+		None,
 		None,
 	)
 	.unwrap()
@@ -1360,5 +1449,277 @@ fn test_reddit_web_production_browser_jars_are_isolated_without_oauth_identity()
 			assert!(!headers.contains_key("authorization"));
 			assert!(!headers.contains_key("x-reddit-device-id"));
 		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_feed_parity_pins_page_size_and_subscription_turns() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(30, Ordering::SeqCst);
+		for combined in [false, true] {
+			let names = if combined {
+				(0..14).map(|i| format!("s{i}")).collect::<Vec<_>>().join("%2B")
+			} else {
+				"rust".into()
+			};
+			for sort in ["hot", "new", "top", "rising", "best", "controversial"] {
+				for limit in [7, 25, 100] {
+					let base = format!("/r/{names}/{sort}.json?limit={limit}");
+					let mut path = base.clone();
+					let mut seen = HashSet::new();
+					let mut rank = f64::INFINITY;
+					let mut turns = HashMap::<String, usize>::new();
+					for page_index in 0..3 {
+						let page = read_on_lane(fixture.context(), Spec::parse(&path, false).unwrap()).await.unwrap();
+						let posts = page["data"]["children"].as_array().unwrap();
+						let available = if combined { 14 * 81 } else { 82 };
+						assert_eq!(posts.len(), limit.min(available - page_index * limit), "{names} {sort} page={page_index} limit={limit}");
+						for post in posts {
+							let id = post["data"]["name"].as_str().unwrap();
+							*turns.entry(post["data"]["subreddit"].as_str().unwrap().to_string()).or_default() += 1;
+							if combined && matches!(sort, "new" | "top" | "controversial") {
+								let current = post["data"][if sort == "new" { "created_utc" } else { "score" }].as_f64().unwrap();
+								assert!(current <= rank, "global ranking must survive page and source boundaries");
+								rank = current;
+							}
+
+							assert!(seen.insert(id.to_string()), "a source refill or pin must not repeat a returned post: {id}");
+							if combined || page_index > 0 {
+								assert!(!id.ends_with("old"), "home/combined/later pages retain the existing 24-hour pin rule");
+							}
+						}
+						if !combined && page_index == 0 {
+							assert_eq!(posts[0]["data"]["name"], "t3_rustold");
+							assert_eq!(posts[1]["data"]["name"], "t3_rustfresh");
+						}
+						if combined && page_index == 0 && limit >= 14 && matches!(sort, "hot" | "best" | "rising") {
+							let communities: HashSet<_> = posts[..14].iter().map(|p| p["data"]["subreddit"].as_str().unwrap()).collect();
+							assert_eq!(communities.len(), 14, "every subscription keeps its turn across fragment boundaries");
+						}
+						if combined && matches!(sort, "hot" | "best" | "rising") {
+							let counts = (0..14).map(|i| *turns.get(&format!("s{i}")).unwrap_or(&0)).collect::<Vec<_>>();
+							assert!(
+								counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1,
+								"subscription turns stay balanced across pages"
+							);
+						}
+						match page["data"]["after"].as_str() {
+							Some(cursor) => path = format!("{base}&after={cursor}"),
+							None => {
+								assert_eq!(seen.len(), available);
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+		let names = (0..64).map(|i| format!("s{i}")).collect::<Vec<_>>().join("%2B");
+		assert!(Spec::parse(&format!("/r/{names}/hot.json"), false).is_ok(), "retain the prior 64-subscription bound");
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_feed_parity_refills_respect_empty_loops_quota_and_resources() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(32, Ordering::SeqCst);
+		assert!(matches!(
+			read_on_lane(fixture.context(), Spec::parse("/r/s0%2Bs1/hot.json", false).unwrap()).await,
+			Err(WebError::Temporary("feed_page_bound"))
+		));
+		assert!(fixture.wires.lock().unwrap().len() <= 18);
+		let private = Fixture::new().await;
+		private.mode.store(34, Ordering::SeqCst);
+		let context = private.context();
+		assert_eq!(
+			read_on_lane(context.clone(), Spec::parse("/r/rust/hot.json", false).unwrap()).await.unwrap_err(),
+			WebError::Resource("private")
+		);
+		let sent = private.wires.lock().unwrap().len();
+		assert_eq!(
+			read_on_lane(context, Spec::parse("/r/rust/hot.json", false).unwrap()).await.unwrap_err(),
+			WebError::Resource("private")
+		);
+		assert_eq!(private.wires.lock().unwrap().len(), sent);
+		let quota = Fixture::new().await;
+		quota.mode.store(33, Ordering::SeqCst);
+		assert!(matches!(
+			read_on_lane(quota.context(), Spec::parse("/r/rust/hot.json", false).unwrap()).await,
+			Err(WebError::RateLimited(_))
+		));
+		let sent = quota.wires.lock().unwrap().len();
+		assert!(matches!(
+			read_on_lane(quota.context(), Spec::parse("/r/rust/hot.json", false).unwrap()).await,
+			Err(WebError::RateLimited(_))
+		));
+		assert_eq!(quota.wires.lock().unwrap().len(), sent, "a refill must honor the exhausted session");
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_feed_parity_previous_and_explicit_limits_survive_http_navigation() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(30, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let mut app = crate::server::Server::new();
+		app.at("/r/:sub/:sort").get(|r| Box::pin(crate::subreddit::community(r)));
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		async fn page(http: &hyper::Client<hyper::client::HttpConnector>, address: std::net::SocketAddr, path: &str) -> (Vec<String>, Option<String>, Option<String>) {
+			let response = http.get(format!("http://{address}{path}").parse().unwrap()).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::OK);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			let doc = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+			let ids = doc
+				.select(&scraper::Selector::parse(".post[id]").unwrap())
+				.map(|e| e.value().attr("id").unwrap().to_string())
+				.collect();
+			let link = |key: &str| {
+				doc
+					.select(&scraper::Selector::parse(&format!("a[accesskey='{key}']")).unwrap())
+					.next()
+					.map(|e| e.value().attr("href").unwrap().to_string())
+			};
+			(ids, link("N"), link("P"))
+		}
+		let first = page(&http, address, "/r/rust/hot?limit=7&t=week").await;
+		assert_eq!(first.0.len(), 7);
+		assert!(first.2.is_none());
+		let next = first.1.as_ref().unwrap();
+		assert!(next.contains("limit=7") && next.contains("t=week"));
+		let second = page(&http, address, &format!("/r/rust/hot{next}")).await;
+		assert_eq!(second.0.len(), 7);
+		let third = page(&http, address, &format!("/r/rust/hot{}", second.1.as_ref().unwrap())).await;
+		assert_eq!(third.0.len(), 7);
+		let previous = page(&http, address, &format!("/r/rust/hot{}", third.2.as_ref().unwrap())).await;
+		assert_eq!(previous.0, second.0);
+		let root = page(&http, address, &format!("/r/rust/hot{}", previous.2.as_ref().unwrap())).await;
+		assert_eq!(root.0, first.0, "returning to the first page restores its pins");
+		assert!(root.2.is_none());
+		server.abort();
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transient_login_redirect_recovers_public_post_without_account_or_quota_rotation() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(35, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let mut app = crate::server::Server::new();
+		app.at("/r/:sub/comments/:id/:title").get(|r| Box::pin(crate::post::item(r)));
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		let url: hyper::Uri = format!("http://{address}/r/rust/comments/abc/title?sort=new&context=2").parse().unwrap();
+		let waiting = http.get(url.clone()).await.unwrap();
+		assert_eq!(waiting.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+		let body = hyper::body::to_bytes(waiting.into_body()).await.unwrap();
+		let body = std::str::from_utf8(&body).unwrap();
+		assert!(body.contains("http-equiv=\"refresh\""));
+		assert!(!body.contains("requires a signed-in account"));
+		let loaded = http.get(url).await.unwrap();
+		assert_eq!(loaded.status(), hyper::StatusCode::OK);
+		assert_eq!(TEST_RENEWALS.load(Ordering::SeqCst), 0, "a connection challenge is not quota exhaustion");
+		assert!(fixture
+			.wires
+			.lock()
+			.unwrap()
+			.iter()
+			.all(|(path, method, headers, _)| path == "/r/rust/comments/abc/title/" && method == "GET" && !headers.contains_key("authorization")));
+		server.abort();
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_feed_parity_pin_metadata_cache_is_bounded_to_its_anonymous_jar() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(30, Ordering::SeqCst);
+		let path = "/r/rust/hot.json?limit=7";
+		for _ in 0..2 {
+			let page = read_on_lane(fixture.context(), Spec::parse(path, false).unwrap()).await.unwrap();
+			assert_eq!(page["data"]["children"].as_array().unwrap().len(), 7);
+		}
+		let pin_reads = fixture.wires.lock().unwrap().iter().filter(|(path, _, _, _)| path.contains("/comments/")).count();
+		assert_eq!(pin_reads, 2, "repeat feed reads reuse both pins without extra upstream requests");
+		let fresh = Fixture::new().await;
+		fresh.mode.store(30, Ordering::SeqCst);
+		read_on_lane(fresh.context(), Spec::parse(path, false).unwrap()).await.unwrap();
+		assert_eq!(
+			fresh.wires.lock().unwrap().iter().filter(|(path, _, _, _)| path.contains("/comments/")).count(),
+			2,
+			"a new anonymous jar revalidates its own pin metadata"
+		);
+		fixture.transport.health.lock().unwrap().pause(Duration::from_secs(60));
+		let sent = fixture.wires.lock().unwrap().len();
+		assert!(matches!(
+			read_on_lane(fixture.context(), Spec::parse(path, false).unwrap()).await,
+			Err(WebError::RateLimited(_))
+		));
+		assert_eq!(fixture.wires.lock().unwrap().len(), sent, "cached pins cannot bypass the exhausted feed session");
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_feed_parity_cache_lifetimes_and_last_good_recovery_keep_resource_gates() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let path = "/r/rust/hot.json?limit=1".to_string();
+		let first = json(path.clone(), false).await.unwrap();
+		let count = fixture.wires.lock().unwrap().len();
+		{
+			let mut cache = READ_CACHE.lock().await;
+			let entry = cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap();
+			entry.0 = Instant::now() - Duration::from_secs(50);
+		}
+		assert_eq!(json(path.clone(), false).await.unwrap(), first);
+		assert_eq!(fixture.wires.lock().unwrap().len(), count, "feed freshness retains the prior 60-second window");
+		{
+			let mut cache = READ_CACHE.lock().await;
+			let entry = cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap();
+			entry.0 = Instant::now() - Duration::from_secs(61);
+		}
+		fixture.mode.store(18, Ordering::SeqCst);
+		assert_eq!(json(path.clone(), false).await.unwrap(), first, "a temporary sign-in redirect preserves last good content");
+		fixture.mode.store(11, Ordering::SeqCst);
+		assert!(json(path.clone(), false).await.unwrap_err().contains("private"));
+		assert!(
+			cached::Cached::cache_get(&mut *READ_CACHE.lock().await, &(path.clone(), false)).is_none(),
+			"a resource gate removes the stale success"
+		);
+		fixture.mode.store(0, Ordering::SeqCst);
+		assert!(json(path, false).await.is_ok(), "the resource error itself is not cached");
+		let path = "/r/rust/comments/abc/title.json".to_string();
+		let first = json(path.clone(), false).await.unwrap();
+		let count = fixture.wires.lock().unwrap().len();
+		{
+			let mut cache = READ_CACHE.lock().await;
+			cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap().0 = Instant::now() - Duration::from_secs(179);
+		}
+		assert_eq!(json(path.clone(), false).await.unwrap(), first);
+		assert_eq!(fixture.wires.lock().unwrap().len(), count, "comment freshness retains the prior 180-second window");
+		{
+			let mut cache = READ_CACHE.lock().await;
+			cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap().0 = Instant::now() - Duration::from_secs(181);
+		}
+		fixture.mode.store(18, Ordering::SeqCst);
+		assert_eq!(json(path, false).await.unwrap(), first, "a challenged comment refresh retains the last good thread too");
+		assert!(fixture.wires.lock().unwrap().len() > count);
 	});
 }

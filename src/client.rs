@@ -3900,6 +3900,15 @@ fn comments_logical_path(path: &str) -> String {
 	}
 }
 
+pub(crate) fn listing_navigation(path: &str, quarantine: bool) -> (String, bool) {
+	if web::enabled() {
+		return web::listing_navigation(path, quarantine);
+	}
+	let query = path.split_once('?').map_or("", |(_, query)| query);
+	let first = url::form_urlencoded::parse(query.as_bytes()).all(|(key, value)| !matches!(key.as_ref(), "after" | "before") || value.is_empty());
+	(crate::utils::param(path, "after").unwrap_or_default(), first)
+}
+
 /// Make a request to a Reddit API and parse the JSON response.
 ///
 /// Identical in-flight requests share one result, including errors, but a later

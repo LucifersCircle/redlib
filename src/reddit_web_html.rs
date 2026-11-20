@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 #[derive(Debug)]
 pub(super) struct Document {
 	pub posts: Vec<Value>,
+	pub pins: Vec<(String, String)>,
 	pub comments: Vec<Value>,
 	pub next: Option<String>,
 	pub fragments: Vec<String>,
@@ -29,6 +30,7 @@ pub(super) struct More {
 }
 
 static POSTS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-post, #siteTable .thing[data-fullname^='t3_']"));
+static HIGHLIGHTS: LazyLock<Selector> = LazyLock::new(|| selector("community-highlight-carousel community-highlight-card[highlighted]"));
 static COMMENTS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-comment[thingid], .comment[data-fullname^='t1_']"));
 static BODY: LazyLock<Selector> = LazyLock::new(|| selector("[slot='text-body'], .usertext-body .md"));
 static COMMENT_BODY: LazyLock<Selector> = LazyLock::new(|| selector("[slot='comment'], .usertext-body .md"));
@@ -41,6 +43,7 @@ static CAPTIONS: LazyLock<Selector> = LazyLock::new(|| selector("figcaption"));
 static LINKS: LazyLock<Selector> = LazyLock::new(|| selector("a[href]"));
 static PLAYERS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-player, video"));
 static FLAIR: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-post-flair, .linkflairlabel, [slot='post-flair']"));
+static STYLED: LazyLock<Selector> = LazyLock::new(|| selector("[style]"));
 static FRAGMENTS: LazyLock<Selector> = LazyLock::new(|| selector("faceplate-partial[src], shreddit-async-loader[src]"));
 static FORM_CURSOR: LazyLock<Selector> = LazyLock::new(|| selector("input[name='cursor']"));
 static MORE_COUNT: LazyLock<Selector> = LazyLock::new(|| selector("faceplate-number[number]"));
@@ -297,7 +300,7 @@ fn image_url(value: &str) -> Option<String> {
 		return None;
 	}
 	let rewritten = crate::utils::format_url(&value);
-	["/img/", "/preview/", "/thumb/", "/emote/"]
+	["/img/", "/preview/", "/thumb/", "/emote/", "/emoji/"]
 		.iter()
 		.any(|prefix| rewritten.starts_with(prefix))
 		.then_some(value)
@@ -490,6 +493,61 @@ fn timestamp(value: Option<&str>) -> f64 {
 fn number(element: ElementRef<'_>, names: &[&str]) -> i64 {
 	attr(element, names).and_then(|value| value.parse().ok()).unwrap_or_default()
 }
+fn post_flair(data: &mut Value, flair: ElementRef<'_>) {
+	fn parts(element: ElementRef<'_>, depth: usize, result: &mut Vec<Value>) {
+		if depth > 16 || result.len() >= 64 {
+			return;
+		}
+		for child in element.children() {
+			if result.len() >= 64 {
+				break;
+			}
+			if let Some(text) = child.value().as_text().filter(|text| !text.trim().is_empty()) {
+				result.push(json!({"e":"text","t":text.to_string()}));
+			} else if let Some(child) = ElementRef::wrap(child) {
+				if matches!(child.value().name(), "script" | "style" | "template" | "svg") {
+					continue;
+				}
+				if child.value().name() == "img" {
+					if let Some(url) = attr(child, &["src"])
+						.and_then(image_url)
+						.filter(|url| !url.chars().any(|c| matches!(c, '\'' | '"' | '(' | ')' | ';')))
+					{
+						result.push(json!({"e":"emoji","u":url,"a":attr(child,&["alt"]).unwrap_or_default()}));
+					}
+				} else {
+					parts(child, depth + 1, result);
+				}
+			}
+		}
+	}
+	let mut rich = Vec::new();
+	parts(flair, 0, &mut rich);
+	data["link_flair_type"] = json!("richtext");
+	data["link_flair_richtext"] = json!(rich);
+	data["link_flair_text_color"] = json!("inherit");
+	for node in std::iter::once(flair).chain(flair.select(&STYLED)) {
+		for declaration in attr(node, &["style"]).unwrap_or_default().split(';') {
+			let Some((name, value)) = declaration.split_once(':') else { continue };
+			let value = value.trim();
+			let Some(hex) = value
+				.strip_prefix('#')
+				.filter(|hex| matches!(hex.len(), 3 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+			else {
+				continue;
+			};
+			if name.trim().eq_ignore_ascii_case("background-color") {
+				data["link_flair_background_color"] = json!(value);
+				if data["link_flair_text_color"] == "inherit" {
+					data["link_flair_text_color"] = json!("light");
+				}
+			}
+			if name.trim().eq_ignore_ascii_case("color") {
+				data["link_flair_text_color"] = json!(if matches!(hex, "000" | "000000") { "dark" } else { "light" });
+			}
+		}
+	}
+}
 fn text(element: ElementRef<'_>) -> String {
 	element.text().collect::<String>().trim().to_string()
 }
@@ -671,7 +729,7 @@ fn parse_post(element: ElementRef<'_>, communities: &[String], quarantine: bool)
 	let external = attr(element, &["content-href", "data-url"]).and_then(safe_link).unwrap_or_else(|| permalink.clone());
 	let self_post = attr(element, &["post-type"]).is_some_and(|kind| matches!(kind, "text" | "self"))
 		|| reddit_path(&external).is_some_and(|path| path.split('?').next() == Some(permalink.as_str()));
-	let flair = element.select(&FLAIR).find(|flair| owned_by(*flair, element, post_element)).map(text).unwrap_or_default();
+	let flair = element.select(&FLAIR).find(|flair| owned_by(*flair, element, post_element));
 	let comment_count = attr(element, &["comment-count", "data-comments-count"]).and_then(|value| value.parse::<u64>().ok());
 	let mut data = json!({
 		"id":id,"name":format!("t3_{id}"),"title":title,"permalink":permalink,"subreddit":sub,
@@ -684,9 +742,18 @@ fn parse_post(element: ElementRef<'_>, communities: &[String], quarantine: bool)
 		"spoiler":flag(element,&["spoiler","is-spoiler"])||class(element,"spoiler"),
 		"stickied":flag(element,&["stickied","is-stickied","pinned","is-pinned"])||class(element,"stickied"),
 		"locked":flag(element,&["locked","is-locked"]),"archived":flag(element,&["archived","is-archived"]),
-		"link_flair_text":flair,"all_awardings":[],"thumbnail":"","post_hint":"","is_video":false,
+		"link_flair_text":flair.map(text).unwrap_or_default(),"all_awardings":[],"thumbnail":"","post_hint":"","is_video":false,
 		"removed_by_category":if flag(element,&["removed","is-removed"]){"moderator"}else{""}
 	});
+	if let Some(flair) = flair {
+		post_flair(&mut data, flair);
+	}
+	if let Some(ratio) = attr(element, &["upvote-ratio"])
+		.and_then(|ratio| ratio.parse::<f64>().ok())
+		.filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio))
+	{
+		data["upvote_ratio"] = json!(ratio);
+	}
 	let mut images = element.select(&IMAGES).filter(|image| post_media_image(*image, element)).collect::<Vec<_>>();
 	images.sort_by_key(|image| {
 		!image
@@ -1031,7 +1098,30 @@ fn parse_mode(html: &str, expected_post: Option<&str>, communities: &[String], q
 			expected_post.is_none() && matches!(parts.as_slice(),["r",sub,..] if allowed_community(sub,communities))
 		})
 		.or_else(|| expected_post.is_none().then(|| fragments.first().cloned()).flatten());
-	if posts.is_empty() && comments.is_empty() && fragments.is_empty() && more.is_empty() {
+	let mut pins = Vec::new();
+	if expected_post.is_none() && communities.len() == 1 {
+		for card in document.select(&HIGHLIGHTS).filter(|card| !inside_ugc(*card) && !auxiliary(*card)) {
+			let Some(id) = attr(card, &["id"]).and_then(|id| id.strip_prefix("highlight_card_")).filter(|id| fullname(id, "t3_")) else {
+				continue;
+			};
+			let Some(path) = card
+				.ancestors()
+				.filter_map(ElementRef::wrap)
+				.find(|node| node.value().name() == "a")
+				.and_then(|link| attr(link, &["href"]))
+			else {
+				continue;
+			};
+			let Some((path, name)) = permalink(path, &id[3..]) else { continue };
+			if allowed_community(&name, communities) && !pins.iter().any(|(old, _)| old == id) {
+				if pins.len() == 6 {
+					return Err(WebError::Temporary("pin_bound"));
+				}
+				pins.push((id.to_string(), path));
+			}
+		}
+	}
+	if posts.is_empty() && pins.is_empty() && comments.is_empty() && fragments.is_empty() && more.is_empty() {
 		let raw_posts = document.select(&POSTS).count();
 		let raw_comments = document.select(&COMMENTS).count();
 		let raw_partials = document.select(&FRAGMENTS).count();
@@ -1061,6 +1151,7 @@ fn parse_mode(html: &str, expected_post: Option<&str>, communities: &[String], q
 	}
 	Ok(Document {
 		posts,
+		pins,
 		comments,
 		next,
 		fragments,
@@ -1115,6 +1206,8 @@ mod tests {
 		assert_eq!(article.media.url, "https://example.com/news");
 		assert!(article.thumbnail.url.starts_with("/preview/external-pre/"));
 		assert_eq!((article.thumbnail.width, article.thumbnail.height), (140, 93));
+		assert_eq!(article.flair.flair_parts[0].value, "News");
+		assert_eq!(article.flair.foreground_color, "inherit");
 	}
 
 	const POST: &str = r#"<shreddit-post id="t3_abc" permalink="/r/rust/comments/abc/title/" content-href="https://www.reddit.com/r/rust/comments/abc/title/" post-title="A &amp; B" author="op" subreddit-name="rust" score="42" comment-count="2" created-timestamp="2026-11-18T07:43:02+0000" is-stickied nsfw="false" spoiler><div slot="text-body"><p>Own <strong>body</strong>.</p></div></shreddit-post>"#;
@@ -1160,6 +1253,41 @@ mod tests {
 		let bad = fixture.replace("https://external-preview.redd.it/article.jpeg", "https://external-preview.redd.it.evil.test/article.jpeg");
 		let doc = parse(&bad, None, &names(), false).unwrap();
 		assert!(crate::utils::parse_post(&doc.posts[1]).await.thumbnail.url.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_reddit_web_html_parity_flair_labels_emoji_colors_and_real_vote_ratio() {
+		let html=POST.replace("score=\"42\"","score=\"42\" upvote-ratio=\"0.78\"").replace("</shreddit-post>","<shreddit-post-flair slot=\"post-flair\"><span style=\"background-color: #F4A221; color: #000000\">Rust <img src=\"https://emoji.redditmedia.com/abc/t5_rust/rust\" alt=\":rust:\"></span></shreddit-post-flair></shreddit-post>");
+		let doc = parse(&format!("<shreddit-feed>{html}</shreddit-feed>"), None, &names(), false).unwrap();
+		let post = crate::utils::parse_post(&doc.posts[0]).await;
+		assert_eq!(post.upvote_ratio, 78);
+		assert_eq!(post.flair.flair_parts.len(), 2);
+		assert_eq!(post.flair.flair_parts[0].value, "Rust ");
+		assert!(post.flair.flair_parts[1].value.starts_with("/emoji/"));
+		assert_eq!(post.flair.background_color, "#F4A221");
+		assert_eq!(post.flair.foreground_color, "black");
+		let invalid = html
+			.replace("https://emoji.redditmedia.com/abc/t5_rust/rust", "https://evil.test/icon.png")
+			.replace("background-color: #F4A221", "background-color: url(https://evil.test/pixel)");
+		let doc = parse(&format!("<shreddit-feed>{invalid}</shreddit-feed>"), None, &names(), false).unwrap();
+		let post = crate::utils::parse_post(&doc.posts[0]).await;
+		assert_eq!(post.flair.flair_parts.len(), 1);
+		assert!(post.flair.background_color.is_empty());
+	}
+
+	#[test]
+	fn test_reddit_web_html_parity_highlight_cards_require_own_public_post_links() {
+		let card = r#"<a href="/r/rust/comments/pin/title/"><community-highlight-card highlighted id="highlight_card_t3_pin"></community-highlight-card></a>"#;
+		let root = format!("<community-highlight-carousel>{card}</community-highlight-carousel><shreddit-feed>{POST}</shreddit-feed>");
+		assert_eq!(parse(&root, None, &names(), false).unwrap().pins, [("t3_pin".into(), "/r/rust/comments/pin/title/".into())]);
+		for bad in [
+			root.replace("/r/rust/comments/pin/", "/r/elsewhere/comments/pin/"),
+			root.replace("highlight_card_t3_pin", "highlight_card_t3_wrong"),
+			root.replace("href=\"/r/", "href=\"https://evil.test/r/"),
+			format!("<aside>{root}</aside><shreddit-feed>{POST}</shreddit-feed>"),
+		] {
+			assert!(parse(&bad, None, &names(), false).unwrap().pins.is_empty());
+		}
 	}
 
 	#[test]

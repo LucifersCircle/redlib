@@ -60,6 +60,15 @@ struct WallTemplate {
 
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 
+pub(crate) fn page_query(url: &str, sort: &str, range: &str, direction: &str, cursor: &str) -> String {
+	let mut query = url::form_urlencoded::Serializer::new(String::new());
+	query.extend_pairs(
+		url::form_urlencoded::parse(url.split_once('?').map_or("", |(_, query)| query).as_bytes()).filter(|(key, _)| !matches!(key.as_ref(), "after" | "before" | "sort" | "t")),
+	);
+	query.append_pair("sort", sort).append_pair("t", range).append_pair(direction, cursor);
+	format!("?{}", query.finish())
+}
+
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
@@ -164,7 +173,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	} else {
 		match Post::fetch(&path, quarantined).await {
 			Ok((mut posts, after)) => {
-				let show_pins = utils::subreddit_pins_first(&sub_name, req.param("sub").is_some(), req.uri().query().unwrap_or_default());
+				let (previous, first_page) = crate::client::listing_navigation(&path, quarantined);
+				let show_pins = utils::subreddit_pins_first(&sub_name, req.param("sub").is_some(), if first_page { "" } else { "after=page" });
 				utils::prepare_community_posts(&mut posts, &sort, show_pins, OffsetDateTime::now_utc().unix_timestamp());
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
@@ -173,7 +183,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					sub,
 					posts,
 					sort: (sort, param(&path, "t").unwrap_or_default()),
-					ends: (param(&path, "after").unwrap_or_default(), after),
+					ends: (previous, after),
 					prefs: Preferences::new(&req),
 					url,
 					redirect_url,

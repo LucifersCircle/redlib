@@ -73,11 +73,11 @@
 
 			<footer>
 				{% if !ends.0.is_empty() %}
-				<a href="?sort={{ sort.0 }}&t={{ sort.1 }}&before={{ ends.0 }}" accesskey="P">PREV</a>
+				<a href="{{ crate::subreddit::page_query(url, sort.0, sort.1, "before", ends.0) }}" accesskey="P">PREV</a>
 				{% endif %}
 
 				{% if !ends.1.is_empty() %}
-				<a href="?sort={{ sort.0 }}&t={{ sort.1 }}&after={{ ends.1 }}" accesskey="N">NEXT</a>
+				<a href="{{ crate::subreddit::page_query(url, sort.0, sort.1, "after", ends.1) }}" accesskey="N">NEXT</a>
 				{% endif %}
 			</footer>
 		</div>
