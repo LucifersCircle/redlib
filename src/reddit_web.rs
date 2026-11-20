@@ -344,6 +344,20 @@ impl Spec {
 		}
 		Ok(format!("{}{}", url.path(), url.query().map_or(String::new(), |q| format!("?{q}"))))
 	}
+	fn script_action(&self, page: &str, action: &str, community: Option<&str>) -> Result<String, WebError> {
+		let checked = self.validate_page(action, community).map_err(|_| WebError::Temporary("script_check_scope"))?;
+		let base = url::Url::parse(self.origin()).unwrap();
+		let current = base.join(page).map_err(|_| WebError::Temporary("script_check_scope"))?;
+		let mut answer = base.join(&checked).map_err(|_| WebError::Temporary("script_check_scope"))?;
+		if current.path().trim_end_matches('/') != answer.path().trim_end_matches('/') || answer.query_pairs().any(|pair| !current.query_pairs().any(|original| original == pair))
+		{
+			return Err(WebError::Temporary("script_check_scope"));
+		}
+		// Keep sort, range, pagination, focus and limits from the requested page.
+		// Challenge fields are appended to this one request, never to saved cursors.
+		answer.set_query(current.query());
+		Ok(format!("{}{}", answer.path(), answer.query().map_or(String::new(), |q| format!("?{q}"))))
+	}
 }
 
 #[derive(Default)]
@@ -454,7 +468,10 @@ impl Context {
 			return Err(self.note(WebError::RateLimited(delay)));
 		}
 		let _permit = CAPACITY.acquire().await.map_err(|_| WebError::Temporary("capacity"))?;
-		for _ in 0..3 {
+		let mut script_fields = None;
+		let mut answered_script = false;
+		let mut redirects = 0;
+		for _ in 0..4 {
 			if let Some(error) = self.budget.terminal.lock().unwrap().clone() {
 				return Err(error);
 			}
@@ -480,14 +497,18 @@ impl Context {
 			let origin = spec.origin();
 			#[cfg(test)]
 			let origin = self.origin.as_deref().unwrap_or_else(|| spec.origin());
+			let mut request_url = url::Url::parse(&format!("{origin}{page}")).map_err(|_| WebError::Temporary("script_check_scope"))?;
+			if let Some(fields) = script_fields.take() {
+				request_url.query_pairs_mut().extend_pairs(fields);
+			}
 			let request = if let Some(form) = form {
 				transport
 					.client
-					.post(format!("{origin}{page}"))
+					.post(request_url.as_str())
 					.header(wreq_header::CONTENT_TYPE, "application/x-www-form-urlencoded")
 					.body(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", &form.cursor).finish())
 			} else {
-				transport.client.get(format!("{origin}{page}"))
+				transport.client.get(request_url.as_str())
 			};
 			let response = request
 				.header(wreq_header::ACCEPT, "text/html, text/vnd.reddit.partial+html;q=0.9")
@@ -516,6 +537,10 @@ impl Context {
 				}
 			}
 			if (300..400).contains(&status) {
+				if redirects == 2 {
+					return Err(WebError::Temporary("redirect_bound"));
+				}
+				redirects += 1;
 				let next = headers.get(wreq_header::LOCATION).and_then(|v| v.to_str().ok()).ok_or(WebError::Temporary("redirect"))?;
 				page = spec.validate_page(next, community).map_err(|_| WebError::Temporary("redirect_scope"))?;
 				continue;
@@ -546,6 +571,18 @@ impl Context {
 				bytes.extend_from_slice(&chunk);
 			}
 			let text = String::from_utf8(bytes).map_err(|_| WebError::Temporary("encoding"))?;
+			if form.is_none() && ((200..300).contains(&status) || status == 403) {
+				if let Some(check) = html::script_check(&text, &spec.communities).map_err(|error| self.note(error))? {
+					if answered_script {
+						return Err(WebError::Temporary("script_check_repeated"));
+					}
+					page = spec.script_action(&page, &check.action, community)?;
+					script_fields = Some(check.fields);
+					answered_script = true;
+					info!("Completing anonymous Reddit script check: lane={} frontend={}", self.lane.label(), spec.origin());
+					continue;
+				}
+			}
 			if status == 403 {
 				return match html::parse(&text, spec.post.as_deref(), &spec.communities, self.quarantine) {
 					Err(WebError::Resource(reason)) => Err(self.note(WebError::Resource(reason))),
@@ -837,6 +874,7 @@ async fn read_on_lane(ctx: Context, spec: Spec) -> Result<Value, WebError> {
 }
 async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 	let spec = Spec::parse(path, quarantine)?;
+	let frontend = spec.origin();
 	let primary = spec
 		.cursor
 		.as_ref()
@@ -862,14 +900,31 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 	.await
 	.unwrap_or(Err(WebError::Temporary("timeout")));
 	let first = budget.finish(first);
+	if let Err(error) = &first {
+		info!(
+			"Anonymous Reddit web attempt failed: lane={} frontend={} reason={}",
+			primary.label(),
+			frontend,
+			error.label()
+		);
+	}
 	if spec.cursor.is_none() && first.as_ref().err().is_some_and(WebError::retry_lane) {
 		let alternate = if primary == RedditLane::Tor { RedditLane::Direct } else { RedditLane::Tor };
 		if alternate == RedditLane::Direct || TOR_FALLBACK_CONFIG.as_ref().is_ok_and(Option::is_some) {
-			let _standby = STANDBY.try_acquire().map_err(|_| WebError::Temporary("capacity"))?;
+			let Ok(_standby) = STANDBY.try_acquire() else { return first };
 			let result = tokio::time::timeout(Duration::from_secs(30), read_on_lane(context(alternate), spec))
 				.await
 				.unwrap_or(Err(WebError::Temporary("timeout")));
-			return budget.finish(result);
+			let result = budget.finish(result);
+			if let Err(error) = &result {
+				info!(
+					"Anonymous Reddit web attempt failed: lane={} frontend={} reason={}",
+					alternate.label(),
+					frontend,
+					error.label()
+				);
+			}
+			return result;
 		}
 	}
 	first
