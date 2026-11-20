@@ -227,6 +227,7 @@ enum TorRetryReason {
 	SessionUnavailable,
 	EdgeRejected,
 	QuotaReserve(QuotaSpilloverTicket),
+	DiscoveryPending,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -235,6 +236,7 @@ enum LaneRecoveryReason {
 	TransportFailure,
 	UpstreamCooldown(Duration),
 	QuotaCooldown(Duration),
+	QuotaDiscoveryPending { delay: Duration, ticket: QuotaDiscoveryTicket },
 	TorGraphqlQuotaCooldown { delay: Duration, scope: QuotaRefreshWaitTicket },
 	TorQuotaRefreshWait(QuotaRefreshWaitTicket),
 	TorQuotaGenerationChanged,
@@ -878,6 +880,23 @@ impl UpstreamGuard {
 		}
 		self.rejected_oauth_generation = Some(generation);
 		true
+	}
+
+	fn quota_discovery_ticket(&self, now: Instant, generation: u64, endpoint: usize) -> Option<QuotaDiscoveryTicket> {
+		let budget = QuotaBudget::for_endpoint(endpoint);
+		let quota = self.quota_budget(budget);
+		if self.routing_availability(now, generation, endpoint) != LaneAvailability::Ready
+			|| quota.generation != generation
+			|| !matches!(quota.window, QuotaWindow::Unknown { probe_in_flight: true })
+		{
+			return None;
+		}
+		quota.discovery_owner.map(|owner| QuotaDiscoveryTicket {
+			budget,
+			generation,
+			quota_epoch: quota.epoch,
+			owner,
+		})
 	}
 
 	fn rejected_session_refresh_delay(&mut self, now: Instant) -> Duration {
@@ -2015,6 +2034,10 @@ struct LaneRoutingState {
 }
 
 fn lane_routing_state(lane: RedditLane, now: Instant, path: &str) -> LaneRoutingState {
+	lane_routing_state_for_endpoint(lane, now, api_endpoint_index(path))
+}
+
+fn lane_routing_state_for_endpoint(lane: RedditLane, now: Instant, endpoint: usize) -> LaneRoutingState {
 	let Some(oauth) = oauth_client(lane) else {
 		return LaneRoutingState {
 			availability: LaneAvailability::Unavailable,
@@ -2022,7 +2045,6 @@ fn lane_routing_state(lane: RedditLane, now: Instant, path: &str) -> LaneRouting
 		};
 	};
 	let guard = upstream_guard(lane);
-	let endpoint = api_endpoint_index(path);
 	let availability = guard.routing_availability(now, oauth.generation, endpoint);
 	let quota = guard.quota_budget(QuotaBudget::for_endpoint(endpoint));
 	LaneRoutingState {
@@ -2102,6 +2124,7 @@ fn direct_quota_spillover_valid(ticket: QuotaSpilloverTicket, now: Instant) -> b
 
 #[derive(Debug)]
 struct BeginAttemptDenied {
+	discovery_wait: Option<QuotaDiscoveryTicket>,
 	admission: Option<AdmissionDenied>,
 	message: String,
 	edge_deferred: bool,
@@ -2117,6 +2140,11 @@ impl BeginAttemptDenied {
 				// The bounded local queue wait is already spent. Starting another
 				// upstream recovery loop here would repeat that wait for 45 seconds.
 				LaneRecoveryReason::None
+			} else if lane == RedditLane::Tor && admission.source == "quota_discovery" && self.discovery_wait.is_some() {
+				LaneRecoveryReason::QuotaDiscoveryPending {
+					delay: admission.delay,
+					ticket: self.discovery_wait.unwrap(),
+				}
 			} else if admission.reason == CooldownReason::UpstreamFailures {
 				LaneRecoveryReason::UpstreamCooldown(admission.delay)
 			} else if admission.reason == CooldownReason::RateLimit && (lane == RedditLane::Tor || admission.source == "active_cooldown") && self.tor_quota_refresh.is_none() {
@@ -2131,6 +2159,14 @@ impl BeginAttemptDenied {
 			}
 		})
 	}
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct QuotaDiscoveryTicket {
+	budget: QuotaBudget,
+	generation: u64,
+	quota_epoch: u64,
+	owner: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2263,6 +2299,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 	let budget = QuotaBudget::for_endpoint(endpoint);
 	let allow_quota_refresh = allow_quota_refresh && (budget == QuotaBudget::Rest || lane == RedditLane::Tor);
 	let oauth_client = oauth_client(lane).ok_or_else(|| BeginAttemptDenied {
+		discovery_wait: None,
 		admission: None,
 		message: oauth_startup_error(),
 		edge_deferred: false,
@@ -2273,6 +2310,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 	let generation = oauth_client.generation;
 	if guard.rejected_oauth_generation == Some(generation) {
 		return Err(BeginAttemptDenied {
+			discovery_wait: None,
 			admission: None,
 			message: session_refresh_wait_message(refresh_backoff_remaining(lane)),
 			edge_deferred: false,
@@ -2283,6 +2321,11 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 	}
 	let now = Instant::now();
 	let result = guard.try_admit_endpoint(now, generation, endpoint);
+	let discovery_wait = result
+		.as_ref()
+		.err()
+		.filter(|denial| denial.source == "quota_discovery")
+		.and_then(|_| guard.quota_discovery_ticket(now, generation, endpoint));
 	let denied_quota_epoch = result
 		.as_ref()
 		.err()
@@ -2323,6 +2366,7 @@ fn begin_upstream_attempt_once(lane: RedditLane, allow_quota_refresh: bool, endp
 			ticket
 		});
 		BeginAttemptDenied {
+			discovery_wait,
 			edge_deferred: denial.reason == CooldownReason::EdgeThrottle,
 			message,
 			admission: Some(denial),
@@ -2388,14 +2432,24 @@ async fn begin_upstream_attempt(
 					if let Some(admission) = denied.admission {
 						record_local_denial(admission.reason);
 						if retry_count > 0 {
-							info!(
-								"Local Reddit admission pause remained after bounded retries: lane={} source={} retries={} wait_milliseconds={} current_quota=[{}]",
-								lane.label(),
-								admission.source,
-								retry_count,
-								elapsed.as_millis(),
-								upstream_guard(lane).quota_budget(QuotaBudget::for_endpoint(endpoint)).snapshot(Instant::now()),
-							);
+							let current_quota = upstream_guard(lane).quota_budget(QuotaBudget::for_endpoint(endpoint)).snapshot(Instant::now());
+							if lane == RedditLane::Tor && admission.source == "quota_discovery" {
+								let direct = lane_routing_state_for_endpoint(RedditLane::Direct, Instant::now(), endpoint);
+								info!(
+									"Local Reddit admission pause remained after bounded retries: lane={} source={} retries={} wait_milliseconds={} current_quota=[{}] direct_availability={:?} direct_discovery_pending={} direct_standby_slots={}",
+									lane.label(), admission.source, retry_count, elapsed.as_millis(), current_quota,
+									direct.availability, direct.discovery_pending, DIRECT_STANDBY_CAPACITY.available_permits(),
+								);
+							} else {
+								info!(
+									"Local Reddit admission pause remained after bounded retries: lane={} source={} retries={} wait_milliseconds={} current_quota=[{}]",
+									lane.label(),
+									admission.source,
+									retry_count,
+									elapsed.as_millis(),
+									current_quota,
+								);
+							}
 						}
 					}
 					return Err(denied);
@@ -2418,6 +2472,7 @@ async fn acquire_attempt_capacity(
 	deadline: tokio::time::Instant,
 ) -> Result<(ApiCapacityPermit, Option<SemaphorePermit<'static>>), BeginAttemptDenied> {
 	let denied = || BeginAttemptDenied {
+		discovery_wait: None,
 		message: "Reddit API request timed out while waiting for transport capacity".to_string(),
 		edge_deferred: false,
 		quota_spillover: None,
@@ -4587,7 +4642,14 @@ async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, S
 	if configured_primary_lane() == RedditLane::Tor && lane == RedditLane::Direct {
 		return direct_then_tor_request(path, quarantine).await;
 	}
-	let (result, retry_reason) = json_uncached_on_lane(path.clone(), quarantine, lane).await;
+	let (result, retry_reason) = json_uncached_on_lane_with_discovery_standby(path.clone(), quarantine, lane, true).await;
+	if retry_reason == TorRetryReason::DiscoveryPending {
+		// Only this initial route consumes the engine's current-state snapshot.
+		// Direct admission still checks its own guards; failed standby returns to
+		// the default Tor engine, where discovery handoff is disabled.
+		info!("Trying bounded direct standby after Tor quota discovery wait: endpoint={}", endpoint_class(&path));
+		return direct_then_tor_request(path, quarantine).await;
+	}
 	if should_use_direct_standby(configured_primary_lane(), lane, retry_reason, lane_availability(RedditLane::Direct, Instant::now(), &path)) {
 		info!("Trying bounded direct standby: endpoint={} reason={retry_reason:?}", endpoint_class(&path));
 		return direct_then_tor_request(path, quarantine).await;
@@ -4646,7 +4708,7 @@ async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, S
 				}
 			}
 		}
-		TorRetryReason::None | TorRetryReason::SessionUnavailable => result,
+		TorRetryReason::None | TorRetryReason::SessionUnavailable | TorRetryReason::DiscoveryPending => result,
 	}
 }
 
@@ -4781,7 +4843,7 @@ fn should_retry_on_tor(
 		TorRetryReason::EdgeRejected => direct_edge_active,
 		TorRetryReason::TransportUnavailable => direct == LaneAvailability::TransportCooldown,
 		TorRetryReason::QuotaReserve(_) => !direct_refreshing && quota_spillover_valid,
-		TorRetryReason::None | TorRetryReason::SessionUnavailable => false,
+		TorRetryReason::None | TorRetryReason::SessionUnavailable | TorRetryReason::DiscoveryPending => false,
 	}
 }
 
@@ -4856,6 +4918,29 @@ async fn wait_for_confirmed_quota_install(changed: &Notify, deadline: tokio::tim
 }
 
 async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane) -> (Result<Value, String>, TorRetryReason) {
+	json_uncached_on_lane_with_discovery_standby(path, quarantine, lane, false).await
+}
+
+fn discovery_standby_ready(path: &str, ticket: QuotaDiscoveryTicket) -> bool {
+	if configured_primary_lane() != RedditLane::Tor || DIRECT_STANDBY_CAPACITY.available_permits() == 0 {
+		return false;
+	}
+	let now = Instant::now();
+	let Some(oauth) = oauth_client(RedditLane::Tor) else { return false };
+	let current = upstream_guard(RedditLane::Tor).quota_discovery_ticket(now, oauth.generation, api_endpoint_index(path));
+	if current != Some(ticket) {
+		return false;
+	}
+	let direct = lane_routing_state(RedditLane::Direct, now, path);
+	direct.availability == LaneAvailability::Ready && !direct.discovery_pending
+}
+
+async fn json_uncached_on_lane_with_discovery_standby(
+	path: String,
+	quarantine: bool,
+	lane: RedditLane,
+	allow_discovery_standby: bool,
+) -> (Result<Value, String>, TorRetryReason) {
 	let initial_timeout = initial_lane_request_timeout(lane, configured_primary_lane(), lane_availability(RedditLane::Direct, Instant::now(), &path));
 	let mut budget = RecoveryBudget::new(tokio::time::Instant::now(), CAPACITY_WAIT_BUDGET + TOR_QUOTA_REFRESH_RETRY_BUDGET + initial_timeout);
 	let mut transport_retries = 0;
@@ -4869,6 +4954,15 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 			Ok(result) => result,
 			Err(_) => return (Err("Reddit API request timed out after bounded server-side recovery".to_string()), TorRetryReason::None),
 		};
+		if allow_discovery_standby && lane == RedditLane::Tor {
+			if let LaneRecoveryReason::QuotaDiscoveryPending { ticket, .. } = recovery_reason {
+				// Recheck the exact denied probe before yielding an initial read.
+				// This is a snapshot, not an atomic reservation on the other lane.
+				if discovery_standby_ready(&path, ticket) {
+					return (result, TorRetryReason::DiscoveryPending);
+				}
+			}
+		}
 		// A request can open direct's failure cooldown after initial routing.
 		// Yield before sleeping so the caller can hand it to an already-ready Tor
 		// lane. The caller rechecks availability and never routes recursively.
@@ -4941,7 +5035,7 @@ async fn json_uncached_on_lane(path: String, quarantine: bool, lane: RedditLane)
 				}
 				continue;
 			}
-			LaneRecoveryReason::UpstreamCooldown(delay) | LaneRecoveryReason::QuotaCooldown(delay) => {
+			LaneRecoveryReason::UpstreamCooldown(delay) | LaneRecoveryReason::QuotaCooldown(delay) | LaneRecoveryReason::QuotaDiscoveryPending { delay, .. } => {
 				let elapsed = budget.begin(tokio::time::Instant::now());
 				let Some(delay) = upstream_cooldown_retry_delay(delay, cooldown_waits, elapsed) else {
 					return (result, tor_retry_reason);
@@ -6989,6 +7083,7 @@ mod tests {
 	#[test]
 	fn test_local_quota_retries_are_attempt_and_time_bounded() {
 		let retryable = BeginAttemptDenied {
+			discovery_wait: None,
 			admission: Some(AdmissionDenied {
 				delay: DEFAULT_RATE_LIMIT_COOLDOWN,
 				reason: CooldownReason::RateLimit,
@@ -7020,6 +7115,7 @@ mod tests {
 		assert_eq!(local_quota_retry_count_after_wait(2, true), 3);
 
 		let not_retryable = BeginAttemptDenied {
+			discovery_wait: None,
 			admission: Some(AdmissionDenied {
 				local_quota_retry: false,
 				..retryable.admission.unwrap()
@@ -7045,6 +7141,7 @@ mod tests {
 			quota_epoch: 4,
 		};
 		let mut denied = BeginAttemptDenied {
+			discovery_wait: None,
 			admission: Some(AdmissionDenied {
 				delay: Duration::from_secs(60),
 				reason: CooldownReason::RateLimit,
@@ -7108,6 +7205,7 @@ mod tests {
 			notify_after_refresh.notify_waiters();
 		});
 		let denied = BeginAttemptDenied {
+			discovery_wait: None,
 			admission: Some(AdmissionDenied {
 				delay: Duration::from_secs(60),
 				reason: CooldownReason::RateLimit,
@@ -7666,6 +7764,7 @@ mod tests {
 	#[test]
 	fn test_recovery_capacity_queue_timeout_is_not_an_upstream_cooldown() {
 		let mut denied = BeginAttemptDenied {
+			discovery_wait: None,
 			admission: Some(AdmissionDenied {
 				delay: TRANSPORT_RETRY_BASE_DELAY,
 				reason: CooldownReason::UpstreamFailures,
