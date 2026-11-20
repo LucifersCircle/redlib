@@ -131,7 +131,7 @@ impl Spec {
 		let mut spec = Self {
 			communities: vec![],
 			sort: "hot".into(),
-			range: get("t").unwrap_or("all").into(),
+			range: get("t").filter(|value| !value.is_empty()).unwrap_or("all").into(),
 			post: None,
 			post_slug: "_".into(),
 			post_community: None,
@@ -185,12 +185,23 @@ impl Spec {
 			if !matches!(sort, "hot" | "new" | "top" | "rising" | "controversial" | "best") {
 				return Err(WebError::Unsupported);
 			}
-			spec.communities = names.replace("%2B", "+").replace("%2b", "+").split('+').map(str::to_ascii_lowercase).collect();
+			spec.communities = names
+				.replace("%2B", "+")
+				.replace("%2b", "+")
+				.split('+')
+				.map(|name| {
+					if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("popular") {
+						name.to_ascii_lowercase()
+					} else {
+						name.to_string()
+					}
+				})
+				.collect();
 			if spec.communities.is_empty() || spec.communities.len() > 32 || !spec.communities.iter().all(|s| valid_name(s)) {
 				return Err(WebError::Unsupported);
 			}
-			spec.communities.sort();
-			spec.communities.dedup();
+			spec.communities.sort_by_key(|name| name.to_ascii_lowercase());
+			spec.communities.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 			spec.sort = sort.into();
 		}
 		if !matches!(spec.range.as_str(), "hour" | "day" | "week" | "month" | "year" | "all") {
@@ -198,7 +209,7 @@ impl Spec {
 		}
 		spec.scope = format!(
 			"{}|{}|{}|{}|{}|{}|{}|{}",
-			spec.communities.join("+"),
+			spec.communities.iter().map(|name| name.to_ascii_lowercase()).collect::<Vec<_>>().join("+"),
 			spec.post.as_deref().unwrap_or(""),
 			spec.focus.as_deref().unwrap_or(""),
 			spec.sort,
@@ -380,6 +391,25 @@ impl Spec {
 		answer.set_query(current.query());
 		Ok(format!("{}{}", answer.path(), answer.query().map_or(String::new(), |q| format!("?{q}"))))
 	}
+	fn canonical_case_page(&self, page: &str, target: &str, community: Option<&str>) -> Result<Option<String>, WebError> {
+		let checked = self.validate_page(target, community).map_err(|_| WebError::Temporary("canonical_scope"))?;
+		let base = url::Url::parse(self.origin()).unwrap();
+		let current = base.join(page).map_err(|_| WebError::Temporary("canonical_scope"))?;
+		let mut next = base.join(&checked).map_err(|_| WebError::Temporary("canonical_scope"))?;
+		if !current.path().eq_ignore_ascii_case(next.path())
+			|| next.query_pairs().any(|(key, value)| {
+				!current
+					.query_pairs()
+					.any(|(k, v)| key == k && (value == v || (matches!(key.as_ref(), "sort" | "t") && value.eq_ignore_ascii_case(&v))))
+			}) {
+			return Err(WebError::Temporary("canonical_scope"));
+		}
+		if current.path() == next.path() {
+			return Ok(None);
+		}
+		next.set_query(current.query());
+		Ok(Some(format!("{}{}", next.path(), next.query().map_or(String::new(), |q| format!("?{q}")))))
+	}
 }
 
 #[derive(Default)]
@@ -539,8 +569,9 @@ impl Context {
 		let _permit = CAPACITY.acquire().await.map_err(|_| WebError::Temporary("capacity"))?;
 		let mut script_fields = None;
 		let mut answered_script = false;
+		let mut followed_canonical = false;
 		let mut redirects = 0;
-		for _ in 0..4 {
+		for _ in 0..5 {
 			if let Some(error) = self.budget.terminal.lock().unwrap().clone() {
 				return Err(error);
 			}
@@ -559,7 +590,8 @@ impl Context {
 			if form.is_some() && !page.starts_with("/svc/shreddit/more-comments/") {
 				return Err(WebError::Cursor);
 			}
-			if self.budget.wires.fetch_add(1, Ordering::SeqCst) >= MAX_WIRES {
+			let wire = self.budget.wires.fetch_add(1, Ordering::SeqCst);
+			if wire >= MAX_WIRES {
 				return Err(WebError::Temporary("wire_bound"));
 			}
 			#[cfg(not(test))]
@@ -651,7 +683,7 @@ impl Context {
 			if let Some(dir) = env::var_os("REDLIB_LIVE_CAPTURE_DIR") {
 				let dir = std::path::PathBuf::from(dir);
 				let _ = std::fs::create_dir_all(&dir);
-				let at = self.budget.wires.load(Ordering::SeqCst);
+				let at = wire + 1;
 				let _ = std::fs::write(dir.join(format!("response-{at}.html")), &text);
 				let _ = std::fs::write(
 					dir.join(format!("response-{at}.shape")),
@@ -668,6 +700,19 @@ impl Context {
 					answered_script = true;
 					info!("Completing anonymous Reddit script check: lane={} frontend={}", self.lane.label(), spec.origin());
 					continue;
+				}
+			}
+			if form.is_none() && (200..300).contains(&status) {
+				if let Some(target) = html::canonical_shell_target(&text, &spec.communities).map_err(|error| self.note(error))? {
+					if let Some(next) = spec.canonical_case_page(&page, &target, community)? {
+						if followed_canonical {
+							return Err(WebError::Temporary("canonical_loop"));
+						}
+						followed_canonical = true;
+						page = next;
+						info!("Following canonical Reddit web casing: lane={} frontend={}", self.lane.label(), spec.origin());
+						continue;
+					}
 				}
 			}
 			if status == 403 {
@@ -988,7 +1033,7 @@ async fn read(path: &str, quarantine: bool) -> Result<Value, WebError> {
 		.unwrap_or_else(|| active_transport(primary, quarantine))?;
 	let mut ctx = context(primary, session, Arc::new(Budget::new()));
 	let first = tokio::time::timeout(
-		Duration::from_secs(if primary == RedditLane::Tor { 8 } else { 30 }),
+		Duration::from_secs(if primary == RedditLane::Tor && spec.communities.len() <= 1 { 8 } else { 30 }),
 		read_on_lane(ctx.clone(), spec.clone()),
 	)
 	.await
