@@ -32,6 +32,7 @@ static POSTS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-post, #si
 static COMMENTS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-comment[thingid], .comment[data-fullname^='t1_']"));
 static BODY: LazyLock<Selector> = LazyLock::new(|| selector("[slot='text-body'], .usertext-body .md"));
 static COMMENT_BODY: LazyLock<Selector> = LazyLock::new(|| selector("[slot='comment'], .usertext-body .md"));
+static REMOVED_COMMENT: LazyLock<Selector> = LazyLock::new(|| selector("div.md > div.scalable-text > p.text-neutral-content-weak"));
 static TITLE: LazyLock<Selector> = LazyLock::new(|| selector("a.title, [slot='title']"));
 static IMAGES: LazyLock<Selector> = LazyLock::new(|| selector("img[src]"));
 static PLAYERS: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-player, video"));
@@ -297,6 +298,20 @@ fn image_url(value: &str) -> Option<String> {
 		.any(|prefix| rewritten.starts_with(prefix))
 		.then_some(value)
 }
+fn video_source(value: &str, hls: bool) -> Option<String> {
+	let value = safe_link(value)?;
+	let url = url::Url::parse(&value).ok()?;
+	if url.scheme() != "https" || url.port().is_some() || !matches!(url.host_str(), Some("v.redd.it" | "packaged-media.redd.it")) {
+		return None;
+	}
+	let proxy = crate::utils::format_url(&value);
+	(if hls {
+		url.path().ends_with(".m3u8") && proxy.starts_with("/hls/")
+	} else {
+		url.path().ends_with(".mp4") && ["/vid/", "/packaged-video/"].iter().any(|prefix| proxy.starts_with(prefix))
+	})
+	.then_some(value)
+}
 fn timestamp(value: Option<&str>) -> f64 {
 	value
 		.and_then(|value| {
@@ -323,8 +338,8 @@ fn text(element: ElementRef<'_>) -> String {
 
 // Rebuild a deliberately small HTML vocabulary. No raw upstream HTML or
 // attribute is ever copied into a template's |safe body.
-fn safe_body(element: ElementRef<'_>) -> String {
-	fn children(element: ElementRef<'_>, depth: usize, budget: &mut usize, out: &mut String) {
+fn safe_body(element: ElementRef<'_>, post: Option<&str>) -> String {
+	fn children(element: ElementRef<'_>, depth: usize, budget: &mut usize, out: &mut String, post: Option<&str>) {
 		if depth > 64 || *budget == 0 {
 			return;
 		}
@@ -358,11 +373,15 @@ fn safe_body(element: ElementRef<'_>) -> String {
 			}
 			if name == "a" {
 				if let Some(href) = attr(child, &["href"]).and_then(safe_link) {
+					if child.value().attr("slot") == Some("text-body") && post.is_some_and(|id| permalink(&href, id).is_some()) {
+						children(child, depth + 1, budget, out, post);
+						continue;
+					}
 					out.push_str(&format!("<a href=\"{}\" rel=\"nofollow\">", htmlescape::encode_attribute(&href)));
-					children(child, depth + 1, budget, out);
+					children(child, depth + 1, budget, out, post);
 					out.push_str("</a>");
 				} else {
-					children(child, depth + 1, budget, out)
+					children(child, depth + 1, budget, out, post)
 				}
 				continue;
 			}
@@ -410,7 +429,7 @@ fn safe_body(element: ElementRef<'_>) -> String {
 					out.push('>')
 				}
 			}
-			children(child, depth + 1, budget, out);
+			children(child, depth + 1, budget, out, post);
 			if allowed && !matches!(name, "br" | "hr") {
 				out.push_str("</");
 				out.push_str(name);
@@ -419,7 +438,7 @@ fn safe_body(element: ElementRef<'_>) -> String {
 		}
 	}
 	let mut out = String::new();
-	children(element, 0, &mut 20_000, &mut out);
+	children(element, 0, &mut 20_000, &mut out, post);
 	format!("<div class=\"md\">{out}</div>")
 }
 
@@ -500,7 +519,7 @@ fn parse_post(element: ElementRef<'_>, communities: &[String], quarantine: bool)
 		"id":id,"name":format!("t3_{id}"),"title":title,"permalink":permalink,"subreddit":sub,
 		"author":attr(element,&["author","data-author"]).unwrap_or("[deleted]"),"score":number(element,&["score","data-score"]),
 		"num_comments":comment_count,"created_utc":timestamp(attr(element,&["created-timestamp","data-timestamp"])),
-		"selftext":body.map(text).unwrap_or_default(),"selftext_html":body.map(safe_body).unwrap_or_default(),
+		"selftext":body.map(text).unwrap_or_default(),"selftext_html":body.map(|body|safe_body(body,Some(id))).unwrap_or_default(),
 		"url":external,"url_overridden_by_dest":external,"is_self":self_post,
 		"domain":if self_post {format!("self.{sub}")} else {url::Url::parse(&external).ok().and_then(|url|url.host_str().map(str::to_string)).unwrap_or_default()},
 		"over_18":flag(element,&["nsfw","is-nsfw","over18","over-18"])||class(element,"over18"),
@@ -521,17 +540,43 @@ fn parse_post(element: ElementRef<'_>, communities: &[String], quarantine: bool)
 	if image_url(&external).is_some() && !self_post {
 		data["post_hint"] = json!("image")
 	}
-	// Preserve playable Reddit video only when the page actually supplied both
-	// validated sources. Otherwise its normal outbound link remains available.
-	if let Some(player) = element.select(&PLAYERS).find(|player| owned_by(*player, element, post_element)) {
-		let mp4 = attr(player, &["src", "src-mp4", "packaged-media-json"]).and_then(safe_link);
-		let hls = attr(player, &["hls-src", "hls-url"]).and_then(safe_link);
-		if let Some((mp4, hls)) = mp4.zip(hls).filter(|(mp4, hls)| {
-			["/vid/", "/packaged-video/"].iter().any(|prefix| crate::utils::format_url(mp4).starts_with(prefix)) && crate::utils::format_url(hls).starts_with("/hls/")
-		}) {
+	if let Some(player) = element.select(&PLAYERS).find(|player| owned_by(*player, element, post_element) && !inside_content(*player)) {
+		let packaged = attr(player, &["packaged-media-json"])
+			.filter(|raw| raw.len() <= 256 * 1024)
+			.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+		let packaged = packaged
+			.as_ref()
+			.and_then(|value| value.pointer("/playbackMp4s/permutations"))
+			.and_then(Value::as_array)
+			.into_iter()
+			.flatten()
+			.take(32)
+			.filter_map(|value| {
+				let source = value.get("source")?;
+				if source["videoCodec"].as_str().is_some_and(|codec| !codec.eq_ignore_ascii_case("H264")) {
+					return None;
+				}
+				let url = source["url"].as_str().and_then(|url| video_source(url, false))?;
+				let width = source["dimensions"]["width"].as_u64().unwrap_or(0).min(8192);
+				let height = source["dimensions"]["height"].as_u64().unwrap_or(0).min(8192);
+				Some((url, width, height))
+			})
+			.min_by_key(|(_, _, height)| if *height <= 720 { 720 - *height } else { 10000 + *height - 720 });
+		let mp4 = packaged.as_ref().map(|(url, _, _)| url.clone()).or_else(|| {
+			["src-mp4", "src", "preview"]
+				.iter()
+				.find_map(|name| attr(player, &[name]).and_then(|url| video_source(url, false)))
+		});
+		let hls = ["hls-src", "hls-url", "src"]
+			.iter()
+			.find_map(|name| attr(player, &[name]).and_then(|url| video_source(url, true)));
+		if let Some(primary) = mp4.or_else(|| hls.clone()) {
+			let (width, height) = packaged
+				.as_ref()
+				.map(|(_, w, h)| (*w as i64, *h as i64))
+				.unwrap_or_else(|| (number(player, &["width"]).max(0), number(player, &["height"]).max(0)));
 			data["is_video"] = json!(true);
-			data["secure_media"] =
-				json!({"reddit_video":{"fallback_url":mp4,"hls_url":hls,"width":number(player,&["width"]).max(0),"height":number(player,&["height"]).max(0),"is_gif":false}});
+			data["secure_media"] = json!({"reddit_video":{"fallback_url":primary,"hls_url":hls.unwrap_or_default(),"width":width,"height":height,"is_gif":false}});
 		}
 	}
 	Ok(Some(json!({"kind":"t3","data":data})))
@@ -596,11 +641,18 @@ fn parse_comments(document: &Html, post_id: &str) -> Result<Vec<Value>, WebError
 			.select(&COMMENT_BODY)
 			.find(|body| owned_by(*body, element, comment_element) && body.value().id().is_none_or(|body_id| body_id == format!("{id}-comment-rtjson-content")));
 		let deleted = flag(element, &["deleted", "is-deleted"]) || attr(element, &["author", "data-author"]) == Some("[deleted]");
-		if body.is_none() && !deleted {
+		// Reddit renders its removal notice outside the usual comment slot.
+		// Recognize only the native placeholder of this comment, never text
+		// inside a user body, child reply or sidebar.
+		let removed = flag(element, &["removed", "is-removed"])
+			|| (body.is_none()
+				&& element
+					.select(&REMOVED_COMMENT)
+					.any(|notice| !auxiliary(notice) && owned_by(notice, element, comment_element) && text(notice) == "Comment removed by Reddit"));
+		if body.is_none() && !deleted && !removed {
 			return Err(WebError::Temporary("missing_comment_body"));
 		}
 		let author = attr(element, &["author", "data-author"]).unwrap_or("[deleted]");
-		let removed = flag(element, &["removed", "is-removed"]);
 		let plain = if removed {
 			"[removed]".to_string()
 		} else {
@@ -609,7 +661,7 @@ fn parse_comments(document: &Html, post_id: &str) -> Result<Vec<Value>, WebError
 		let html = if removed {
 			"<div class=\"md\"><p>[removed]</p></div>".to_string()
 		} else {
-			body.map(safe_body).unwrap_or_else(|| "<div class=\"md\"><p>[deleted]</p></div>".into())
+			body.map(|body| safe_body(body, None)).unwrap_or_else(|| "<div class=\"md\"><p>[deleted]</p></div>".into())
 		};
 		let data = json!({"id":&id[3..],"name":id,"parent_id":parent,"link_id":post,"author":author,"body":plain,"body_html":html,
 			"score":number(element,&["score","data-score"]),"created_utc":timestamp(attr(element,&["created","created-timestamp","data-timestamp"])),
@@ -1048,6 +1100,32 @@ mod tests {
 	}
 
 	#[test]
+	fn test_reddit_web_html_native_removed_comment_preserves_thread_and_replies() {
+		let notice = r#"<div class="md text-14-scalable"><div class="scalable-text"><p class="text-neutral-content-weak">Comment removed by Reddit</p></div></div>"#;
+		let removed = format!(
+			r#"<shreddit-comment thingid="t1_removed" author="alice">{notice}<shreddit-comment thingid="t1_reply" author="bob"><div slot="comment"><p>A reply</p></div></shreddit-comment></shreddit-comment>"#
+		);
+		let doc = parse(&format!("{POST}{removed}"), Some("abc"), &names(), false).unwrap();
+		assert_eq!(doc.comments[0]["data"]["body"], "[removed]");
+		assert_eq!(doc.comments[0]["data"]["replies"]["data"]["children"][0]["data"]["body"], "A reply");
+		let ordinary = removed.replace(notice, "<div slot=\"comment\"><p>Comment removed by Reddit</p></div>");
+		assert_eq!(
+			parse(&format!("{POST}{ordinary}"), Some("abc"), &names(), false).unwrap().comments[0]["data"]["body"],
+			"Comment removed by Reddit"
+		);
+		for bad in [
+			removed.replace(notice, ""),
+			removed.replace(notice, "<p>Comment removed by Reddit</p>"),
+			removed.replace(notice, &format!("<aside>{notice}</aside>")),
+		] {
+			assert!(
+				parse(&format!("{POST}{bad}"), Some("abc"), &names(), false).is_err(),
+				"missing bodies must not turn into fabricated removals"
+			);
+		}
+	}
+
+	#[test]
 	fn test_reddit_web_html_canonical_shell_target_requires_empty_app_and_primary_metadata() {
 		let canonical = r#"<div id="canonical-url-updater" value="https://www.reddit.com/r/Rust/hot/"></div>"#;
 		let shell = format!("<shreddit-app>{canonical}</shreddit-app>");
@@ -1064,6 +1142,47 @@ mod tests {
 			canonical_shell_target(&format!("{shell}<shreddit-content-gate reason=\"private\"></shreddit-content-gate>"), &names()).err(),
 			Some(WebError::Resource("private"))
 		);
+	}
+
+	#[test]
+	fn test_reddit_web_html_modern_video_sources_and_preview_wrapper_text() {
+		let player = r#"<shreddit-player src="https://v.redd.it/clip/HLSPlaylist.m3u8?a=fixture" preview="https://v.redd.it/clip/CMAF_96.mp4" packaged-media-json='{"playbackMp4s":{"permutations":[{"source":{"url":"https://packaged-media.redd.it/clip/pb/720.mp4","videoCodec":"H264","dimensions":{"width":1280,"height":720}}}]}}'></shreddit-player>"#;
+		let video = POST.replace("</shreddit-post>", &format!("{player}</shreddit-post>"));
+		let data = &parse(&format!("<shreddit-feed>{video}</shreddit-feed>"), None, &names(), false).unwrap().posts[0]["data"];
+		assert_eq!(data["is_video"], true);
+		assert_eq!(data["secure_media"]["reddit_video"]["fallback_url"], "https://packaged-media.redd.it/clip/pb/720.mp4");
+		assert_eq!(data["secure_media"]["reddit_video"]["hls_url"], "https://v.redd.it/clip/HLSPlaylist.m3u8?a=fixture");
+		for player in [
+			player.replace("H264", "HEVC"),
+			player.replace("https://packaged-media.redd.it", "https://evil.test"),
+			player.replace("playbackMp4s", "unsupported"),
+		] {
+			let video = POST.replace("</shreddit-post>", &format!("{player}</shreddit-post>"));
+			let data = &parse(&format!("<shreddit-feed>{video}</shreddit-feed>"), None, &names(), false).unwrap().posts[0]["data"];
+			assert_eq!(
+				data["secure_media"]["reddit_video"]["fallback_url"], "https://v.redd.it/clip/CMAF_96.mp4",
+				"unsupported packaged media must fall back to the supplied MP4"
+			);
+		}
+		let wrapped = POST
+			.replace(
+				"<div slot=\"text-body\">",
+				"<shreddit-post-text-body slot=\"text-body\"><a slot=\"text-body\" href=\"/r/rust/comments/abc/title/\"><div>",
+			)
+			.replace("</div></shreddit-post>", "</div></a></shreddit-post-text-body></shreddit-post>");
+		let data = &parse(&format!("<shreddit-feed>{wrapped}</shreddit-feed>"), None, &names(), false).unwrap().posts[0]["data"];
+		let body = data["selftext_html"].as_str().unwrap();
+		assert!(!body.contains("<a "), "the preview navigation wrapper must not color all post text as a link");
+		assert!(body.contains("<strong>body</strong>"));
+		// Detail pages contain genuine user links without the feed's navigation wrapper.
+		let linked = POST.replace(
+			"Own <strong>body</strong>.",
+			"Own <strong>body</strong>. <a href=\"https://example.com/user-link\">A real link</a>",
+		);
+		let data = &parse(&format!("<shreddit-feed>{linked}</shreddit-feed>"), None, &names(), false).unwrap().posts[0]["data"];
+		assert!(htmlescape::decode_html(data["selftext_html"].as_str().unwrap())
+			.unwrap()
+			.contains("https://example.com/user-link"));
 	}
 
 	#[test]
@@ -1146,7 +1265,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_reddit_web_html_video_sources_require_both_known_proxy_destinations() {
+	fn test_reddit_web_html_video_sources_require_known_proxy_destinations() {
 		let video = POST.replace("</shreddit-post>", "<shreddit-player src=\"https://v.redd.it/clip/DASH_720.mp4\" hls-src=\"https://v.redd.it/clip/HLSPlaylist.m3u8\" width=\"720\" height=\"480\"></shreddit-player></shreddit-post>");
 		let doc = parse(&format!("<shreddit-feed>{video}</shreddit-feed>"), None, &names(), false).unwrap();
 		assert_eq!(doc.posts[0]["data"]["is_video"], true);
@@ -1154,10 +1273,32 @@ mod tests {
 			.as_str()
 			.unwrap()
 			.contains("DASH_720.mp4"));
-		let unsupported = video.replace("https://v.redd.it/clip/DASH_720.mp4", "https://evil.test/video.mp4");
+		let unsupported = video
+			.replace("https://v.redd.it/clip/DASH_720.mp4", "https://evil.test/video.mp4")
+			.replace("https://v.redd.it/clip/HLSPlaylist.m3u8", "https://evil.test/playlist.m3u8");
 		let doc = parse(&format!("<shreddit-feed>{unsupported}</shreddit-feed>"), None, &names(), false).unwrap();
 		assert_eq!(doc.posts[0]["data"]["is_video"], false);
 		assert!(doc.posts[0]["data"]["secure_media"].is_null());
+		for player in [
+			r#"<shreddit-player src="https://v.redd.it/clip/HLSPlaylist.m3u8" preview="https://v.redd.it/clip/CMAF_96.mp4"></shreddit-player>"#,
+			r#"<shreddit-player src="https://v.redd.it/clip/HLSPlaylist.m3u8"></shreddit-player>"#,
+			r#"<shreddit-player src="https://v.redd.it/clip/DASH_720.mp4"></shreddit-player>"#,
+		] {
+			let html = POST.replace("</shreddit-post>", &format!("{player}</shreddit-post>"));
+			assert_eq!(
+				parse(&format!("<shreddit-feed>{html}</shreddit-feed>"), None, &names(), false).unwrap().posts[0]["data"]["is_video"],
+				true
+			);
+		}
+		for url in [
+			"http://v.redd.it/clip/DASH_720.mp4",
+			"https://evil.test/clip/DASH_720.mp4",
+			"https://v.redd.it:444/clip/DASH_720.mp4",
+			"https://v.redd.it/clip/not-video.txt",
+			"https://alice@v.redd.it/clip/DASH_720.mp4",
+		] {
+			assert!(video_source(url, false).is_none());
+		}
 	}
 	#[test]
 	fn test_reddit_web_html_metadata_mode_preserves_scope_without_requiring_initial_comments() {

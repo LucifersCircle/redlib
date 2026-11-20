@@ -270,8 +270,22 @@ fn test_quota_discovery_first_operation_zero_headers_block_before_invalid_body()
 					reddit_pages(path, false, oauth, &mut attempt, false, PageRequest::from_path(path, false).unwrap(), origin).await
 				}
 			});
-			assert!(tokio::time::timeout(Duration::from_millis(20), &mut read).await.is_err());
-			tokio::time::timeout(Duration::from_secs(2), received.notified()).await.unwrap();
+			// Keep polling the reader until it observes the response headers.
+			// The server accepting a request alone does not mean the client has
+			// reconciled those headers, especially on a busy runner.
+			tokio::time::timeout(Duration::from_secs(2), async {
+				tokio::select! {
+					_ = &mut read => panic!("read ended before the held body was released"),
+					_ = async {
+						received.notified().await;
+						while !matches!(upstream_guard(lane).graphql_quota.window, QuotaWindow::Known { available: 0, .. }) {
+							tokio::task::yield_now().await;
+						}
+					} => {}
+				}
+			})
+			.await
+			.unwrap();
 			assert!(matches!(upstream_guard(lane).graphql_quota.window, QuotaWindow::Known { available: 0, .. }));
 			assert!(upstream_guard(lane).try_admit_endpoint(Instant::now(), 0, api_endpoint_index(path)).is_err());
 			release.notify_one();

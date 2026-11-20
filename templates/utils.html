@@ -166,12 +166,12 @@
 		</a>
 	</div>
 	{% else if post.post_type == "video" || post.post_type == "gif" %}
-	{% if prefs.use_hls == "on" && !post.media.alt_url.is_empty() %}
+	{% if (prefs.use_hls == "on" || post.media.url.starts_with("/hls/")) && !post.media.alt_url.is_empty() %}
 	<script src="/hls.min.js"></script>
 	<div class="post_media_content">
 		<video class="post_media_video short {% if prefs.autoplay_videos == "on" %}hls_autoplay{% endif %}" {% if post.media.width > 0 && post.media.height > 0 %}width="{{ post.media.width }}" height="{{ post.media.height }}"{% endif %} poster="{{ post.media.poster }}" preload="none" controls>
 			<source src="{{ post.media.alt_url }}" type="application/vnd.apple.mpegurl" />
-			<source src="{{ post.media.url }}" type="video/mp4" />
+			{% if !post.media.url.starts_with("/hls/") %}<source src="{{ post.media.url }}" type="video/mp4" />{% endif %}
 		</video>
 	</div>
 	<script src="/playHLSVideo.js"></script>
@@ -335,11 +335,11 @@
 		</a>
 	</div>
 	{% else if (prefs.layout.is_empty() || prefs.layout == "card") && (post.post_type == "gif" || post.post_type == "video") %}
-	{% if prefs.use_hls == "on" && !post.media.alt_url.is_empty() %}
+	{% if (prefs.use_hls == "on" || post.media.url.starts_with("/hls/")) && !post.media.alt_url.is_empty() %}
 	<div class="post_media_content">
         <video class="post_media_video short{% if prefs.autoplay_videos == "on" %} hls_autoplay{% endif %}" {% if post.media.width > 0 && post.media.height > 0 %}width="{{ post.media.width }}" height="{{ post.media.height }}"{% endif %} poster="{{ post.media.poster }}" controls preload="none">
 			<source src="{{ post.media.alt_url }}" type="application/vnd.apple.mpegurl" />
-			<source src="{{ post.media.url }}" type="video/mp4" />
+			{% if !post.media.url.starts_with("/hls/") %}<source src="{{ post.media.url }}" type="video/mp4" />{% endif %}
 		</video>
 	</div>
 	{% else %}
