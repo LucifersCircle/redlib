@@ -3907,11 +3907,12 @@ fn comments_logical_path(path: &str) -> String {
 /// metadata responses are kept longer than dynamic listings, and either cache
 /// can serve its most recent success if a refresh fails.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
-	let path = normalize_reddit_api_path(&path);
-	record_logical_json(&path);
+	let normalized = normalize_reddit_api_path(&path);
+	record_logical_json(&normalized);
 	if web::enabled() {
 		return web::json(path, quarantine).await;
 	}
+	let path = normalized;
 	if web::contains_cursor(&path) {
 		return Err("Page navigation expired. Open the first page again.".into());
 	}

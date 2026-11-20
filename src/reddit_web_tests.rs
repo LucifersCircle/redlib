@@ -3,6 +3,95 @@ use hyper::service::{make_service_fn, service_fn};
 use sealed_test::prelude::*;
 use std::convert::Infallible;
 
+#[tokio::test]
+#[ignore = "Manual signed-out public HTTPS verification; honors the environment proxy and CA trust"]
+async fn live_anonymous_web_reader_capture() {
+	let _ = pretty_env_logger::try_init();
+	std::fs::create_dir_all("/tmp/redlib-live-capture").unwrap();
+	let feed = env::var("REDLIB_LIVE_FEED").unwrap_or_else(|_| "rust".into());
+	assert!(matches!(feed.as_str(), "rust" | "all" | "popular"));
+	let mut builder = WreqClient::builder()
+		.emulation(Emulation::builder().profile(Profile::Chrome145).platform(Platform::Windows).headers(true).build())
+		.redirect(Policy::none())
+		.cookie_provider(Arc::new(Jar::default()))
+		.tls_cert_store(wreq::tls::trust::CertStore::builder().set_default_paths().build().unwrap());
+	if let Ok(proxy) = env::var("HTTPS_PROXY").or_else(|_| env::var("https_proxy")) {
+		builder = builder.proxy(Proxy::all(proxy).unwrap());
+	}
+	let transport = Arc::new(Transport {
+		client: Arc::new(builder.build().unwrap()),
+		health: Mutex::new(Health::default()),
+	});
+	let ctx = Context {
+		lane: RedditLane::Direct,
+		quarantine: false,
+		budget: Arc::new(Budget::new()),
+		session: transport,
+		origin: None,
+	};
+	let spec = Spec::parse(&format!("/r/{feed}/hot.json?limit=1"), false).unwrap();
+	let response = tokio::time::timeout(Duration::from_secs(40), ctx.fetch(&spec, &spec.initial(Some(&feed)), Some(&feed), None))
+		.await
+		.unwrap();
+	if feed == "all" && matches!(response, Err(WebError::Resource("login_required"))) {
+		println!("Real All result: login required; no anonymous feed was loaded");
+		return;
+	}
+	let text = response.unwrap();
+	std::fs::write("/tmp/redlib-live-capture/wreq-page.html", &text).unwrap();
+	let names = if matches!(feed.as_str(), "all" | "popular") { vec![] } else { vec![feed.clone()] };
+	let doc = html::parse(&text, None, &names, false).unwrap();
+	println!("Real HTML: posts={} comments={} fragments={}", doc.posts.len(), doc.comments.len(), doc.fragments.len());
+	for path in doc.fragments.iter().chain(doc.next.iter()) {
+		let url = url::Url::parse(spec.origin()).unwrap().join(path).unwrap();
+		println!(
+			"Fragment: path={} query_keys={:?} accepted={}",
+			url.path(),
+			url.query_pairs().map(|(k, _)| k.into_owned()).collect::<Vec<_>>(),
+			spec.validate_page(path, Some(&feed)).is_ok()
+		);
+		spec
+			.validate_page(path, Some(&feed))
+			.expect("every continuation from the real page must survive validation");
+	}
+	assert!(!doc.posts.is_empty(), "a shell is not a successful real feed load");
+	let first = read_on_lane(ctx.clone(), spec).await.expect("the full real feed pipeline must succeed");
+	assert!(!first["data"]["children"].as_array().unwrap().is_empty());
+	println!("Real feed pipeline: {} posts", first["data"]["children"].as_array().unwrap().len());
+	if let Some(after) = first["data"]["after"].as_str() {
+		let next = Spec::parse(&format!("/r/{feed}/hot.json?limit=1&after={after}"), false).unwrap();
+		let next = read_on_lane(ctx.clone(), next).await.expect("the real Next pipeline must succeed");
+		assert!(!next["data"]["children"].as_array().unwrap().is_empty());
+		println!("Real Next pipeline: {} posts", next["data"]["children"].as_array().unwrap().len());
+	}
+	let permalink = first["data"]["children"][0]["data"]["permalink"].as_str().unwrap();
+	let post = Spec::parse(&format!("{}.json", permalink.trim_end_matches('/')), false).unwrap();
+	let post = read_on_lane(ctx.clone(), post).await.expect("the real post/comment pipeline must succeed");
+	assert!(!post[0]["data"]["children"].as_array().unwrap().is_empty());
+	println!("Real thread pipeline: {} root comments", post[1]["data"]["children"].as_array().unwrap().len());
+	// Exercise the real HTTP router, JSON conversion and Askama rendering too.
+	*MOCK.lock().unwrap() = Some((ctx.session.clone(), String::new()));
+	let mut app = crate::server::Server::new();
+	app.at("/r/:sub/:sort").get(|r| Box::pin(crate::subreddit::community(r)));
+	app.at("/r/:sub/comments/:id/:title").get(|r| Box::pin(crate::post::item(r)));
+	let server = tokio::spawn(app.listen("127.0.0.1:18081"));
+	let http = hyper::Client::new();
+	for path in [format!("/r/{feed}/hot?limit=1"), permalink.to_string()] {
+		let url = format!("http://127.0.0.1:18081{path}").parse().unwrap();
+		let response = http.get(url).await.unwrap();
+		let status = response.status();
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		std::fs::write("/tmp/redlib-live-capture/rendered-response.html", &body).unwrap();
+		assert_eq!(status, hyper::StatusCode::OK, "rendered HTTP route {path}");
+		assert!(body.len() > 1000);
+		let page = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+		let titles = scraper::Selector::parse(".post_title").unwrap();
+		assert!(page.select(&titles).next().is_some(), "HTTP 200 must contain rendered post content");
+		println!("Real rendered HTTP route: status=200 bytes={}", body.len());
+	}
+	server.abort();
+}
+
 struct Fixture {
 	origin: String,
 	transport: Arc<Transport>,
@@ -74,8 +163,10 @@ impl Fixture {
 							.lock()
 							.unwrap()
 							.push((path.clone(), method.clone(), headers, String::from_utf8(body.to_vec()).unwrap()));
-						let status = if mode.load(Ordering::SeqCst) == 1 || (challenge_mode == 10 && answered) {
+						let status = if mode.load(Ordering::SeqCst) == 1 || (challenge_mode == 10 && answered) || (challenge_mode == 17 && wires.lock().unwrap().len() == 1) {
 							429
+						} else if challenge_mode == 18 {
+							302
 						} else if challenge_mode == 13 && !answered {
 							403
 						} else if mode.load(Ordering::SeqCst) == 6 && !rdt {
@@ -111,6 +202,10 @@ impl Fixture {
 							"x".repeat(MAX_HTML + 1)
 						} else if path.starts_with("/svc/shreddit/more-comments/") {
 							comment("second")
+						} else if challenge_mode == 16 && path.starts_with("/svc/shreddit/community-more-posts/") {
+							post("rust", "x0c", 2, false, false)
+						} else if challenge_mode == 15 && path.starts_with("/svc/shreddit/comments/") {
+							comment("fragment")
 						} else if path.contains("/comments/") {
 							let p = post("rust", "abc", 20, false, false).replace("comment-count=\"0\"", "comment-count=\"3\"");
 							let repeated = wires
@@ -120,7 +215,9 @@ impl Fixture {
 								.filter(|(path, method, _, _)| method == "GET" && path.starts_with("/r/rust/comments/"))
 								.count()
 								> if matches!(challenge_mode, 8 | 13) { 2 } else { 1 };
-							if repeated {
+							if challenge_mode == 15 {
+								format!(r#"<main>{p}<faceplate-partial src="/svc/shreddit/comments/r/rust/t3_abc?sort=BEST"></faceplate-partial></main>"#)
+							} else if repeated {
 								format!("<main>{p}</main>")
 							} else {
 								format!(
@@ -145,7 +242,12 @@ impl Fixture {
 									post(name, &format!("x{number}b"), number, false, false)
 								)
 							};
-							format!("<main><shreddit-feed>{cards}</shreddit-feed></main>")
+							let next = if challenge_mode == 16 {
+								r#"<faceplate-partial src="/svc/shreddit/community-more-posts/hot/?t=ALL&amp;limit=1&amp;after=t3_x0b&amp;name=rust&amp;adDistance=1&amp;ad_posts_served=1&amp;navigationSessionId=12345678-1234-4234-8234-123456789abc&amp;feedLength=4"></faceplate-partial>"#
+							} else {
+								""
+							};
+							format!("<main><shreddit-feed>{cards}{next}</shreddit-feed></main>")
 						};
 						let response = HyperResponse::builder()
 							.status(status)
@@ -155,6 +257,8 @@ impl Fixture {
 							response.header("retry-after", "60")
 						} else if challenge_mode == 14 {
 							response.header("x-ratelimit-remaining", "0").header("x-ratelimit-reset", "60")
+						} else if challenge_mode == 18 {
+							response.header("location", "https://old.reddit.com/login/?reason=lor2&dest=%2Fr%2Fall%2Fhot%2F")
 						} else if status == 302 {
 							response.header("location", "/r/rust/hot/?rdt=12345")
 						} else {
@@ -191,7 +295,7 @@ impl Fixture {
 			lane: RedditLane::Direct,
 			quarantine: false,
 			budget: Arc::new(Budget::new()),
-			fixture: Some(self.transport.clone()),
+			session: self.transport.clone(),
 			origin: Some(self.origin.clone()),
 		}
 	}
@@ -484,6 +588,245 @@ fn test_reddit_web_script_check_rejects_other_forms_scripts_and_destinations() {
 }
 
 #[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_all_login_redirect_is_terminal_without_retry_or_identity_rotation() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(18, Ordering::SeqCst);
+		let spec = Spec::parse("/r/all/hot.json", false).unwrap();
+		let error = document(&fixture.context(), &spec, &spec.initial(Some("all")), Some("all"), true).await.unwrap_err();
+		assert_eq!(error, WebError::Resource("login_required"));
+		assert!(!error.retry_lane());
+		assert_eq!(fixture.wires.lock().unwrap().len(), 1);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_public_json_preserves_full_post_permalink() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let result = super::super::json("/r/RuSt/comments/abc/Actual_Title/.json".into(), false).await.unwrap();
+		assert_eq!(result[0]["data"]["children"][0]["data"]["name"], "t3_abc");
+		assert_eq!(fixture.wires.lock().unwrap()[0].0, "/r/RuSt/comments/abc/Actual_Title/");
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_default_comments_follow_server_best_fragment() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(15, Ordering::SeqCst);
+		let spec = Spec::parse("/r/rust/comments/abc.json", false).unwrap();
+		let doc = document(&fixture.context(), &spec, &spec.initial(Some("rust")), Some("rust"), true).await.unwrap();
+		assert_eq!(doc.posts[0]["data"]["name"], "t3_abc");
+		assert_eq!(doc.comments[0]["data"]["name"], "t1_fragment");
+		assert_eq!(fixture.wires.lock().unwrap().len(), 2);
+		for sort in ["new", "top", "controversial", "old"] {
+			let spec = Spec::parse(&format!("/r/rust/comments/abc.json?sort={sort}"), false).unwrap();
+			assert!(spec.validate_page("/svc/shreddit/comments/r/rust/t3_abc?sort=BEST", Some("rust")).is_err());
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_production_tor_renewal_changes_socks_identity_and_cookie_jar() {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(17, Ordering::SeqCst);
+		let target: std::net::SocketAddr = fixture.origin.strip_prefix("http://").unwrap().parse().unwrap();
+		let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+		std::env::set_var("REDLIB_TOR_PROXY", format!("socks5h://{}", listener.local_addr().unwrap()));
+		let identities = Arc::new(Mutex::new(Vec::new()));
+		let recorded = identities.clone();
+		let relay = tokio::spawn(async move {
+			loop {
+				let (mut socket, _) = listener.accept().await.unwrap();
+				let recorded = recorded.clone();
+				tokio::spawn(async move {
+					assert_eq!(socket.read_u8().await.unwrap(), 5);
+					let n = socket.read_u8().await.unwrap();
+					let mut methods = vec![0; n as usize];
+					socket.read_exact(&mut methods).await.unwrap();
+					assert!(methods.contains(&2));
+					socket.write_all(&[5, 2]).await.unwrap();
+					assert_eq!(socket.read_u8().await.unwrap(), 1);
+					let n = socket.read_u8().await.unwrap();
+					let mut user = vec![0; n as usize];
+					socket.read_exact(&mut user).await.unwrap();
+					let n = socket.read_u8().await.unwrap();
+					let mut password = vec![0; n as usize];
+					socket.read_exact(&mut password).await.unwrap();
+					assert_eq!(user, password);
+					recorded.lock().unwrap().push(user);
+					socket.write_all(&[1, 0]).await.unwrap();
+					let mut request = [0; 4];
+					socket.read_exact(&mut request).await.unwrap();
+					assert_eq!(&request[..3], &[5, 1, 0]);
+					match request[3] {
+						1 => {
+							let mut ip = [0; 4];
+							socket.read_exact(&mut ip).await.unwrap();
+							assert_eq!(ip, [127, 0, 0, 1]);
+						}
+						3 => {
+							let n = socket.read_u8().await.unwrap();
+							let mut host = vec![0; n as usize];
+							socket.read_exact(&mut host).await.unwrap();
+							assert_eq!(host, b"127.0.0.1");
+						}
+						other => panic!("unexpected test destination type {other}"),
+					}
+					assert_eq!(socket.read_u16().await.unwrap(), target.port());
+					let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+					socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+					let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
+				});
+			}
+		});
+		let spec = Spec::parse("/r/rust/hot.json", false).unwrap();
+		let old = active_transport(RedditLane::Tor, false).unwrap();
+		let ctx = Context {
+			lane: RedditLane::Tor,
+			quarantine: false,
+			budget: Arc::new(Budget::new()),
+			session: old.clone(),
+			origin: Some(fixture.origin.clone()),
+		};
+		assert!(matches!(ctx.fetch(&spec, "/r/rust/hot/", Some("rust"), None).await, Err(WebError::RateLimited(_))));
+		let fresh = renew_tor_transport(&old, false).unwrap();
+		assert!(!Arc::ptr_eq(&fresh, &old));
+		let fresh = Context {
+			session: fresh,
+			budget: Arc::new(ctx.budget.new_attempt()),
+			..ctx
+		};
+		let doc = document(&fresh, &spec, "/r/rust/hot/", Some("rust"), true).await.unwrap();
+		assert!(!doc.posts.is_empty());
+		let identities = identities.lock().unwrap();
+		assert_eq!(identities.len(), 2);
+		assert_ne!(identities[0], identities[1]);
+		let wires = fixture.wires.lock().unwrap();
+		assert_eq!(wires.len(), 2);
+		assert!(wires[1].2.get("cookie").is_none());
+		relay.abort();
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_tor_quota_renews_one_session_for_concurrent_reads() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let old = Fixture::new().await;
+		old.mode.store(1, Ordering::SeqCst);
+		let fresh = Fixture::new().await;
+		*MOCK.lock().unwrap() = Some((old.transport.clone(), old.origin.clone()));
+		*RENEW_MOCK.lock().unwrap() = Some((fresh.transport.clone(), fresh.origin.clone()));
+		let mut tasks = tokio::task::JoinSet::new();
+		for _ in 0..8 {
+			tasks.spawn(async { read("/r/rust/hot.json?limit=1", false).await });
+		}
+		while let Some(page) = tasks.join_next().await {
+			let page = page.unwrap().unwrap();
+			let token = page["data"]["after"].as_str().unwrap().strip_prefix(PREFIX).unwrap();
+			let saved = cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).unwrap().clone();
+			assert!(saved.tor);
+			assert!(Arc::ptr_eq(saved.session.as_ref().unwrap(), &fresh.transport));
+		}
+		assert_eq!(TEST_RENEWALS.load(Ordering::SeqCst), 1, "all failures of the old identity must share one replacement");
+		assert!((1..=4).contains(&old.wires.lock().unwrap().len()));
+		let sent = fresh.wires.lock().unwrap();
+		assert_eq!(sent.len(), 8);
+		assert!(
+			sent[0].2.get("cookie").is_none(),
+			"the fresh session must not reuse the exhausted identity's anonymous cookie"
+		);
+		assert!(sent.iter().all(|(_, _, headers, _)| !headers.contains_key("authorization")));
+		assert!(old.transport.health.lock().unwrap().until.is_some());
+		assert!(fresh.transport.health.lock().unwrap().until.is_none());
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_cached_root_discards_cursor_of_exhausted_tor_identity() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let old = Fixture::new().await;
+		let fresh = Fixture::new().await;
+		*MOCK.lock().unwrap() = Some((old.transport.clone(), old.origin.clone()));
+		*RENEW_MOCK.lock().unwrap() = Some((fresh.transport.clone(), fresh.origin.clone()));
+		let _ = json("/r/rust/hot.json?limit=1".into(), false).await.unwrap();
+		old.mode.store(1, Ordering::SeqCst);
+		read("/r/rust/new.json?limit=1", false).await.unwrap();
+		let page = json("/r/rust/hot.json?limit=1".into(), false).await.unwrap();
+		let token = page["data"]["after"].as_str().unwrap().strip_prefix(PREFIX).unwrap();
+		let cursor = cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).unwrap().clone();
+		assert!(Arc::ptr_eq(cursor.session.as_ref().unwrap(), &fresh.transport));
+		assert_eq!(
+			fresh.wires.lock().unwrap().len(),
+			2,
+			"the cached root must reload instead of issuing another exhausted cursor"
+		);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_tor_renewal_is_bounded_and_does_not_replay_old_cursor() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let old = Fixture::new().await;
+		let fresh = Fixture::new().await;
+		*MOCK.lock().unwrap() = Some((old.transport.clone(), old.origin.clone()));
+		*RENEW_MOCK.lock().unwrap() = Some((fresh.transport.clone(), fresh.origin.clone()));
+		let page = read("/r/rust/hot.json?limit=1", false).await.unwrap();
+		let cursor = page["data"]["after"].as_str().unwrap();
+		old.mode.store(1, Ordering::SeqCst);
+		assert_eq!(read(&format!("/r/rust/hot.json?limit=1&after={cursor}"), false).await, Err(WebError::Cursor));
+		assert_eq!(fresh.wires.lock().unwrap().len(), 0, "old continuations cannot be transferred to the new jar");
+		fresh.mode.store(1, Ordering::SeqCst);
+		let another = Fixture::new().await;
+		another.mode.store(1, Ordering::SeqCst);
+		*RENEW_MOCK.lock().unwrap() = Some((another.transport.clone(), another.origin.clone()));
+		assert!(matches!(read("/r/rust/hot.json?limit=1", false).await, Err(WebError::RateLimited(_))));
+		assert_eq!(another.wires.lock().unwrap().len(), 1, "a logical read may try only one replacement identity");
+		let budget = Budget::new();
+		budget.wires.store(MAX_WIRES, Ordering::SeqCst);
+		let next = budget.new_attempt();
+		assert_eq!(next.wires.load(Ordering::SeqCst), MAX_WIRES, "renewal must retain the full read's request and byte bounds");
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_transport_recorded_feed_continuation_shape_loads_next_without_skips() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(16, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let mut path = "/r/rust/hot.json?limit=1".to_string();
+		let mut ids = vec![];
+		for _ in 0..3 {
+			let page = read(&path, false).await.unwrap();
+			ids.push(page["data"]["children"][0]["data"]["name"].as_str().unwrap().to_string());
+			if let Some(after) = page["data"]["after"].as_str() {
+				path = format!("/r/rust/hot.json?limit=1&after={after}");
+			}
+		}
+		assert_eq!(ids, ["t3_x0a", "t3_x0b", "t3_x0c"]);
+		let spec = Spec::parse("/r/rust/hot.json", false).unwrap();
+		for query in ["feedLength=-1", "ad_posts_served=1000001", "navigationSessionId=not-a-uuid", "t=DAY", "name=elsewhere"] {
+			assert!(spec
+				.validate_page(&format!("/svc/shreddit/community-more-posts/hot/?name=rust&{query}"), Some("rust"))
+				.is_err());
+		}
+	});
+}
+
+#[test]
 fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 	assert_eq!(Spec::parse("/r/all/hot.json", false).unwrap().origin(), "https://old.reddit.com");
 	let all = Spec::parse("/r/all/hot.json", false).unwrap();
@@ -501,7 +844,7 @@ fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 		served: 1,
 		form: None,
 	};
-	let cursor = encode_cursor(&spec.scope, vec![source], RedditLane::Direct).unwrap().unwrap();
+	let cursor = encode_cursor(&spec.scope, vec![source], RedditLane::Direct, None).unwrap().unwrap();
 	let path = format!("/r/rust/hot.json?limit=1&after={cursor}");
 	assert!(Spec::parse(&path, false).is_ok());
 	assert!(matches!(Spec::parse(&path, true), Err(WebError::Cursor)));
@@ -532,6 +875,7 @@ fn test_reddit_web_cursor_scope_terminal_priority_and_destination_allowlist() {
 			form: None,
 		}],
 		RedditLane::Direct,
+		None,
 	)
 	.unwrap()
 	.unwrap();
@@ -557,7 +901,7 @@ fn test_reddit_web_production_browser_jars_are_isolated_without_oauth_identity()
 			lane: RedditLane::Direct,
 			quarantine,
 			budget: Arc::new(Budget::new()),
-			fixture: None,
+			session: active_transport(RedditLane::Direct, quarantine).unwrap(),
 			origin: Some(fixture.origin.clone()),
 		};
 		for quarantine in [false, false, true] {
