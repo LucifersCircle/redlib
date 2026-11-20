@@ -42,6 +42,79 @@ static MORE_COUNT: LazyLock<Selector> = LazyLock::new(|| selector("faceplate-num
 static NEXT: LazyLock<Selector> = LazyLock::new(|| selector("a[rel='next'][href], .next-button a[href]"));
 static GATES: LazyLock<Selector> = LazyLock::new(|| selector("shreddit-content-gate, shreddit-error-page, [data-testid='content-gate']"));
 static HEADINGS: LazyLock<Selector> = LazyLock::new(|| selector("h1, h2, title"));
+static SCRIPTS: LazyLock<Selector> = LazyLock::new(|| selector("script"));
+static FORMS: LazyLock<Selector> = LazyLock::new(|| selector("form"));
+static INPUTS: LazyLock<Selector> = LazyLock::new(|| selector("input[name]"));
+
+pub(super) struct ScriptCheck {
+	pub action: String,
+	pub fields: Vec<(String, String)>,
+}
+
+/// The fixed seed-doubling form documented by webclaw 3c2006a13e5f96ea2a6956f578b9afefb8f5d8b7.
+/// Interpret only that operation; never evaluate upstream JavaScript or submit other forms.
+pub(super) fn script_check(html: &str, communities: &[String]) -> Result<Option<ScriptCheck>, WebError> {
+	const MARKER: &str = "async e=>e+e)(\"";
+	if !html.contains(MARKER) {
+		return Ok(None);
+	}
+	let document = Html::parse_document(html);
+	if let Err(error) = restrictions(&document, communities) {
+		if error != WebError::Temporary("web_access_wall") {
+			return Err(error);
+		}
+	}
+	if document.select(&POSTS).next().is_some() || document.select(&COMMENTS).next().is_some() {
+		return Ok(None);
+	}
+	let seeds: Vec<_> = document
+		.select(&SCRIPTS)
+		.filter(|element| !inside_ugc(*element) && !auxiliary(*element))
+		.flat_map(|element| {
+			let script = text(element);
+			script
+				.match_indices(MARKER)
+				.filter_map(|(at, _)| {
+					let rest = &script[at + MARKER.len()..];
+					let (seed, tail) = rest.split_once('"')?;
+					(!seed.is_empty() && seed.len() <= 256 && seed.bytes().all(|b| b.is_ascii_alphanumeric()) && tail.starts_with(')')).then(|| seed.to_string())
+				})
+				.collect::<Vec<_>>()
+		})
+		.collect();
+	let [seed] = seeds.as_slice() else { return Ok(None) };
+	let forms: Vec<_> = document
+		.select(&FORMS)
+		.filter(|element| !inside_ugc(*element) && !auxiliary(*element))
+		.filter(|form| form.select(&INPUTS).any(|input| input.value().attr("name") == Some("jsc_token")))
+		.collect();
+	let [form] = forms.as_slice() else { return Ok(None) };
+	if !attr(*form, &["method"]).is_some_and(|method| method.eq_ignore_ascii_case("get")) {
+		return Ok(None);
+	}
+	let Some(action) = attr(*form, &["action"]) else { return Ok(None) };
+	let mut fields = vec![("solution".into(), format!("{seed}{seed}"))];
+	let mut names = HashSet::new();
+	for input in form.select(&INPUTS) {
+		let name = input.value().attr("name").unwrap();
+		let value = input.value().attr("value").unwrap_or_default();
+		if !input.value().attr("type").is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")) || !names.insert(name) || value.len() > 4096 || value.chars().any(char::is_control)
+		{
+			return Ok(None);
+		}
+		match name {
+			"solution" if value.is_empty() => {}
+			"js_challenge" if value == "1" => fields.push((name.into(), value.into())),
+			"jsc_token" if !value.is_empty() => fields.push((name.into(), value.into())),
+			"jsc_orig_r" => fields.push((name.into(), value.into())),
+			_ => return Ok(None),
+		}
+	}
+	if names.len() != 4 || fields.len() != 4 {
+		return Ok(None);
+	}
+	Ok(Some(ScriptCheck { action: action.into(), fields }))
+}
 
 fn selector(value: &str) -> Selector {
 	Selector::parse(value).expect("fixed Reddit HTML selector")

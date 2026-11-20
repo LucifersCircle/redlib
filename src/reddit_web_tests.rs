@@ -29,6 +29,12 @@ fn post(name: &str, id: &str, score: usize, pinned: bool, old: bool) -> String {
 fn comment(id: &str) -> String {
 	format!(r#"<shreddit-comment thingid="t1_{id}" author="bob" score="2"><div id="t1_{id}-comment-rtjson-content" slot="comment"><p>Comment {id}</p></div></shreddit-comment>"#)
 }
+// Recorded script/form contract from 0xMassi/webclaw 3c2006a13e5f96ea2a6956f578b9afefb8f5d8b7.
+fn script_check(action: &str) -> String {
+	format!(
+		r#"<html><head><title>Reddit - Prove your humanity</title><script>document.addEventListener("DOMContentLoaded",async function(){{var e=document.forms[0],n=(e.onsubmit=function(t){{return!0}},await(async e=>e+e)("3ca3d93c"));e.elements.namedItem("solution").value=n,e.requestSubmit()}},{{once:!0}});</script></head><body><form hidden method="GET" action="{action}"><input type="hidden" name="solution" /><input type="hidden" name="js_challenge" value="1"/><input type="hidden" name="jsc_token" value="2824be"/><input type="hidden" name="jsc_orig_r" value=""/></form></body></html>"#
+	)
+}
 impl Fixture {
 	async fn new() -> Self {
 		let wires = Arc::new(Mutex::new(Vec::new()));
@@ -41,6 +47,24 @@ impl Fixture {
 					let (wires, mode) = shared.clone();
 					async move {
 						let path = req.uri().path().to_string();
+						let query: HashMap<_, _> = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()).into_owned().collect();
+						let answered = query.get("solution").is_some_and(|s| s == "3ca3d93c3ca3d93c")
+							&& query.get("jsc_token").is_some_and(|s| s == "2824be")
+							&& query.get("js_challenge").is_some_and(|s| s == "1")
+							&& query.get("jsc_orig_r").is_some_and(String::is_empty)
+							&& req.headers().get("cookie").is_some_and(|v| v.to_str().unwrap().contains("anon=fixture"))
+							&& !req.headers().contains_key("authorization");
+						if query.contains_key("solution") {
+							assert!(answered, "only the recognized solution and the anonymous session cookie may be submitted");
+							if path.contains("/comments/") {
+								assert_eq!(query.get("sort").map(String::as_str), Some("new"));
+								assert_eq!(query.get("context").map(String::as_str), Some("2"));
+							} else {
+								assert_eq!(query.get("t").map(String::as_str), Some("all"));
+								assert_eq!(query.get("limit").map(String::as_str), Some("1"));
+							}
+						}
+						let challenge_mode = mode.load(Ordering::SeqCst);
 						let rdt = req.uri().query().unwrap_or_default().contains("rdt=");
 						let after = req.uri().query().unwrap_or_default().contains("after=");
 						let method = req.method().to_string();
@@ -50,14 +74,24 @@ impl Fixture {
 							.lock()
 							.unwrap()
 							.push((path.clone(), method.clone(), headers, String::from_utf8(body.to_vec()).unwrap()));
-						let status = if mode.load(Ordering::SeqCst) == 1 {
+						let status = if mode.load(Ordering::SeqCst) == 1 || (challenge_mode == 10 && answered) {
 							429
+						} else if challenge_mode == 13 && !answered {
+							403
 						} else if mode.load(Ordering::SeqCst) == 6 && !rdt {
 							302
 						} else {
 							200
 						};
-						let body = if mode.load(Ordering::SeqCst) == 7 {
+						let body = if (8..=14).contains(&challenge_mode) && (!answered || matches!(challenge_mode, 9 | 11 | 12)) {
+							let action = if challenge_mode == 12 { "https://evil.test/r/rust/hot/" } else { &path };
+							let check = script_check(action);
+							if challenge_mode == 11 {
+								format!("<shreddit-content-gate reason=\"private\"></shreddit-content-gate>{check}")
+							} else {
+								check
+							}
+						} else if mode.load(Ordering::SeqCst) == 7 {
 							let id = if after { "oldtwo" } else { "oldone" };
 							let next = if after {
 								String::new()
@@ -85,7 +119,7 @@ impl Fixture {
 								.iter()
 								.filter(|(path, method, _, _)| method == "GET" && path.starts_with("/r/rust/comments/"))
 								.count()
-								> 1;
+								> if matches!(challenge_mode, 8 | 13) { 2 } else { 1 };
 							if repeated {
 								format!("<main>{p}</main>")
 							} else {
@@ -119,6 +153,8 @@ impl Fixture {
 							.header("set-cookie", "anon=fixture; Path=/; HttpOnly");
 						let response = if status == 429 {
 							response.header("retry-after", "60")
+						} else if challenge_mode == 14 {
+							response.header("x-ratelimit-remaining", "0").header("x-ratelimit-reset", "60")
 						} else if status == 302 {
 							response.header("location", "/r/rust/hot/?rdt=12345")
 						} else {
@@ -340,6 +376,111 @@ fn test_reddit_web_transport_quota_stops_queued_sends_and_streaming_is_bounded()
 		assert!(budget.finish(Ok(json!({"ok":true}))).is_ok());
 		assert!(matches!(budget.finish(Err(WebError::Temporary("transport"))), Err(WebError::RateLimited(_))));
 	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_script_check_retains_tor_cookie_and_request_scope() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		for mode in [8, 13] {
+			let fixture = Fixture::new().await;
+			fixture.mode.store(mode, Ordering::SeqCst);
+			*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+			let page = read("/r/rust/hot.json?limit=1", false).await.unwrap();
+			let token = page["data"]["after"].as_str().unwrap().strip_prefix(PREFIX).unwrap();
+			let saved = cached::Cached::cache_get(&mut *CURSORS.lock().unwrap(), token).unwrap().clone();
+			assert!(saved.tor);
+			assert!(saved.sources.iter().all(|s| !s.page.as_deref().unwrap_or_default().contains("jsc_token")));
+			assert_eq!(
+				fixture.wires.lock().unwrap().len(),
+				2,
+				"the initial Tor read must complete its script check without a Direct replay"
+			);
+			assert!(oauth_client(RedditLane::Direct).is_none());
+			assert!(oauth_client(RedditLane::Tor).is_none());
+		}
+		let fixture = Fixture::new().await;
+		fixture.mode.store(8, Ordering::SeqCst);
+		let spec = Spec::parse("/r/rust/comments/abc.json?sort=new&context=2", false).unwrap();
+		let doc = document(&fixture.context(), &spec, &spec.initial(Some("rust")), Some("rust"), true).await.unwrap();
+		assert_eq!(doc.posts[0]["data"]["name"], "t3_abc");
+		assert!(!doc.comments.is_empty());
+		assert_eq!(fixture.wires.lock().unwrap().len(), 2);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_reddit_web_transport_script_check_is_bounded_and_respects_resources_and_quota() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let spec = Spec::parse("/r/rust/hot.json?limit=1", false).unwrap();
+		for (mode, wires, resource, quota) in [
+			(9, 2, false, false),
+			(10, 2, false, true),
+			(11, 1, true, false),
+			(12, 1, false, false),
+			(14, 1, false, true),
+		] {
+			let fixture = Fixture::new().await;
+			fixture.mode.store(mode, Ordering::SeqCst);
+			let ctx = fixture.context();
+			let error = document(&ctx, &spec, &spec.initial(Some("rust")), Some("rust"), true).await.unwrap_err();
+			assert_eq!(matches!(error, WebError::Resource(_)), resource, "mode {mode}: {error:?}");
+			assert_eq!(matches!(error, WebError::RateLimited(_)), quota, "mode {mode}: {error:?}");
+			assert_eq!(fixture.wires.lock().unwrap().len(), wires, "mode {mode}: {error:?}");
+		}
+		let fixture = Fixture::new().await;
+		fixture.mode.store(9, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let _busy_standby = STANDBY.acquire_many(2).await.unwrap();
+		assert_eq!(
+			read("/r/rust/hot.json?limit=1", false).await,
+			Err(WebError::Temporary("script_check_repeated")),
+			"busy standby must preserve the upstream failure instead of replacing it with capacity"
+		);
+		assert_eq!(fixture.wires.lock().unwrap().len(), 2);
+	});
+}
+
+#[test]
+fn test_reddit_web_script_check_rejects_other_forms_scripts_and_destinations() {
+	let page = script_check("/r/rust/hot/");
+	let check = html::script_check(&page, &["rust".into()]).unwrap().unwrap();
+	assert_eq!(check.fields[0], ("solution".into(), "3ca3d93c3ca3d93c".into()));
+	for altered in [
+		page.replace("async e=>e+e", "async e=>fetch(e)"),
+		page.replace("3ca3d93c", "bad;code"),
+		page.replace("method=\"GET\"", "method=\"POST\""),
+		page.replace("name=\"js_challenge\" value=\"1\"", "name=\"js_challenge\" value=\"2\""),
+		page.replace("name=\"jsc_token\"", "name=\"password\""),
+		page.replace("</form>", "<input type=\"hidden\" name=\"jsc_token\" value=\"duplicate\"></form>"),
+		page.replace("</form>", "<input type=\"hidden\" name=\"next\" value=\"https://evil.test\"></form>"),
+		page.replace("3ca3d93c", &"a".repeat(257)),
+		format!("<shreddit-post><div slot=\"text-body\">{page}</div></shreddit-post>"),
+	] {
+		assert!(html::script_check(&altered, &["rust".into()]).unwrap().is_none());
+	}
+	let spec = Spec::parse("/r/rust/hot.json?limit=1&t=day", false).unwrap();
+	assert_eq!(
+		spec.script_action("/r/rust/hot/?limit=1&t=day", &check.action, Some("rust")).unwrap(),
+		"/r/rust/hot/?limit=1&t=day"
+	);
+	for action in [
+		"https://evil.test/r/rust/hot/",
+		"https://old.reddit.com/r/rust/hot/",
+		"//evil.test/r/rust/hot/",
+		"/r/linux/hot/",
+		"/r/rust/new/",
+		"/r/rust/hot/?t=all",
+		"/r/rust/hot/?jsc_token=untrusted",
+		"/r/rust/hot/#fragment",
+	] {
+		assert!(spec.script_action("/r/rust/hot/?limit=1&t=day", action, Some("rust")).is_err(), "{action}");
+	}
+	assert_eq!(
+		html::script_check(&format!("<shreddit-content-gate reason=\"private\"></shreddit-content-gate>{page}"), &["rust".into()]).err(),
+		Some(WebError::Resource("private"))
+	);
 }
 
 #[test]
