@@ -3,6 +3,12 @@ use hyper::service::{make_service_fn, service_fn};
 use sealed_test::prelude::*;
 use std::convert::Infallible;
 
+#[path = "reddit_web_load_tests.rs"]
+mod load_tests;
+
+#[path = "reddit_web_canonical_tests.rs"]
+mod canonical_tests;
+
 #[tokio::test]
 #[ignore = "Manual signed-out public HTTPS verification; honors the environment proxy and CA trust"]
 async fn live_anonymous_web_reader_capture() {
@@ -72,6 +78,11 @@ async fn live_anonymous_web_reader_capture() {
 		println!("Real Next pipeline: {} posts", next["data"]["children"].as_array().unwrap().len());
 	}
 	let permalink = first["data"]["children"][0]["data"]["permalink"].as_str().unwrap();
+	let short = permalink.split('/').take(5).collect::<Vec<_>>().join("/");
+	let short = Spec::parse(&format!("{short}/_.json"), false).unwrap();
+	let corrected = read_on_lane(ctx.clone(), short).await.expect("a real same-post canonical slug correction must load");
+	assert_eq!(corrected[0]["data"]["children"][0]["data"]["name"], first["data"]["children"][0]["data"]["name"]);
+	println!("Real missing-title permalink pipeline: same post loaded");
 	let post = Spec::parse(&format!("{}.json", permalink.trim_end_matches('/')), false).unwrap();
 	let post = read_on_lane(ctx.clone(), post).await.expect("the real post/comment pipeline must succeed");
 	assert!(!post[0]["data"]["children"].as_array().unwrap().is_empty());
@@ -305,6 +316,13 @@ impl Fixture {
 							}
 						}
 						let challenge_mode = mode.load(Ordering::SeqCst);
+						if challenge_mode == 38 {
+							tokio::time::sleep(Duration::from_millis(40)).await;
+						}
+						if challenge_mode == 36 && path.contains("/canonical_title/") {
+							assert_eq!(query.get("sort").map(String::as_str), Some("new"));
+							assert_eq!(query.get("context").map(String::as_str), Some("2"));
+						}
 						if matches!(challenge_mode, 24 | 25) && path.starts_with("/svc/shreddit/community-more-posts/") {
 							assert_eq!(
 								query.get("navigationSessionId").map(String::as_str),
@@ -457,9 +475,19 @@ impl Fixture {
 							} else {
 								body
 							}
+						} else if matches!(challenge_mode, 36 | 37) && path.contains("/comments/") && !path.contains("/canonical_title/") {
+							let name = path.split('/').nth(2).unwrap();
+							let id = path.split('/').nth(4).unwrap();
+							format!("<shreddit-app><div id=\"canonical-url-updater\" value=\"https://www.reddit.com/r/{name}/comments/{id}/canonical_title/\"></div></shreddit-app>")
+						} else if challenge_mode == 36 {
+							format!(
+								"{}{}",
+								post("rust", "abc", 20, false, false).replace("comment-count=\"0\"", "comment-count=\"1\""),
+								comment("first")
+							)
 						} else if challenge_mode == 35 {
 							post("rust", "abc", 20, false, false)
-						} else if matches!(challenge_mode, 30 | 32 | 33 | 34) {
+						} else if matches!(challenge_mode, 30 | 32 | 33 | 34 | 37 | 38) {
 							paged_feed_fixture(&path, &query, challenge_mode)
 						} else if matches!(challenge_mode, 28 | 29) {
 							let fixture = include_str!("../tests/fixtures/reddit_web_media.html");
@@ -476,6 +504,11 @@ impl Fixture {
 							} else {
 								body
 							}
+						} else {
+							body
+						};
+						let body = if challenge_mode == 38 {
+							format!("{body}<!--{}-->", " ".repeat(128 * 1024))
 						} else {
 							body
 						};
@@ -1251,6 +1284,9 @@ fn test_reddit_web_subscription_home_preserves_and_recovers_canonical_names() {
 		let server = tokio::spawn(app.listen(&address.to_string()));
 		let http = hyper::Client::new();
 		for names in ["AskReddit+Android+rust", "askreddit+android+rust"] {
+			// Each variant must reach the fixture to exercise native casing
+			// correction independently of semantic page-cache reuse.
+			cached::Cached::cache_clear(&mut *READ_CACHE.lock().await);
 			let request = hyper::Request::builder()
 				.uri(format!("http://{address}/"))
 				.header("cookie", format!("subscriptions={names}; post_sort=hot; front_page=default"))
@@ -1339,11 +1375,11 @@ fn test_reddit_web_canonical_case_recovery_is_scoped_bounded_and_respects_limits
 			"/r/AskReddit/hot/?after=different",
 			"/r/AskReddit/hot/?next=evil",
 		] {
-			assert!(spec.canonical_case_page("/r/askreddit/hot/?t=all&limit=25", target, Some("askreddit")).is_err(), "{target}");
+			assert!(spec.canonical_page("/r/askreddit/hot/?t=all&limit=25", target, Some("askreddit")).is_err(), "{target}");
 		}
 		assert_eq!(
 			spec
-				.canonical_case_page("/r/askreddit/hot/?t=all&limit=25", "/r/AskReddit/hot/", Some("askreddit"))
+				.canonical_page("/r/askreddit/hot/?t=all&limit=25", "/r/AskReddit/hot/", Some("askreddit"))
 				.unwrap()
 				.unwrap(),
 			"/r/AskReddit/hot/?t=all&limit=25"
@@ -1685,14 +1721,14 @@ fn test_reddit_web_feed_parity_cache_lifetimes_and_last_good_recovery_keep_resou
 		let count = fixture.wires.lock().unwrap().len();
 		{
 			let mut cache = READ_CACHE.lock().await;
-			let entry = cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap();
+			let entry = cached::Cached::cache_get_mut(&mut *cache, &Spec::parse(&path, false).unwrap().cache_key(false)).unwrap();
 			entry.0 = Instant::now() - Duration::from_secs(50);
 		}
 		assert_eq!(json(path.clone(), false).await.unwrap(), first);
 		assert_eq!(fixture.wires.lock().unwrap().len(), count, "feed freshness retains the prior 60-second window");
 		{
 			let mut cache = READ_CACHE.lock().await;
-			let entry = cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap();
+			let entry = cached::Cached::cache_get_mut(&mut *cache, &Spec::parse(&path, false).unwrap().cache_key(false)).unwrap();
 			entry.0 = Instant::now() - Duration::from_secs(61);
 		}
 		fixture.mode.store(18, Ordering::SeqCst);
@@ -1700,7 +1736,7 @@ fn test_reddit_web_feed_parity_cache_lifetimes_and_last_good_recovery_keep_resou
 		fixture.mode.store(11, Ordering::SeqCst);
 		assert!(json(path.clone(), false).await.unwrap_err().contains("private"));
 		assert!(
-			cached::Cached::cache_get(&mut *READ_CACHE.lock().await, &(path.clone(), false)).is_none(),
+			cached::Cached::cache_get(&mut *READ_CACHE.lock().await, &Spec::parse(&path, false).unwrap().cache_key(false)).is_none(),
 			"a resource gate removes the stale success"
 		);
 		fixture.mode.store(0, Ordering::SeqCst);
@@ -1710,16 +1746,58 @@ fn test_reddit_web_feed_parity_cache_lifetimes_and_last_good_recovery_keep_resou
 		let count = fixture.wires.lock().unwrap().len();
 		{
 			let mut cache = READ_CACHE.lock().await;
-			cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap().0 = Instant::now() - Duration::from_secs(179);
+			cached::Cached::cache_get_mut(&mut *cache, &Spec::parse(&path, false).unwrap().cache_key(false)).unwrap().0 = Instant::now() - Duration::from_secs(179);
 		}
 		assert_eq!(json(path.clone(), false).await.unwrap(), first);
 		assert_eq!(fixture.wires.lock().unwrap().len(), count, "comment freshness retains the prior 180-second window");
 		{
 			let mut cache = READ_CACHE.lock().await;
-			cached::Cached::cache_get_mut(&mut *cache, &(path.clone(), false)).unwrap().0 = Instant::now() - Duration::from_secs(181);
+			cached::Cached::cache_get_mut(&mut *cache, &Spec::parse(&path, false).unwrap().cache_key(false)).unwrap().0 = Instant::now() - Duration::from_secs(181);
 		}
 		fixture.mode.store(18, Ordering::SeqCst);
 		assert_eq!(json(path, false).await.unwrap(), first, "a challenged comment refresh retains the last good thread too");
 		assert!(fixture.wires.lock().unwrap().len() > count);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_READ_BACKEND","web"),("REDLIB_TOR_FALLBACK","off"),("REDLIB_REDDIT_PRIMARY_LANE","direct")])]
+fn test_reddit_web_canonical_post_and_pin_recovery_through_http() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new().await;
+		fixture.mode.store(36, Ordering::SeqCst);
+		*MOCK.lock().unwrap() = Some((fixture.transport.clone(), fixture.origin.clone()));
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		drop(listener);
+		let mut app = crate::server::Server::new();
+		app.at("/").get(|r| Box::pin(crate::subreddit::community(r)));
+		app.at("/r/:sub/comments/:id/:title").get(|r| Box::pin(crate::post::item(r)));
+		app.at("/r/:sub/comments/:id/:title/:comment_id").get(|r| Box::pin(crate::post::item(r)));
+		let server = tokio::spawn(app.listen(&address.to_string()));
+		let http = hyper::Client::new();
+		for path in ["/r/rust/comments/abc/_?sort=new&context=2", "/r/rust/comments/abc/old_title/first?sort=new&context=2"] {
+			let response = http.get(format!("http://{address}{path}").parse().unwrap()).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::OK);
+			let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+			assert!(std::str::from_utf8(&body).unwrap().contains("Readable body"));
+		}
+		let wires = fixture.wires.lock().unwrap().clone();
+		assert!(wires
+			.iter()
+			.any(|(path, method, _, _)| path == "/r/rust/comments/abc/canonical_title/first/" && method == "GET"));
+		fixture.mode.store(37, Ordering::SeqCst);
+		let names = (0..14).map(|i| format!("s{i}")).collect::<Vec<_>>().join("+");
+		let request = hyper::Request::builder()
+			.uri(format!("http://{address}/"))
+			.header("cookie", format!("subscriptions={names};post_sort=hot;front_page=default"))
+			.body(Body::empty())
+			.unwrap();
+		let response = http.request(request).await.unwrap();
+		assert_eq!(response.status(), hyper::StatusCode::OK, "canonicalized pin metadata must not stall the homepage");
+		let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+		let html = scraper::Html::parse_document(std::str::from_utf8(&body).unwrap());
+		assert_eq!(html.select(&scraper::Selector::parse(".post_title").unwrap()).count(), 25);
+		server.abort();
 	});
 }
