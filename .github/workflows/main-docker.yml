@@ -57,6 +57,7 @@ jobs:
           cargo test --locked --lib test_direct_transport_cooldown_
           cargo test --locked --lib test_graphql_pages_
           cargo test --locked --lib test_graphql_comments_
+          cargo test --locked --lib test_legacy_all_
           cargo test --locked --lib test_endpoint_edge_
           cargo test --locked --lib test_credential_rejection_
           cargo test --locked --lib test_rejection_

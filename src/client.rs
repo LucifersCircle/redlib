@@ -35,6 +35,10 @@ use wreq_util::{Emulation, Platform, Profile};
 mod tor_graphql_quota_tests;
 
 #[cfg(test)]
+#[path = "client_legacy_all_tests.rs"]
+mod legacy_all_tests;
+
+#[cfg(test)]
 #[path = "client_graphql_pages_tests.rs"]
 mod graphql_pages_tests;
 
@@ -1176,6 +1180,9 @@ impl UpstreamGuard {
 	}
 
 	fn reconcile_quota(&mut self, now: Instant, attempt: &mut UpstreamAttempt, remaining: Option<u16>, reset: Option<Duration>, quota_exhausted: bool) {
+		if quota_exhausted || remaining == Some(0) {
+			disqualify_legacy_all_recovery();
+		}
 		if attempt.quota_reconciled {
 			return;
 		}
@@ -2490,6 +2497,7 @@ async fn acquire_recovery_capacity<'a>(
 }
 
 fn block_for_rate_limit(lane: RedditLane, generation: u64, retry_after: Option<&str>, reset: Option<&str>, endpoint: usize) -> (Duration, bool) {
+	disqualify_legacy_all_recovery();
 	let mut guard = upstream_guard(lane);
 	if guard.quota.generation != generation {
 		return (rate_limit_base_delay(retry_after, reset).0, false);
@@ -2710,6 +2718,9 @@ fn record_upstream_failure(lane: RedditLane, kind: &str, status: Option<u16>, pa
 }
 
 fn record_upstream_response(attempt: &UpstreamAttempt, path: &str, status: u16) {
+	if is_legacy_all_rest_path(path) {
+		return;
+	}
 	let released = upstream_guard(attempt.lane).record_http_response(Instant::now(), attempt.generation, attempt.edge.endpoint, status);
 	if released {
 		quota_notify(attempt.lane).notify_waiters();
@@ -2745,6 +2756,7 @@ fn record_graphql_resource_response(attempt: &UpstreamAttempt, path: &str, statu
 }
 
 fn record_resource_response(attempt: &UpstreamAttempt, path: &str, status: u16, remaining: Option<u16>) {
+	disqualify_legacy_all_recovery();
 	if remaining != Some(0) {
 		record_upstream_response(attempt, path, status);
 	}
@@ -3275,6 +3287,9 @@ enum RedditReadResponse {
 }
 
 fn graphql_api_error(error: GraphqlError, lane: RedditLane, generation: u64, headers: &wreq::header::HeaderMap) -> ApiRequestError {
+	if matches!(error.kind, GraphqlErrorKind::Resource | GraphqlErrorKind::Session) {
+		disqualify_legacy_all_recovery();
+	}
 	if error.kind == GraphqlErrorKind::Invalid {
 		return ApiRequestError::Terminal {
 			message: error.message,
@@ -3301,6 +3316,9 @@ fn reconcile_graphql_quota(
 	retry_after: Option<&str>,
 	reset_header: Option<&str>,
 ) -> Option<Duration> {
+	if matches!(error, Some(GraphqlErrorKind::Session | GraphqlErrorKind::Resource)) {
+		disqualify_legacy_all_recovery();
+	}
 	// A positive allowance on an embedded quota/session error must not publish
 	// successful discovery before its body classification is installed.
 	let quota_error = error == Some(GraphqlErrorKind::RateLimit);
@@ -3524,6 +3542,14 @@ async fn reddit_get(
 	}
 	let lane = attempt.lane;
 	let origin = lane.api_origin();
+	#[cfg(test)]
+	let origin = if is_legacy_all_rest_path(&path) {
+		let fixture = oauth_client.graphql_origin();
+		assert!(fixture.base.starts_with("http://127.0.0.1:"), "legacy request tests must use explicit loopback fixtures");
+		fixture
+	} else {
+		origin
+	};
 	let generation = oauth_client.generation;
 	let mut path = path;
 	let mut visited = HashSet::new();
@@ -3540,7 +3566,7 @@ async fn reddit_get(
 		let response = request_once(&Method::GET, transport_path.into_owned(), quarantine, origin, oauth_client.clone(), lane, None)
 			.await
 			.map_err(ApiRequestError::Upstream)?;
-		if !response.status().is_redirection() {
+		if !response.status().is_redirection() || is_legacy_all_rest_path(&path) {
 			return Ok(RedditReadResponse::Rest(response));
 		}
 
@@ -4033,8 +4059,229 @@ fn is_metadata_path(path: &str) -> bool {
 	}
 }
 
+const LEGACY_ALL_TIMEOUT: Duration = Duration::from_secs(3);
+const LEGACY_ALL_CURSOR_PREFIX: &str = "redlib-legacy-all:";
+tokio::task_local! { static LEGACY_ALL_DISQUALIFIED: std::cell::Cell<bool>; }
+
+fn disqualify_legacy_all_recovery() {
+	let _ = LEGACY_ALL_DISQUALIFIED.try_with(|flag| flag.set(true));
+}
+fn legacy_all_unavailable() -> String {
+	"Reddit is temporarily unable to load this page. Retry in 5 seconds".into()
+}
+fn invalid_legacy_all_cursor() -> String {
+	"This page link is invalid. Return to the first page and try again.".into()
+}
+fn legacy_all_fullname(value: &str) -> bool {
+	value
+		.strip_prefix("t3_")
+		.is_some_and(|id| !id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum LegacyAllPlan {
+	FirstPage(String),
+	Tagged(String),
+}
+fn legacy_all_plan(path: &str) -> Result<Option<LegacyAllPlan>, String> {
+	let (base, raw_query) = path.split_once('?').unwrap_or((path, ""));
+	let parts: Vec<_> = base.trim_end_matches('/').trim_end_matches(".json").split('/').filter(|s| !s.is_empty()).collect();
+	let mut query: Vec<(String, String)> = url::form_urlencoded::parse(raw_query.as_bytes()).into_owned().collect();
+	let cursors: Vec<_> = query.iter().filter(|(key, _)| key == "after" || key == "before").collect();
+	let tagged = cursors.iter().any(|(_, value)| value.starts_with("redlib-legacy-all"));
+	let all = matches!(parts.as_slice(), ["r", name] | ["r", name, _] if name.eq_ignore_ascii_case("all"));
+	let sort = parts.get(2).copied().unwrap_or("hot");
+	if !all || !matches!(sort, "hot" | "new" | "top" | "rising" | "controversial" | "best") {
+		return if tagged { Err(invalid_legacy_all_cursor()) } else { Ok(None) };
+	}
+	if tagged {
+		if cursors.len() != 1 || !cursors[0].1.strip_prefix(LEGACY_ALL_CURSOR_PREFIX).is_some_and(legacy_all_fullname) {
+			return Err(invalid_legacy_all_cursor());
+		}
+	} else if cursors.iter().any(|(_, value)| !value.is_empty()) {
+		// Untagged cursors retain the existing GraphQL route and never trigger
+		// first-page REST recovery. Only our explicit provenance selects REST.
+		return Ok(None);
+	}
+	for (key, value) in &mut query {
+		if tagged && (key == "after" || key == "before") {
+			*value = value.strip_prefix(LEGACY_ALL_CURSOR_PREFIX).unwrap().into();
+		}
+	}
+	let encoded_base = if parts.len() == 2 {
+		"/r/all%2B.json".to_string()
+	} else {
+		format!("/r/all%2B/{sort}.json")
+	};
+	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	serializer.extend_pairs(query);
+	let query = serializer.finish();
+	let path = if query.is_empty() { encoded_base } else { format!("{encoded_base}?{query}") };
+	Ok(Some(if tagged { LegacyAllPlan::Tagged(path) } else { LegacyAllPlan::FirstPage(path) }))
+}
+fn is_legacy_all_rest_path(path: &str) -> bool {
+	let base = path.split('?').next().unwrap_or_default();
+	matches!(
+		base,
+		"/r/all%2B.json" | "/r/all%2B/hot.json" | "/r/all%2B/new.json" | "/r/all%2B/top.json" | "/r/all%2B/rising.json" | "/r/all%2B/controversial.json" | "/r/all%2B/best.json"
+	)
+}
+fn legacy_all_rest_cursors_valid(path: &str) -> bool {
+	let query = path.split_once('?').map_or("", |(_, query)| query);
+	let cursors: Vec<_> = url::form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key == "after" || key == "before").collect();
+	cursors.iter().all(|(_, value)| value.is_empty()) || (cursors.len() == 1 && legacy_all_fullname(&cursors[0].1))
+}
+
+fn normalize_legacy_all_rest_cursors(path: &str) -> Result<String, String> {
+	if !is_legacy_all_rest_path(path) {
+		return Err(invalid_legacy_all_cursor());
+	}
+	let (base, raw_query) = path.split_once('?').unwrap_or((path, ""));
+	let mut query: Vec<(String, String)> = url::form_urlencoded::parse(raw_query.as_bytes()).into_owned().collect();
+	for (key, value) in &mut query {
+		if key == "after" || key == "before" {
+			if let Some(cursor) = value.strip_prefix(LEGACY_ALL_CURSOR_PREFIX) {
+				if !legacy_all_fullname(cursor) {
+					return Err(invalid_legacy_all_cursor());
+				}
+				*value = cursor.to_string();
+			}
+		}
+	}
+	let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+	serializer.extend_pairs(query);
+	let query = serializer.finish();
+	let path = if query.is_empty() { base.to_string() } else { format!("{base}?{query}") };
+	if !legacy_all_rest_cursors_valid(&path) {
+		return Err(invalid_legacy_all_cursor());
+	}
+	Ok(path)
+}
+
+fn legacy_all_candidate(result: &Result<Value, String>) -> bool {
+	match result {
+		Ok(value) => value["kind"] == "Listing" && value["data"]["children"].as_array().is_some_and(Vec::is_empty),
+		Err(message) => [
+			"Reddit is temporarily unable to load this page",
+			"Reddit is temporarily unable to load page",
+			"Couldn't send request to Reddit",
+			"Failed receiving body from Reddit",
+			"Failed to parse page JSON data",
+			"Reddit API request timed out",
+			"Reddit is temporarily rejecting this instance",
+			"Reddit returned an empty response",
+			"Reddit is having issues",
+			"Reddit error 403",
+		]
+		.iter()
+		.any(|prefix| message.starts_with(prefix)),
+	}
+}
+fn validate_legacy_all_listing(value: &mut Value, quarantine: bool) -> Result<(), String> {
+	if value["kind"] != "Listing"
+		|| !value["data"].is_object()
+		|| value.get("error").is_some_and(|error| !error.is_null())
+		|| value.get("errors").is_some_and(|errors| !errors.is_null() && !errors.as_array().is_some_and(Vec::is_empty))
+		|| value["message"] == "Unauthorized"
+	{
+		return Err(legacy_all_unavailable());
+	}
+	let children = value["data"]["children"]
+		.as_array()
+		.filter(|children| !children.is_empty())
+		.ok_or_else(legacy_all_unavailable)?;
+	for item in children {
+		let data = &item["data"];
+		if data["quarantine"] == true && !quarantine {
+			return Err("quarantined".into());
+		}
+		if data["subreddit_type"] == "private" {
+			return Err("private".into());
+		}
+		let name = data["name"].as_str().ok_or_else(legacy_all_unavailable)?;
+		if item["kind"] != "t3"
+			|| !legacy_all_fullname(name)
+			|| data["id"].as_str() != name.strip_prefix("t3_")
+			|| !data["title"].as_str().is_some_and(|title| !title.is_empty())
+			|| !data["subreddit"]
+				.as_str()
+				.is_some_and(|name| !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+			|| !data["permalink"]
+				.as_str()
+				.is_some_and(|path| path.starts_with("/r/") && path.contains(&format!("/comments/{}/", &name[3..])) && !path.chars().any(char::is_control))
+		{
+			return Err(legacy_all_unavailable());
+		}
+	}
+	for key in ["after", "before"] {
+		let cursor = &value["data"][key];
+		if cursor.is_null() {
+			continue;
+		}
+		let cursor = cursor.as_str().filter(|cursor| legacy_all_fullname(cursor)).ok_or_else(legacy_all_unavailable)?;
+		value["data"][key] = Value::String(format!("{LEGACY_ALL_CURSOR_PREFIX}{cursor}"));
+	}
+	Ok(())
+}
+fn legacy_all_current_quota_or_session_pause(lane: RedditLane) -> bool {
+	let now = Instant::now();
+	let guard = upstream_guard(lane);
+	guard.rejected_oauth_generation == Some(guard.quota.generation)
+		|| [QuotaBudget::Rest, QuotaBudget::Graphql].iter().any(|budget| {
+			guard.rate_limit_deadline(*budget).is_some_and(|until| until > now)
+				|| matches!(guard.quota_budget(*budget).window, QuotaWindow::Known { available: 0, reset_at } if reset_at > now)
+		})
+}
+async fn legacy_all_read(logical_path: &str, rest_path: String, quarantine: bool, opportunistic: bool) -> Result<Value, String> {
+	let rest_path = normalize_legacy_all_rest_cursors(&rest_path)?;
+	let now = Instant::now();
+	let lane = preferred_api_lane(now, &rest_path);
+	if lane_availability(lane, now, &rest_path) != LaneAvailability::Ready
+		|| (opportunistic && (legacy_all_current_quota_or_session_pause(preferred_api_lane(now, logical_path)) || legacy_all_current_quota_or_session_pause(lane)))
+	{
+		return Err(legacy_all_unavailable());
+	}
+	let _standby = if lane == RedditLane::Direct && configured_primary_lane() == RedditLane::Tor {
+		Some(DIRECT_STANDBY_CAPACITY.try_acquire().map_err(|_| legacy_all_unavailable())?)
+	} else {
+		None
+	};
+	let mut refresh = TorQuotaRefreshRetryState::default();
+	tokio::time::timeout(
+		LEGACY_ALL_TIMEOUT,
+		json_uncached_on_lane_with_options(rest_path, quarantine, lane, AdmissionRetryMode::Immediate, Some(LEGACY_ALL_TIMEOUT), None, &mut refresh),
+	)
+	.await
+	.map_err(|_| legacy_all_unavailable())?
+	.0
+}
+
 async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> {
-	with_tor_first_page_budget(&path, json_uncached_routed(path.clone(), quarantine)).await
+	with_tor_first_page_budget(&path, async {
+		if is_legacy_all_rest_path(&path) {
+			return legacy_all_read(&path, path.clone(), quarantine, true).await;
+		}
+		match legacy_all_plan(&path)? {
+			Some(LegacyAllPlan::Tagged(rest_path)) => legacy_all_read(&path, rest_path, quarantine, false).await,
+			Some(LegacyAllPlan::FirstPage(rest_path)) => {
+				let (result, disqualified) = LEGACY_ALL_DISQUALIFIED
+					.scope(std::cell::Cell::new(false), async {
+						let result = json_uncached_routed(path.clone(), quarantine).await;
+						let disqualified = LEGACY_ALL_DISQUALIFIED.with(std::cell::Cell::get);
+						(result, disqualified)
+					})
+					.await;
+				if !disqualified && legacy_all_candidate(&result) {
+					if let Ok(value) = legacy_all_read(&path, rest_path, quarantine, true).await {
+						return Ok(value);
+					}
+				}
+				result
+			}
+			None => json_uncached_routed(path.clone(), quarantine).await,
+		}
+	})
+	.await
 }
 
 async fn json_uncached_routed(path: String, quarantine: bool) -> Result<Value, String> {
@@ -4444,6 +4691,7 @@ fn initial_lane_request_timeout(lane: RedditLane, primary: RedditLane, direct: L
 }
 
 fn start_rejected_session_refresh(lane: RedditLane, generation: u64) {
+	disqualify_legacy_all_recovery();
 	let mut guard = upstream_guard(lane);
 	if !guard.reject_oauth_generation(generation) {
 		return;
@@ -4485,7 +4733,16 @@ async fn json_uncached_on_lane_with_options(
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	let request_timeout = timeout_override.unwrap_or_else(|| lane.request_timeout());
+	let legacy_all = is_legacy_all_rest_path(&path);
+	if legacy_all && !legacy_all_rest_cursors_valid(&path) {
+		return (Err(invalid_legacy_all_cursor()), TorRetryReason::None, LaneRecoveryReason::None);
+	}
+	let admission_mode = if legacy_all { AdmissionRetryMode::Immediate } else { admission_mode };
+	let request_timeout = if legacy_all {
+		timeout_override.unwrap_or(LEGACY_ALL_TIMEOUT).min(LEGACY_ALL_TIMEOUT)
+	} else {
+		timeout_override.unwrap_or_else(|| lane.request_timeout())
+	};
 	if let Some(ticket) = quota_spillover_ticket {
 		debug_assert_eq!(lane, RedditLane::Tor);
 		debug_assert_eq!(admission_mode, AdmissionRetryMode::Immediate);
@@ -4526,11 +4783,12 @@ async fn json_uncached_on_lane_with_options(
 	let timeout_path = path.clone();
 	let mut retry_reason = TorRetryReason::None;
 	let mut recovery_reason = LaneRecoveryReason::None;
-	let allow_quota_refresh = quota_refresh_launch_allowed(
-		admission_mode,
-		quota_spillover_ticket.is_some(),
-		tor_refresh.owner.is_some() || tor_refresh.redirect_replayed,
-	);
+	let allow_quota_refresh = !legacy_all
+		&& quota_refresh_launch_allowed(
+			admission_mode,
+			quota_spillover_ticket.is_some(),
+			tor_refresh.owner.is_some() || tor_refresh.redirect_replayed,
+		);
 
 	// Fetch the url...
 	let result = tokio::time::timeout_at(request_deadline, async {
@@ -4578,7 +4836,7 @@ async fn json_uncached_on_lane_with_options(
 				let quota_before_response = upstream_guard(lane).quota_budget(quota_budget).snapshot(Instant::now());
 				reconcile_quota_headers(&mut upstream_attempt, graphql.is_some() && status.is_success(), parsed_remaining, reset_duration,
 					matches!(throttle_kind, Some(ThrottleKind::Quota)));
-				if quota_budget == QuotaBudget::Rest && throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
+				if !legacy_all && quota_budget == QuotaBudget::Rest && throttle_kind.is_none() && !auth_rejected && resource_reason.is_none() {
 					maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path, upstream_attempt.wire_operation);
 				}
 				trace!(
@@ -4598,6 +4856,7 @@ async fn json_uncached_on_lane_with_options(
 				);
 
 				if let Some(reason) = resource_reason {
+					disqualify_legacy_all_recovery();
 					if !auth_rejected && parsed_remaining != Some(0) && !matches!(throttle_kind, Some(ThrottleKind::Quota)) {
 						record_upstream_response(&upstream_attempt, &path, status_code);
 					}
@@ -4680,6 +4939,8 @@ async fn json_uncached_on_lane_with_options(
 				}
 
 				if auth_rejected {
+					disqualify_legacy_all_recovery();
+					if legacy_all { return Err(legacy_all_unavailable()); }
 					if !is_current_oauth_generation(lane, request_generation) {
 						if completed_tor_graphql_rotation_matches(&upstream_attempt) { recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged; }
 						return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
@@ -4697,6 +4958,9 @@ async fn json_uncached_on_lane_with_options(
 					return Err("OAuth token has expired. Please refresh the page!".to_string());
 				}
 
+				if legacy_all && (status.is_redirection() || (status.is_success() && content_kind != "json")) {
+					return Err(legacy_all_unavailable());
+				}
 				if status_code == 403 {
 					return Err("Reddit error 403: Forbidden".to_string());
 				}
@@ -4760,6 +5024,8 @@ async fn json_uncached_on_lane_with_options(
 								if json["error"].is_i64() {
 									// OAuth token has expired; http status 401
 									if json["message"] == "Unauthorized" {
+										disqualify_legacy_all_recovery();
+										if legacy_all { return Err(legacy_all_unavailable()); }
 										if !is_current_oauth_generation(lane, request_generation) {
 											if completed_tor_graphql_rotation_matches(&upstream_attempt) { recovery_reason = LaneRecoveryReason::TorQuotaGenerationChanged; }
 											return Err("OAuth token changed while this request was in flight. Please retry.".to_string());
@@ -4803,6 +5069,8 @@ async fn json_uncached_on_lane_with_options(
 									}
 									Err(format!("Reddit returned an unexpected response status: {status}"))
 								} else {
+									let mut json = json;
+									if legacy_all { validate_legacy_all_listing(&mut json, quarantine)?; }
 									record_upstream_success(&mut upstream_attempt, &path);
 									if quota_budget == QuotaBudget::Graphql && allow_quota_refresh { maybe_rotate_low_budget(lane, request_generation, parsed_remaining, parsed_used, reset_duration, &path, upstream_attempt.wire_operation); }
 									Ok(json)

@@ -10,6 +10,8 @@ enum Scenario {
 	FinalThenFirst429,
 	FirstInvalid,
 	MalformedFirstFeed,
+	MissingPostMetadata,
+	UnrecognizedAllFeed,
 	FinalInvalid,
 	Publication429,
 	FirstQuotaBody,
@@ -26,6 +28,7 @@ struct Fixture {
 	origin: RedditOrigin,
 	server: tokio::task::JoinHandle<Result<(), hyper::Error>>,
 	auth_calls: Arc<AtomicUsize>,
+	legacy_calls: Arc<AtomicUsize>,
 	wires: Arc<Mutex<Vec<(String, String)>>>,
 	devices: Arc<Mutex<Vec<String>>>,
 	auth_seen: Arc<Notify>,
@@ -43,6 +46,7 @@ impl Fixture {
 		use hyper::service::{make_service_fn, service_fn};
 		use std::convert::Infallible;
 		let auth_calls = Arc::new(AtomicUsize::new(0));
+		let legacy_calls = Arc::new(AtomicUsize::new(0));
 		let wires = Arc::new(Mutex::new(Vec::new()));
 		let devices = Arc::new(Mutex::new(Vec::new()));
 		let auth_seen = Arc::new(Notify::new());
@@ -51,6 +55,7 @@ impl Fixture {
 		let data_release = Arc::new(Notify::new());
 		let shared = (
 			auth_calls.clone(),
+			legacy_calls.clone(),
 			wires.clone(),
 			devices.clone(),
 			auth_seen.clone(),
@@ -62,7 +67,7 @@ impl Fixture {
 			let shared = shared.clone();
 			async move {
 				Ok::<_, Infallible>(service_fn(move |request: HyperRequest<Body>| {
-					let (auth_calls, wires, devices, auth_seen, auth_release, data_seen, data_release) = shared.clone();
+					let (auth_calls, legacy_calls, wires, devices, auth_seen, auth_release, data_seen, data_release) = shared.clone();
 					async move {
 						if request.uri().path().starts_with("/auth/") {
 							assert!(request.headers()["authorization"].to_str().unwrap().starts_with("Basic "));
@@ -78,6 +83,15 @@ impl Fixture {
 								HyperResponse::new(Body::from(r#"{"access_token":"renewed-fixture","expires_in":3600}"#))
 							};
 							return Ok::<_, Infallible>(response);
+						}
+						if request.method() == hyper::Method::GET {
+							legacy_calls.fetch_add(1, Ordering::SeqCst);
+							return Ok(
+								HyperResponse::builder()
+									.header("content-type", "application/json")
+									.body(Body::from(r#"{"legacy_fixture":"unavailable"}"#))
+									.unwrap(),
+							);
 						}
 						let bearer = request.headers()["authorization"].to_str().unwrap().to_string();
 						let payload: Value = serde_json::from_slice(&hyper::body::to_bytes(request.into_body()).await.unwrap()).unwrap();
@@ -116,6 +130,10 @@ impl Fixture {
 							serde_json::json!({"errors":[{"extensions":{"code":"RATE_LIMITED"}}]})
 						} else if old && ((scenario == Scenario::FirstInvalid && first) || (scenario == Scenario::FinalInvalid && !first)) {
 							serde_json::json!({"errors":[{"extensions":{"code":"UNRECOGNIZED_ERROR"}}]})
+						} else if scenario == Scenario::MissingPostMetadata && op == "PostsByIds" {
+							serde_json::json!({"data":{}})
+						} else if scenario == Scenario::UnrecognizedAllFeed && op == "AllFeedSdui" {
+							serde_json::json!({"data":{"allV3":{"elements":{"edges":[{"node":{"groupId":"unrecognized"}}],"pageInfo":{"hasNextPage":false}}}}})
 						} else if scenario == Scenario::MalformedFirstFeed && op == "AllFeedSdui" {
 							serde_json::json!({"data":{"allV3":{"elements":{"pageInfo":{"hasNextPage":false}}}}})
 						} else if old && scenario == Scenario::LateSession && !first {
@@ -166,6 +184,7 @@ impl Fixture {
 			origin,
 			server: tokio::spawn(server),
 			auth_calls,
+			legacy_calls,
 			wires,
 			devices,
 			auth_seen,
@@ -707,5 +726,72 @@ fn test_quota_diagnostics_operation_malformed_feed_labels_the_preceding_wire() {
 		assert_eq!(wires.len(), 1, "a malformed feed must fail before hydration sends another operation");
 		assert_eq!(wires[0].1, "AllFeedSdui");
 		assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 0);
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_tor_graphql_quota_missing_shapes_fail_without_auth_or_cached_empty_success() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		for (scenario, path) in [
+			(Scenario::MissingPostMetadata, "/comments/abc.json?outage_fixture=missing"),
+			(Scenario::UnrecognizedAllFeed, "/r/all/hot.json?outage_fixture=missing"),
+		] {
+			let fixture = Fixture::new(scenario, false).await;
+			fixture.install();
+			let result = tokio::time::timeout(Duration::from_secs(3), json_coalesced(path.into(), false)).await.unwrap();
+			let message = result.expect_err("a missing upstream shape must not become a successful empty listing");
+			let request = HyperRequest::builder().uri(path).body(Body::empty()).unwrap();
+			let response = crate::utils::error(request, &message).await.unwrap();
+			assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE, "{message}");
+			assert_eq!(fixture.wires.lock().unwrap().len(), 1, "invalid shapes must not send another GraphQL operation");
+			assert_eq!(
+				fixture.legacy_calls.load(Ordering::SeqCst),
+				usize::from(path.starts_with("/r/all/")),
+				"All may make its one bounded REST attempt, which this fixture explicitly rejects"
+			);
+			assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 0);
+			assert_eq!(upstream_guard(RedditLane::Tor).rejected_oauth_generation, None);
+			let key = (path.to_string(), false);
+			let cached = if path.starts_with("/comments/") {
+				json_pause_cache_value(&*JSON_COMMENTS_CACHED.lock().await, &key)
+			} else {
+				json_pause_cache_value(&*JSON_DYNAMIC_CACHED.lock().await, &key)
+			};
+			assert_eq!(cached, None, "invalid upstream shapes must not be cached as successful empty content");
+		}
+	});
+}
+
+#[test]
+#[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
+fn test_legacy_all_latch_survives_late_embedded_session_after_confirmed_renewal() {
+	tokio::runtime::Runtime::new().unwrap().block_on(async {
+		let fixture = Fixture::new(Scenario::LateSession, false).await;
+		fixture.install();
+		let read = tokio::spawn(LEGACY_ALL_DISQUALIFIED.scope(std::cell::Cell::new(false), async {
+			let result = json_uncached_on_lane("/comments/abc.json".into(), false, RedditLane::Tor).await.0;
+			assert!(result.is_ok());
+			assert!(
+				LEGACY_ALL_DISQUALIFIED.with(std::cell::Cell::get),
+				"the stale Session classification must survive its successful full replay"
+			);
+			for later in [
+				Err("Reddit is temporarily unable to load this page. Retry in 30 seconds".into()),
+				Ok(serde_json::json!({"kind":"Listing","data":{"children":[]}})),
+			] {
+				assert!(legacy_all_candidate(&later));
+				assert!(
+					LEGACY_ALL_DISQUALIFIED.with(std::cell::Cell::get),
+					"later schema/empty outcomes cannot erase session history"
+				);
+			}
+		}));
+		fixture.data_seen.notified().await;
+		fixture.renew_old_budget(false);
+		fixture.refreshed().await;
+		fixture.data_release.notify_one();
+		tokio::time::timeout(Duration::from_secs(3), read).await.unwrap().unwrap();
+		assert_eq!(fixture.auth_calls.load(Ordering::SeqCst), 1);
 	});
 }

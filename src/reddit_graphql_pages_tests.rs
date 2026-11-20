@@ -573,3 +573,29 @@ fn test_graphql_pages_pin_promotion_is_only_for_a_scoped_first_page() {
 	}
 	assert!(!crate::utils::subreddit_pins_first("Skyrim", false, ""));
 }
+
+#[test]
+fn test_graphql_pages_unrecognized_all_nodes_are_not_successful_empty_feeds() {
+	for node in [json!({}), json!({"groupId":"t1_other"}), json!({"groupId":42}), Value::Null] {
+		let request = PageRequest::from_path("/r/all/hot.json", false).unwrap();
+		let mut values = vec![json!({"data":{"allV3":{"elements":conn(vec![node],None)}}})];
+		let error = request.next_payload(&mut values).unwrap_err();
+		assert_eq!(error.kind, crate::reddit_graphql::ErrorKind::Invalid);
+		assert_eq!(error.reason, "missing_feed_post_ids");
+		assert_eq!(values.len(), 1, "an unrecognized nonempty feed must not synthesize empty hydration");
+	}
+	for nodes in [vec![], vec![json!({"adPayload":{"id":"ad"}})]] {
+		let request = PageRequest::from_path("/r/all/hot.json", false).unwrap();
+		let mut values = vec![json!({"data":{"allV3":{"elements":conn(nodes,None)}}})];
+		assert!(request.next_payload(&mut values).unwrap().is_none());
+		assert_eq!(request.finish(&values).unwrap()["data"]["children"], json!([]));
+	}
+	let request = PageRequest::from_path("/r/all/hot.json", false).unwrap();
+	let mut values = vec![json!({"data":{"allV3":{"elements":conn(vec![json!({"groupId":"unrecognized"}), json!({"groupId":"t3_abc"}), json!({"adPayload":{}})],None)}}})];
+	let payload = request.next_payload(&mut values).unwrap().unwrap();
+	assert_eq!(payload["operationName"], "PostsByIds");
+	assert_eq!(payload["variables"]["ids"], json!(["t3_abc"]));
+	values.push(json!({"data":{"postsInfoByIds":[post("abc",1)]}}));
+	assert!(request.next_payload(&mut values).unwrap().is_none());
+	assert_eq!(request.finish(&values).unwrap()["data"]["children"].as_array().unwrap().len(), 1);
+}
