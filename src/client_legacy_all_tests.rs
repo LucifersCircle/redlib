@@ -437,20 +437,28 @@ fn test_legacy_all_low_allowance_and_three_second_deadline_do_not_launch_auth() 
 #[test]
 #[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
 fn test_legacy_all_quota_resource_and_session_classifications_never_trigger_fallback() {
-	tokio::runtime::Runtime::new().unwrap().block_on(async {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	runtime.block_on(async {
 		for gql_case in [GqlCase::Quota, GqlCase::Zero, GqlCase::Resource, GqlCase::Session] {
 			let fixture = Fixture::new(gql_case, LegacyCase::Listing).await;
 			fixture.install();
 			crate::oauth::set_refresh_backoff_for_test(RedditLane::Tor, Some(Duration::from_secs(60)));
 			assert!(json_uncached("/r/all/hot.json".into(), false).await.is_err());
 			assert_eq!(fixture.legacy.load(Ordering::SeqCst), 0);
-			crate::oauth::set_refresh_backoff_for_test(RedditLane::Tor, None);
 		}
 		let fixture = Fixture::new(GqlCase::Edge, LegacyCase::Listing).await;
 		fixture.install();
 		assert!(json_uncached("/r/all/hot.json".into(), false).await.is_ok());
 		assert_eq!(fixture.legacy.load(Ordering::SeqCst), 1);
+		assert_eq!(fixture.auth.load(Ordering::SeqCst), 0);
+		let current = oauth_client(RedditLane::Tor).unwrap();
+		assert_eq!(current.generation, 0);
+		assert_eq!(current.graphql_origin(), fixture.origin);
 	});
+	// A Session error starts a background worker. Keep its backoff until the
+	// runtime has cancelled it, so it cannot overwrite a replacement fixture.
+	drop(runtime);
+	crate::oauth::set_refresh_backoff_for_test(RedditLane::Tor, None);
 }
 
 #[tokio::test]
@@ -482,7 +490,8 @@ async fn test_legacy_all_latch_is_monotonic_request_local_and_not_inherited_by_a
 #[test]
 #[sealed_test(env=[("REDLIB_TOR_FALLBACK","on"),("REDLIB_TOR_PROXY","socks5h://127.0.0.1:1"),("REDLIB_REDDIT_PRIMARY_LANE","tor")])]
 fn test_legacy_all_latch_retains_earlier_real_classification_after_guards_reset_and_later_schema_or_empty() {
-	tokio::runtime::Runtime::new().unwrap().block_on(async {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	runtime.block_on(async {
 		for initial in [GqlCase::Quota, GqlCase::Zero, GqlCase::Resource, GqlCase::Session] {
 			for later in [GqlCase::Missing, GqlCase::Empty] {
 				let first = Fixture::new(initial, LegacyCase::Listing).await;
@@ -511,10 +520,13 @@ fn test_legacy_all_latch_retains_earlier_real_classification_after_guards_reset_
 						assert_eq!(second.legacy.load(Ordering::SeqCst), 0);
 					})
 					.await;
-				crate::oauth::set_refresh_backoff_for_test(RedditLane::Tor, None);
 			}
 		}
 	});
+	// A Session error starts a background worker. Keep its backoff until the
+	// runtime has cancelled it, so it cannot overwrite a replacement fixture.
+	drop(runtime);
+	crate::oauth::set_refresh_backoff_for_test(RedditLane::Tor, None);
 }
 
 #[test]
