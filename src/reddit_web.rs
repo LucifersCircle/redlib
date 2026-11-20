@@ -1,4 +1,4 @@
-//! Explicit anonymous HTML reader. No API tokens or API admission state enter this module.
+//! Default anonymous HTML reader. No API tokens or API admission state enter this module.
 use super::*;
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ impl WebError {
 }
 
 pub(super) fn enabled() -> bool {
-	env::var("REDLIB_READ_BACKEND").is_ok_and(|value| value == "web")
+	env::var("REDLIB_READ_BACKEND").map_or(true, |value| value == "web")
 }
 pub(super) fn contains_cursor(path: &str) -> bool {
 	url::form_urlencoded::parse(path.split_once('?').map_or("", |(_, query)| query).as_bytes())

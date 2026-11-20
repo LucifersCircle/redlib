@@ -50,6 +50,8 @@ jobs:
       - name: Check code
         run: cargo check --locked --all-targets
       - name: Run deterministic resilience tests
+        env:
+          REDLIB_READ_BACKEND: api
         run: |
           cargo test --locked --lib primary_lane_is_explicit_and_defaults_to_direct
           cargo test --locked --lib test_tor_first_
