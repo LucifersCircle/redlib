@@ -653,7 +653,9 @@ fn test_quota_diagnostics_operation_labels_follow_each_failed_wire_and_full_repl
 					.await
 					.unwrap();
 				assert_eq!(result.is_ok(), valid);
-				if fixture.auth_calls.load(Ordering::SeqCst) > 0 {
+				// CompleteLow launches refresh before returning, but the worker may not
+				// have reached the auth server yet. Drain it before resetting this fixture.
+				if scenario == Scenario::CompleteLow || fixture.auth_calls.load(Ordering::SeqCst) > 0 {
 					fixture.refreshed().await;
 				}
 				let rows = OPERATION_LOG_ROWS.lock().unwrap();
